@@ -70,3 +70,6 @@ Desktop.ini
 project.lock.json
 project.fragment.lock.json
 artifacts/
+
+# Planning documents (local superpowers plans)
+docs/superpowers/plans/
