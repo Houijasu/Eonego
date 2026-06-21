@@ -33,6 +33,7 @@ nuget.exe
 .vs/
 .vscode/
 .idea/
+.editorconfig
 *.user
 *.suo
 *.userprefs

@@ -81,7 +81,8 @@ type SearchConfig =
     { Threads: int
       HashMb: int
       UseTt: bool
-      UsePruning: bool }
+      UsePruning: bool
+      UseProbCut: bool }
 
 type SearchLimits =
     { MoveTime: int
@@ -99,7 +100,8 @@ let defaultConfig =
     { Threads = 1
       HashMb = 16
       UseTt = true
-      UsePruning = true }
+      UsePruning = true
+      UseProbCut = true }
 
 let defaultLimits =
     { MoveTime = 0
@@ -472,6 +474,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
         let mutable ttHit = false
         let mutable ttScore = 0
         let mutable ttEval = VALUE_NONE
+        let mutable ttDepth = 0
 
         // 1. mate-distance pruning (gated -> oracle stays strictly full-window)
         if usePruning then
@@ -494,6 +497,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                 ttMove <- m
                 ttScore <- valueFromTt sc ply
                 ttEval <- ev
+                ttDepth <- dp
 
                 if not isPv && dp >= depthIn then
                     if
@@ -504,8 +508,10 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                         result <- ttScore
                         produced <- true
 
-        // 3. static eval
+        // 3. static eval (+ "improving": static eval higher than 2 plies ago — hoisted up so ProbCut/pruning
+        //    can read it; prunes less when our position is improving)
         let mutable staticEval = VALUE_NONE
+        let mutable improving = false
 
         if not produced then
             staticEval <-
@@ -514,6 +520,11 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                 else eval pos
 
             w.Stack.[ssCur].StaticEval <- staticEval
+
+            improving <-
+                (not inCheck)
+                && (let prev2 = w.Stack.[ssCur - 2].StaticEval in
+                    prev2 = VALUE_NONE || staticEval > prev2)
 
         // 4. pruning block (gated, non-PV, not in check)
         if not produced && usePruning && not isPv && not inCheck then
@@ -537,6 +548,60 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                     result <- (if v >= MATE_IN_MAX_PLY then beta else v)
                     produced <- true
 
+        // 4.5 ProbCut: a strong capture that HOLDS a reduced search above beta+margin is a cutoff.
+        if
+            not produced
+            && usePruning
+            && cfg.UseProbCut
+            && not isPv
+            && not inCheck
+            && depthIn >= 5
+            && abs beta < MATE_IN_MAX_PLY
+        then
+            let probCutBeta = beta + 200 - (if improving then 50 else 0)
+            // Conservative skip heuristic (NOT a proof the node can't reach probCutBeta).
+            let ttBlocks =
+                ttHit && ttDepth >= depthIn - 3 && ttScore <> VALUE_NONE && ttScore < probCutBeta
+
+            if not ttBlocks then
+                let us = pos.SideToMove
+                let ksq = pos.KingSquare us
+                let pcMoves = w.MoveBuf.AsSpan(ply * MaxMoves, MaxMoves)
+                let pcScores = w.ScoreBuf.AsSpan(ply * MaxMoves, MaxMoves)
+                let mutable pcMp = mkProbCut pos w.Tables ttMove (probCutBeta - staticEval) pcMoves pcScores
+                let mutable pcMove = nextMove &pcMp false
+
+                while pcMove <> MoveNone && not produced && not w.Control.Stopped do
+                    let needsCheck =
+                        isEnPassant pcMove
+                        || fromSq pcMove = ksq
+                        || testBit (pos.BlockersForKing us) (fromSq pcMove)
+
+                    if (not needsCheck) || isLegal pos pcMove then
+                        w.Stack.[ssCur].CurrentMove <- pcMove
+                        w.Stack.[ssCur].MovedPiece <- pos.PieceOn(fromSq pcMove)
+                        pos.Make pcMove
+                        let mutable v = -(qsearch w pos (-probCutBeta) (-probCutBeta + 1) (ply + 1))
+
+                        if v >= probCutBeta then
+                            v <- -(negamax w pos (-probCutBeta) (-probCutBeta + 1) (depthIn - 4) (ply + 1) false)
+
+                        pos.Unmake pcMove
+
+                        if not w.Control.Stopped && v >= probCutBeta then
+                            // Trust a sufficient existing TT entry over clobbering it; else store + return v.
+                            if ttHit && ttDepth >= depthIn - 3 && ttScore <> VALUE_NONE && ttScore >= probCutBeta then
+                                result <- ttScore
+                            else
+                                if useTt then
+                                    w.Control.Tt.Store pos.Key (depthIn - 3) BoundLower (valueToTt v ply) staticEval pcMove
+
+                                result <- v
+
+                            produced <- true
+
+                    pcMove <- if produced || w.Control.Stopped then MoveNone else nextMove &pcMp false
+
         // 5. move loop
         if not produced then
             let prevMove =
@@ -557,14 +622,6 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
             let k2 = w.Tables.Killer ply 1
             let us = pos.SideToMove
             let ksq = pos.KingSquare us
-            // "improving": is our static eval higher than 2 plies ago? (prunes less when our position is improving)
-            let improving =
-                if inCheck then
-                    false
-                else
-                    let prev2 = w.Stack.[ssCur - 2].StaticEval
-                    prev2 = VALUE_NONE || staticEval > prev2
-
             let moves = w.MoveBuf.AsSpan(ply * MaxMoves, MaxMoves)
             let scores = w.ScoreBuf.AsSpan(ply * MaxMoves, MaxMoves)
             let mutable mp = mkMain pos w.Tables ttMove k1 k2 cm depthIn moves scores

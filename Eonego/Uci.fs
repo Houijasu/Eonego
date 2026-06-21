@@ -20,6 +20,7 @@ let private writeLine (s: string) = Console.Out.WriteLine(s)
 type private UciState =
     { mutable Threads: int
       mutable HashMb: int
+      mutable UseProbCut: bool
       mutable Tt: TranspositionTable
       mutable RootFen: string
       mutable RootMoves: Move[]
@@ -150,7 +151,8 @@ let private startSearch (st: UciState) (lim: SearchLimits) =
         { Threads = st.Threads
           HashMb = st.HashMb
           UseTt = true
-          UsePruning = true }
+          UsePruning = true
+          UseProbCut = st.UseProbCut }
 
     let control = SearchControl(cfg, lim, st.Tt, st.RootFen, st.RootMoves)
     st.Control <- Some control
@@ -175,12 +177,17 @@ let private handleSetOption (st: UciState) (tokens: string[]) =
             st.Tt.Resize st.HashMb
         elif String.Equals(name, "Threads", StringComparison.OrdinalIgnoreCase) then
             st.Threads <- max 1 v
+        elif String.Equals(name, "UseProbCut", StringComparison.OrdinalIgnoreCase) then
+            match Boolean.TryParse tokens.[vi + 1] with
+            | true, b -> st.UseProbCut <- b
+            | _ -> ()
     | _ -> ()
 
 let run () =
     let st =
         { Threads = 1
           HashMb = 16
+          UseProbCut = true
           Tt = TranspositionTable(16)
           RootFen = StartPosFen
           RootMoves = [||]
@@ -202,6 +209,7 @@ let run () =
                     writeLine "id author Houijasu"
                     writeLine "option name Hash type spin default 16 min 1 max 65536"
                     writeLine "option name Threads type spin default 1 min 1 max 256"
+                    writeLine "option name UseProbCut type check default true"
                     writeLine "uciok"
                 | "isready" -> writeLine "readyok"
                 | "ucinewgame" ->

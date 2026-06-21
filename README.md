@@ -1,6 +1,6 @@
 # Eonego
 
-A from-scratch chess engine written in **F#** (.NET 10), built for speed and verified for correctness. Eonego implements a complete UCI-compatible search stack on top of a hand-tuned bitboard board representation: PEXT/magic sliders, a Stockfish-style staged move picker, alpha-beta / PVS search with LazySMP, and a lock-free transposition table — all allocation-free on the hot path and validated against published perft node counts and an in-test minimax oracle.
+A from-scratch chess engine written in **F#** (.NET 10), built for speed and verified for correctness. Eonego implements a complete UCI-compatible search stack on top of a hand-tuned bitboard board representation: PEXT/magic sliders, a Stockfish-style staged move picker, alpha-beta / PVS search with LazySMP and aggressive forward pruning (ProbCut, log-based LMR, null-move, futility/SEE), and a lock-free transposition table — all allocation-free on the hot path and validated against published perft node counts and an in-test minimax oracle.
 
 - **Author:** Houijasu
 - **Language:** F# on `net10.0`
@@ -62,9 +62,9 @@ A from-scratch chess engine written in **F#** (.NET 10), built for speed and ver
 **Search**
 - Alpha-beta / **PVS**, fail-soft, with aspiration iterative deepening
 - **LazySMP**: N independent iterative-deepening workers, each with its own `Position` + history tables + stack/PV/buffers; the only shared writable state is the lock-free TT plus an atomic stop flag
-- Pruning: mate-distance, null-move, static/futility, late-move reductions (LMR), move-count quiet pruning
+- Forward pruning: mate-distance, reverse-futility, null-move, **ProbCut**, **log-based late-move reductions (LMR)**, move-count (late-move) pruning, futility pruning, and SEE pruning of losing quiets/captures — all scaled by an `improving` signal
 - Check extensions (SEE >= 0), quiescence search with SEE-based capture pruning
-- Triangular PV, `info` lines with `depth/seldepth/score/nodes/nps/time/pv`
+- Triangular PV, `info` lines with `depth/seldepth/score/nodes/nps/time/pv` (aggregate node/nps across all workers)
 - Time management: `movetime`, `wtime`/`winc`/`btime`/`binc`/`movestogo`, `depth`, `nodes`, `mate`, `infinite` — soft + hard time stops
 - `UsePruning = false` collapses to plain full-window alpha-beta — the built-in correctness oracle
 
@@ -210,10 +210,14 @@ Each worker is a `Worker` object owning its own `Position`, `History.Tables`, se
 - **Quiescence** (`qsearch`): fail-soft leaves with stand-pat, SEE-based capture pruning, and mate scoring when in check with no moves
 - **Pruning** (gated by `UsePruning`, non-PV, not in check):
   - Mate-distance pruning
-  - Static/null-move pruning (`staticEval - 120*depth >= beta`)
-  - Null-move pruning (`depth >= 3`, `staticEval >= beta`, has non-pawn material)
-  - Move-count quiet pruning (late futility)
+  - Reverse futility (`staticEval - 120*depth >= beta`, `depth <= 6`)
+  - Null-move pruning (`depth >= 3`, `staticEval >= beta`, non-pawn material; `R = 3 + depth/4 + (eval≫beta)`)
+  - **ProbCut** (`depth >= 5`): a strong-enough capture (SEE) that *holds* a reduced `negamax(depth-4)` above `beta + margin` is a cutoff — verified by qsearch then the reduced search, stored as a `BoundLower` at `depth-3`
+  - **LMR**: a log-based reduction table `r[depth][moveCount]`, deeper for non-improving / quiet moves, lighter for captures, with a zero-window re-search on fail-high
+  - Move-count (late-move) pruning, futility pruning of late quiets, and SEE pruning of losing quiets / shallow losing captures
 - **Extensions**: check giving + SEE >= 0 → +1 ply
+- An **`improving`** signal (static eval vs two plies ago) tightens or loosens the pruning margins
+- ProbCut and the rest are *heuristic* forward pruning — they trade a little accuracy for depth and are **not** score-preserving (unlike the TT). Exact correctness is the pruning-off oracle below; `setoption UseProbCut false` disables ProbCut at runtime for A/B testing.
 - **Move ordering feedback**: on a beta cutoff, the mover gets a `statBonus(depth)` history bump, quiet refuters get a negative bump, killers are set, and the countermove is recorded
 
 ### Time budget
@@ -226,7 +230,7 @@ Each worker is a `Worker` object owning its own `Position`, `History.Tables`, se
 
 ### Correctness oracle
 
-With `UsePruning = false` the search becomes plain full-window alpha-beta (PVS/LMR/extensions/null/mate-distance/qsearch-SEE/history-writes all disabled). The test suite compares this against an exhaustive in-test minimax that shares the engine's own `qsearch` leaf and draw/terminal/mate semantics — they must return identical scores.
+With `UsePruning = false` the search becomes plain full-window alpha-beta (PVS / LMR / extensions / null-move / ProbCut / mate-distance / qsearch-SEE / history-writes all disabled). The test suite compares this against an exhaustive in-test minimax that shares the engine's own `qsearch` leaf and draw/terminal/mate semantics — they must return identical scores. This is the exact-correctness anchor; the heuristic pruning layered on top (ProbCut/LMR/null-move/futility) only ever *speeds* the search relative to this oracle, never redefines correctness.
 
 Constants: `MaxSearchPly = 246`, `MATE = 32000`, `INF = 32001`, `MATE_IN_MAX_PLY = 31754`.
 
@@ -270,7 +274,7 @@ Stat updates use SF's "gravity" formula `entry += clamp(bonus,-D,D) - entry*|cla
 
 | Command | Behavior |
 |---|---|
-| `uci` | Emit `id name Eonego` / `id author Houijasu`, the `Hash` and `Threads` options, and `uciok` |
+| `uci` | Emit `id name Eonego` / `id author Houijasu`, the `Hash` / `Threads` / `UseProbCut` options, and `uciok` |
 | `isready` | Reply `readyok` |
 | `ucinewgame` | Stop any search, clear the TT, reset to startpos |
 | `position [startpos \| fen <fields>] moves m1 m2 ...` | Set the root; UCI moves are re-stamped against legal generation (recovers EP/castling flags, disambiguates under-promotions) |
@@ -278,11 +282,12 @@ Stat updates use SF's "gravity" formula `entry += clamp(bonus,-D,D) - entry*|cla
 | `stop` | Signal the atomic stop flag; the search exits at its next check point |
 | `setoption name Hash value <MB>` | Resize the TT (1..65536 MiB) after stopping any search |
 | `setoption name Threads value <N>` | Set LazySMP worker count (1..256) |
+| `setoption name UseProbCut value <true\|false>` | Toggle ProbCut forward pruning (default on; useful for A/B testing) |
 | `quit` | Stop + join, then exit |
 
 ### Defaults
 
-- `Threads = 1`, `Hash = 16` MiB
+- `Threads = 1`, `Hash = 16` MiB, `UseProbCut = true`
 - Standard chess only (Chess960 castling is out of v1 scope; castling uses standard king-to-square encoding `e1g1`/`e1c1`/`e8g8`/`e8c8`)
 
 ### Draw detection (search-owned)
@@ -347,7 +352,7 @@ Node counts are validated against the canonical CPW positions 1–6. Default tie
 
 ### Suite inventory
 
-`BitboardTests`, `MoveTests`, `ZobristTests` (pinned key values), `PositionTests` (FEN idempotency, make/unmake round-trip, key == from-scratch), `MoveGenerationTests` (perft gate + targeted edge cases), `SeeTests`, `IsPseudoLegalTests`, `PromotionSplitTests`, `HistoryTests` (gravity saturation), `MovePickTests` + `MovePickProbeTests` (staging, laziness, ordering, byref-mutation persistence), `EvaluationTests` (mirror symmetry, phase taper), `TranspositionTests` (XOR validation, torn-read injection, replacement), `PliesFromNullTests`, `DrawDetectionTests`, `LazySmpTests`.
+`BitboardTests`, `MoveTests`, `ZobristTests` (pinned key values), `PositionTests` (FEN idempotency, make/unmake round-trip, key == from-scratch), `MoveGenerationTests` (perft gate + targeted edge cases), `SeeTests`, `IsPseudoLegalTests`, `PromotionSplitTests`, `HistoryTests` (gravity saturation), `MovePickTests` + `MovePickProbeTests` (staging, laziness, ordering, byref-mutation persistence), `EvaluationTests` (mirror symmetry, phase taper), `TranspositionTests` (XOR validation, torn-read injection, replacement), `PliesFromNullTests`, `SearchTests` (oracle, mate suites, TT invariance), `DrawDetectionTests`, `LazySmpTests`, `ProbCutTests` (tactic-not-hidden, node reduction, best-move agreement).
 
 ---
 
@@ -391,7 +396,7 @@ Eonego/
 ├── Eonego.Tests/
 │   ├── Eonego.Tests.fsproj
 │   ├── TestFixtures.fs
-│   └── … (18 test modules)
+│   └── … (19 test modules)
 └── Eonego.Benchmarks/
     ├── Eonego.Benchmarks.fsproj
     └── Program.fs

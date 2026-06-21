@@ -24,6 +24,7 @@
     <Compile Include="SearchTests.fs" />
     <Compile Include="DrawDetectionTests.fs" />
     <Compile Include="LazySmpTests.fs" />
+    <Compile Include="ProbCutTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
