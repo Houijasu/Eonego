@@ -14,8 +14,20 @@ open Eonego.Move
 open Eonego.Transposition
 open Eonego.Search
 
-let private cfgOn = defaultConfig                                   // UseProbCut = true
-let private cfgOff = { defaultConfig with UseProbCut = false }
+// Isolate ProbCut against the legacy search: hold the later forward-pruning heuristics (IIR/razoring/
+// history/delta) OFF in both arms so these fixtures measure ProbCut alone. (The "same best move"
+// fixtures are coincidental for any heuristic — turning the newer ones on can flip a tie-break between
+// equally-scored moves, e.g. =Q vs =R that both win the queen. The full default stack is exercised by
+// PruningTests instead.)
+let private cfgBase =
+    { defaultConfig with
+        UseIir = false
+        UseRazoring = false
+        UseHistoryPruning = false
+        UseDeltaPruning = false }
+
+let private cfgOn = cfgBase                                         // UseProbCut = true
+let private cfgOff = { cfgBase with UseProbCut = false }
 
 // ---------------------------------------------------------------------------
 // Tactic not hidden: a genuinely winning capture (rook backs the pawn -> KR vs K, a real win, not a

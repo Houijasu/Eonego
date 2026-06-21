@@ -62,7 +62,9 @@ A from-scratch chess engine written in **F#** (.NET 10), built for speed and ver
 **Search**
 - Alpha-beta / **PVS**, fail-soft, with aspiration iterative deepening
 - **LazySMP**: N independent iterative-deepening workers, each with its own `Position` + history tables + stack/PV/buffers; the only shared writable state is the lock-free TT plus an atomic stop flag
-- Forward pruning: mate-distance, reverse-futility, null-move, **ProbCut**, **log-based late-move reductions (LMR)**, move-count (late-move) pruning, futility pruning, and SEE pruning of losing quiets/captures — all scaled by an `improving` signal
+- Forward pruning: mate-distance, reverse-futility, null-move, **ProbCut**, **log-based late-move reductions (LMR)**, move-count (late-move) pruning, futility pruning, SEE pruning of losing quiets/captures, **history pruning** of late quiet losers, and **delta pruning** in qsearch — all scaled by an `improving` signal
+- **Internal iterative reductions (IIR)** when no TT move is available to improve ordering
+- **Razoring**: qsearch verification of shallow positions where static eval is far below alpha
 - Check extensions (SEE >= 0), quiescence search with SEE-based capture pruning
 - Triangular PV, `info` lines with `depth/seldepth/score/nodes/nps/time/pv` (aggregate node/nps across all workers)
 - Time management: `movetime`, `wtime`/`winc`/`btime`/`binc`/`movestogo`, `depth`, `nodes`, `mate`, `infinite` — soft + hard time stops
@@ -207,17 +209,19 @@ Each worker is a `Worker` object owning its own `Position`, `History.Tables`, se
 
 - **Iterative deepening** with **aspiration windows** (full window for depth <= 4 or near-mate; re-searches widen by doubling `delta` on fail-low/fail-high)
 - **Negamax / PVS**: first move is searched full window; subsequent moves get a zero-window scout search at reduced depth (LMR), re-searched at full depth and then full window only if they beat alpha
-- **Quiescence** (`qsearch`): fail-soft leaves with stand-pat, SEE-based capture pruning, and mate scoring when in check with no moves
+- **Internal iterative reductions (IIR)**: when no TT move is available at an interior node, reduce the searched depth by one ply to let the next iteration seed better move ordering
+- **Quiescence** (`qsearch`): fail-soft leaves with stand-pat, SEE-based capture pruning, **delta pruning** of captures that cannot lift alpha even after winning the piece, and mate scoring when in check with no moves
 - **Pruning** (gated by `UsePruning`, non-PV, not in check):
   - Mate-distance pruning
   - Reverse futility (`staticEval - 120*depth >= beta`, `depth <= 6`)
+  - **Razoring** (`depth <= 3`): qsearch verification when static eval is far below alpha; fail low if captures cannot lift alpha
   - Null-move pruning (`depth >= 3`, `staticEval >= beta`, non-pawn material; `R = 3 + depth/4 + (eval≫beta)`)
   - **ProbCut** (`depth >= 5`): a strong-enough capture (SEE) that *holds* a reduced `negamax(depth-4)` above `beta + margin` is a cutoff — verified by qsearch then the reduced search, stored as a `BoundLower` at `depth-3`
   - **LMR**: a log-based reduction table `r[depth][moveCount]`, deeper for non-improving / quiet moves, lighter for captures, with a zero-window re-search on fail-high
-  - Move-count (late-move) pruning, futility pruning of late quiets, and SEE pruning of losing quiets / shallow losing captures
+  - Move-count (late-move) pruning, futility pruning of late quiets, SEE pruning of losing quiets / shallow losing captures, and **history pruning** of late quiet moves with strongly negative butterfly history
 - **Extensions**: check giving + SEE >= 0 → +1 ply
 - An **`improving`** signal (static eval vs two plies ago) tightens or loosens the pruning margins
-- ProbCut and the rest are *heuristic* forward pruning — they trade a little accuracy for depth and are **not** score-preserving (unlike the TT). Exact correctness is the pruning-off oracle below; `setoption UseProbCut false` disables ProbCut at runtime for A/B testing.
+- ProbCut, IIR, razoring, history pruning, and delta pruning are *heuristic* forward pruning — they trade a little accuracy for depth and are **not** score-preserving (unlike the TT). Exact correctness is the pruning-off oracle below; each can be toggled at runtime via `setoption` for A/B testing.
 - **Move ordering feedback**: on a beta cutoff, the mover gets a `statBonus(depth)` history bump, quiet refuters get a negative bump, killers are set, and the countermove is recorded
 
 ### Time budget
@@ -230,7 +234,7 @@ Each worker is a `Worker` object owning its own `Position`, `History.Tables`, se
 
 ### Correctness oracle
 
-With `UsePruning = false` the search becomes plain full-window alpha-beta (PVS / LMR / extensions / null-move / ProbCut / mate-distance / qsearch-SEE / history-writes all disabled). The test suite compares this against an exhaustive in-test minimax that shares the engine's own `qsearch` leaf and draw/terminal/mate semantics — they must return identical scores. This is the exact-correctness anchor; the heuristic pruning layered on top (ProbCut/LMR/null-move/futility) only ever *speeds* the search relative to this oracle, never redefines correctness.
+With `UsePruning = false` the search becomes plain full-window alpha-beta (PVS / LMR / extensions / null-move / ProbCut / IIR / razoring / history pruning / delta pruning / mate-distance / qsearch-SEE / history-writes all disabled). The test suite compares this against an exhaustive in-test minimax that shares the engine's own `qsearch` leaf and draw/terminal/mate semantics — they must return identical scores. This is the exact-correctness anchor; the heuristic pruning layered on top (IIR, razoring, history pruning, delta pruning, ProbCut, LMR, null-move, futility) only ever *speeds* the search relative to this oracle, never redefines correctness.
 
 Constants: `MaxSearchPly = 246`, `MATE = 32000`, `INF = 32001`, `MATE_IN_MAX_PLY = 31754`.
 
@@ -282,12 +286,17 @@ Stat updates use SF's "gravity" formula `entry += clamp(bonus,-D,D) - entry*|cla
 | `stop` | Signal the atomic stop flag; the search exits at its next check point |
 | `setoption name Hash value <MB>` | Resize the TT (1..65536 MiB) after stopping any search |
 | `setoption name Threads value <N>` | Set LazySMP worker count (1..256) |
-| `setoption name UseProbCut value <true\|false>` | Toggle ProbCut forward pruning (default on; useful for A/B testing) |
+| `setoption name UseProbCut value <true\|false>` | Toggle ProbCut forward pruning (default on) |
+| `setoption name UseIir value <true\|false>` | Toggle internal iterative reductions (default on) |
+| `setoption name UseRazoring value <true\|false>` | Toggle razoring at shallow depths (default on) |
+| `setoption name UseHistoryPruning value <true\|false>` | Toggle history-based quiet pruning (default on) |
+| `setoption name UseDeltaPruning value <true\|false>` | Toggle qsearch delta pruning (default on) |
 | `quit` | Stop + join, then exit |
 
 ### Defaults
 
-- `Threads = 1`, `Hash = 16` MiB, `UseProbCut = true`
+- `Threads = 1`, `Hash = 16` MiB
+- Forward-pruning toggles default to `true`: `UseProbCut`, `UseIir`, `UseRazoring`, `UseHistoryPruning`, `UseDeltaPruning`
 - Standard chess only (Chess960 castling is out of v1 scope; castling uses standard king-to-square encoding `e1g1`/`e1c1`/`e8g8`/`e8c8`)
 
 ### Draw detection (search-owned)
@@ -352,7 +361,7 @@ Node counts are validated against the canonical CPW positions 1–6. Default tie
 
 ### Suite inventory
 
-`BitboardTests`, `MoveTests`, `ZobristTests` (pinned key values), `PositionTests` (FEN idempotency, make/unmake round-trip, key == from-scratch), `MoveGenerationTests` (perft gate + targeted edge cases), `SeeTests`, `IsPseudoLegalTests`, `PromotionSplitTests`, `HistoryTests` (gravity saturation), `MovePickTests` + `MovePickProbeTests` (staging, laziness, ordering, byref-mutation persistence), `EvaluationTests` (mirror symmetry, phase taper), `TranspositionTests` (XOR validation, torn-read injection, replacement), `PliesFromNullTests`, `SearchTests` (oracle, mate suites, TT invariance), `DrawDetectionTests`, `LazySmpTests`, `ProbCutTests` (tactic-not-hidden, node reduction, best-move agreement).
+`BitboardTests`, `MoveTests`, `ZobristTests` (pinned key values), `PositionTests` (FEN idempotency, make/unmake round-trip, key == from-scratch), `MoveGenerationTests` (perft gate + targeted edge cases), `SeeTests`, `IsPseudoLegalTests`, `PromotionSplitTests`, `HistoryTests` (gravity saturation), `MovePickTests` + `MovePickProbeTests` (staging, laziness, ordering, byref-mutation persistence), `EvaluationTests` (mirror symmetry, phase taper), `TranspositionTests` (XOR validation, torn-read injection, replacement), `PliesFromNullTests`, `SearchTests` (oracle, mate suites, TT invariance), `DrawDetectionTests`, `LazySmpTests`, `ProbCutTests` (ProbCut isolated from newer heuristics: tactic-not-hidden, node reduction, best-move agreement), `PruningTests` (full default pruning stack: IIR, razoring, history, delta, ProbCut).
 
 ---
 

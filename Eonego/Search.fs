@@ -82,7 +82,11 @@ type SearchConfig =
       HashMb: int
       UseTt: bool
       UsePruning: bool
-      UseProbCut: bool }
+      UseProbCut: bool
+      UseIir: bool
+      UseRazoring: bool
+      UseHistoryPruning: bool
+      UseDeltaPruning: bool }
 
 type SearchLimits =
     { MoveTime: int
@@ -101,7 +105,11 @@ let defaultConfig =
       HashMb = 16
       UseTt = true
       UsePruning = true
-      UseProbCut = true }
+      UseProbCut = true
+      UseIir = true
+      UseRazoring = true
+      UseHistoryPruning = true
+      UseDeltaPruning = true }
 
 let defaultLimits =
     { MoveTime = 0
@@ -400,7 +408,17 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
                     && not inCheck
                     && not (isPromotion m)
                     && not (pos.GivesCheck m)
-                    && not (pos.SeeGe m 1)
+                    && (not (pos.SeeGe m 1) // existing SEE prune
+                        // delta pruning: a capture that can't lift alpha even after winning the
+                        // piece (captures only — guard pieceType against an empty destination).
+                        || (cfg.UseDeltaPruning
+                            && (let dst = pos.PieceOn(toSq m) in
+                                (isEnPassant m || dst <> NoPiece)
+                                && (let capturedValue =
+                                        if isEnPassant m then pieceValueOf Pawn
+                                        else pieceValueOf (pieceType dst)
+
+                                    rawEval + 200 + capturedValue <= alpha))))
 
                 if legal && not prune then
                     movesPlayed <- movesPlayed + 1
@@ -531,6 +549,19 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
             if depthIn <= 6 && staticEval - 120 * depthIn >= beta && abs beta < MATE_IN_MAX_PLY then
                 result <- staticEval
                 produced <- true
+            // razoring: at shallow depth a static eval far below alpha is verified by qsearch;
+            // if even captures can't lift alpha, fail low. Mutually exclusive with RFP/null-move.
+            elif
+                cfg.UseRazoring
+                && depthIn <= 3
+                && abs alpha < MATE_IN_MAX_PLY
+                && staticEval + (240 + 200 * depthIn) <= alpha
+            then
+                let v = qsearch w pos alpha (alpha + 1) ply
+
+                if v <= alpha && not w.Control.Stopped then
+                    result <- v
+                    produced <- true
             elif
                 depthIn >= 3
                 && pos.PliesFromNull > 0
@@ -604,6 +635,14 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
         // 5. move loop
         if not produced then
+            // IIR: with no TT move to order on, reduce a ply and let the next iteration's TT
+            // move improve ordering. `depth` below is the *searched* depth (may be depthIn - 1),
+            // not the requested one. `ply > 0` keeps IIR off the fixed-depth root (test == game).
+            let mutable depth = depthIn
+
+            if usePruning && cfg.UseIir && ply > 0 && ttMove = MoveNone && depthIn >= 4 then
+                depth <- depth - 1
+
             let prevMove =
                 if ply > 0 then
                     w.Stack.[ssCur - 1].CurrentMove
@@ -624,7 +663,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
             let ksq = pos.KingSquare us
             let moves = w.MoveBuf.AsSpan(ply * MaxMoves, MaxMoves)
             let scores = w.ScoreBuf.AsSpan(ply * MaxMoves, MaxMoves)
-            let mutable mp = mkMain pos w.Tables ttMove k1 k2 cm depthIn moves scores
+            let mutable mp = mkMain pos w.Tables ttMove k1 k2 cm depth moves scores
 
             if isPv then
                 w.Pv.[ply * MaxSearchPly] <- MoveNone
@@ -653,15 +692,25 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
                     // --- forward pruning: never on the first real move, never when we might be getting mated ---
                     if usePruning && not isPv && not inCheck && best > -MATE_IN_MAX_PLY then
-                        let lmrDepth = max 0 (depthIn - 1 - reduction depthIn moveCount)
+                        let lmrDepth = max 0 (depth - 1 - reduction depth moveCount)
 
                         if isQuiet then
                             // late-move (move-count) pruning — stop trying quiets once deep into the list
                             if
-                                depthIn <= 8
-                                && moveCount >= (3 + depthIn * depthIn) / (if improving then 1 else 2)
+                                depth <= 8
+                                && moveCount >= (3 + depth * depth) / (if improving then 1 else 2)
                             then
                                 skipQuiets <- true
+                                doMove <- false
+                            // history — a late quiet with very negative butterfly history. Per-move
+                            // skip (NOT skipQuiets): the picker only partial-sorts quiets, so a worse
+                            // quiet can precede a better one in the unsorted tail.
+                            elif
+                                cfg.UseHistoryPruning
+                                && lmrDepth <= 6
+                                && moveCount > 3
+                                && w.Tables.MainHistory us (fromTo m) < -500 - 800 * lmrDepth
+                            then
                                 doMove <- false
                             // futility — a quiet that can't lift alpha at shallow (reduced) depth
                             elif (not givesCheck) && lmrDepth <= 6 && staticEval + 120 + 110 * lmrDepth <= alpha then
@@ -670,13 +719,13 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                             // SEE — a quiet that walks into a losing exchange
                             elif lmrDepth <= 7 && not (pos.SeeGe m (-25 * lmrDepth * lmrDepth)) then
                                 doMove <- false
-                        elif (not givesCheck) && depthIn <= 6 && not (pos.SeeGe m (-90 * depthIn)) then
+                        elif (not givesCheck) && depth <= 6 && not (pos.SeeGe m (-90 * depth)) then
                             // SEE — a capture that loses material by static exchange at shallow depth
                             doMove <- false
 
                     if doMove then
                         let ext = if usePruning && givesCheck && pos.SeeGe m 0 then 1 else 0
-                        let newDepth = depthIn - 1 + ext
+                        let newDepth = depth - 1 + ext
                         w.Stack.[ssCur].CurrentMove <- m
                         w.Stack.[ssCur].MovedPiece <- pos.PieceOn(fromSq m)
 
@@ -694,8 +743,8 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                         else
                             // LMR: table reduction, deeper for non-improving / quiet moves, lighter for captures
                             let mutable r =
-                                if depthIn >= 3 && moveCount > 1 && not givesCheck then
-                                    let mutable rr = reduction depthIn moveCount
+                                if depth >= 3 && moveCount > 1 && not givesCheck then
+                                    let mutable rr = reduction depth moveCount
 
                                     if not improving then
                                         rr <- rr + 1
@@ -740,7 +789,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                                 cutoff <- true
 
                                 if usePruning then
-                                    let bonus = statBonus depthIn
+                                    let bonus = statBonus depth
 
                                     if isQuiet then
                                         w.Tables.UpdateMain us m bonus
@@ -777,7 +826,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                         elif best >= beta then BoundLower
                         else BoundExact
 
-                    w.Control.Tt.Store pos.Key depthIn bound (valueToTt best ply) staticEval bestMove
+                    w.Control.Tt.Store pos.Key depth bound (valueToTt best ply) staticEval bestMove
 
                 result <- best
 

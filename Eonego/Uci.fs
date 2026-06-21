@@ -21,6 +21,10 @@ type private UciState =
     { mutable Threads: int
       mutable HashMb: int
       mutable UseProbCut: bool
+      mutable UseIir: bool
+      mutable UseRazoring: bool
+      mutable UseHistoryPruning: bool
+      mutable UseDeltaPruning: bool
       mutable Tt: TranspositionTable
       mutable RootFen: string
       mutable RootMoves: Move[]
@@ -152,7 +156,11 @@ let private startSearch (st: UciState) (lim: SearchLimits) =
           HashMb = st.HashMb
           UseTt = true
           UsePruning = true
-          UseProbCut = st.UseProbCut }
+          UseProbCut = st.UseProbCut
+          UseIir = st.UseIir
+          UseRazoring = st.UseRazoring
+          UseHistoryPruning = st.UseHistoryPruning
+          UseDeltaPruning = st.UseDeltaPruning }
 
     let control = SearchControl(cfg, lim, st.Tt, st.RootFen, st.RootMoves)
     st.Control <- Some control
@@ -181,6 +189,22 @@ let private handleSetOption (st: UciState) (tokens: string[]) =
             match Boolean.TryParse tokens.[vi + 1] with
             | true, b -> st.UseProbCut <- b
             | _ -> ()
+        elif String.Equals(name, "UseIir", StringComparison.OrdinalIgnoreCase) then
+            match Boolean.TryParse tokens.[vi + 1] with
+            | true, b -> st.UseIir <- b
+            | _ -> ()
+        elif String.Equals(name, "UseRazoring", StringComparison.OrdinalIgnoreCase) then
+            match Boolean.TryParse tokens.[vi + 1] with
+            | true, b -> st.UseRazoring <- b
+            | _ -> ()
+        elif String.Equals(name, "UseHistoryPruning", StringComparison.OrdinalIgnoreCase) then
+            match Boolean.TryParse tokens.[vi + 1] with
+            | true, b -> st.UseHistoryPruning <- b
+            | _ -> ()
+        elif String.Equals(name, "UseDeltaPruning", StringComparison.OrdinalIgnoreCase) then
+            match Boolean.TryParse tokens.[vi + 1] with
+            | true, b -> st.UseDeltaPruning <- b
+            | _ -> ()
     | _ -> ()
 
 let run () =
@@ -188,6 +212,10 @@ let run () =
         { Threads = 1
           HashMb = 16
           UseProbCut = true
+          UseIir = true
+          UseRazoring = true
+          UseHistoryPruning = true
+          UseDeltaPruning = true
           Tt = TranspositionTable(16)
           RootFen = StartPosFen
           RootMoves = [||]
@@ -210,6 +238,10 @@ let run () =
                     writeLine "option name Hash type spin default 16 min 1 max 65536"
                     writeLine "option name Threads type spin default 1 min 1 max 256"
                     writeLine "option name UseProbCut type check default true"
+                    writeLine "option name UseIir type check default true"
+                    writeLine "option name UseRazoring type check default true"
+                    writeLine "option name UseHistoryPruning type check default true"
+                    writeLine "option name UseDeltaPruning type check default true"
                     writeLine "uciok"
                 | "isready" -> writeLine "readyok"
                 | "ucinewgame" ->
