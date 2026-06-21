@@ -1,0 +1,55 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+
+    <!-- Compiler optimizations -->
+    <Optimize>true</Optimize>
+    <DebugType>none</DebugType>
+    <Tailcalls>true</Tailcalls>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+
+    <!-- Allow unsafe code for pointer/bitboard optimizations -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+    <!-- GC tuned for throughput -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+    <RetainVMGarbageCollection>true</RetainVMGarbageCollection>
+
+    <!-- Runtime / JIT tuning -->
+    <TieredCompilation>false</TieredCompilation>
+    <ReadyToRun>true</ReadyToRun>
+    <UseWindowsThreadPool>true</UseWindowsThreadPool>
+
+    <!-- Native AOT publishing -->
+    <PublishAot>true</PublishAot>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <IlcOptimizationPreference>Speed</IlcOptimizationPreference>
+    <!-- Use the build machine's full ISA (AVX2 + BMI1/BMI2/PEXT + POPCNT/LZCNT) so the AOT binary uses
+         the PEXT slider backend instead of the magic fallback. `native` targets THIS CPU (13980HX) — the
+         binary then requires a CPU with at least these features to run. -->
+    <IlcInstructionSet>native</IlcInstructionSet>
+    <StackTraceSupport>false</StackTraceSupport>
+    <UseSystemResourceKeys>true</UseSystemResourceKeys>
+    <MetadataUpdaterSupport>false</MetadataUpdaterSupport>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Bitboard.fs" />
+    <Compile Include="Move.fs" />
+    <Compile Include="Zobrist.fs" />
+    <Compile Include="Position.fs" />
+    <Compile Include="Evaluation.fs" />
+    <Compile Include="MoveGeneration.fs" />
+    <Compile Include="History.fs" />
+    <Compile Include="MovePick.fs" />
+    <Compile Include="Transposition.fs" />
+    <Compile Include="Search.fs" />
+    <Compile Include="Uci.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+
+</Project>

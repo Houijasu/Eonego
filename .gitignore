@@ -1,0 +1,72 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+[Dd]ebug/
+[Rr]elease/
+
+# Native AOT publish
+publish/
+*.native
+*.dll.config
+
+# BenchmarkDotNet artifacts
+BenchmarkDotNet.Artifacts/
+
+# Test results
+[Tt]est[Rr]esult*/
+[Bb]uild[Rr]esult.*/
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+
+# NuGet
+*.nupkg
+*.snupkg
+.nuget/
+nuget.exe
+**/[Pp]ackages/*
+!**/[Pp]ackages/build/
+
+# IDEs
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.userprefs
+*.userosscache
+*.sln.docstates
+*.userprefs
+*.swp
+*.*~
+
+# Rider
+*.sln.iml
+.idea_modules/
+
+# Visual Studio Code (keep extensions and settings out)
+.vscode/*.log
+
+# OS files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+*.DS_Store
+
+# Logs
+*.log
+*.tlog
+*.binlog
+
+# Temporary files
+*.tmp
+*.bak
+*.cache
+
+# Project lock files
+project.lock.json
+project.fragment.lock.json
+artifacts/

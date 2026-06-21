@@ -1,0 +1,29 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+max_line_length = 120
+
+[*.{fsproj,fsx,props,targets}]
+indent_size = 2
+
+[*.{csproj,sln}]
+indent_size = 2
+
+[*.{cs,csx}]
+# Group usings: System/Microsoft first, then external libs, then project usings.
+dotnet_sort_system_directives_first = true
+dotnet_separate_import_directive_groups = true
+
+[*.{fs,fsx,fsi}]
+# dotnet format for F# uses Fantomas. Fantomas preserves blank lines between open groups
+# but cannot auto-insert them. Keep opens grouped manually as:
+#   System → Microsoft → external libraries → project modules.
+
+[*.{json,yml,yaml,md}]
+indent_size = 2

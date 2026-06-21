@@ -1,0 +1,497 @@
+module Eonego.Benchmarks.Program
+
+#nowarn "9" // NativePtr.stackalloc in MoveGenBench
+
+open System
+open System.Numerics
+open System.Runtime.Intrinsics.X86
+open Microsoft.FSharp.NativeInterop
+open BenchmarkDotNet.Attributes
+open BenchmarkDotNet.Running
+open Eonego.Bitboard
+open Eonego.Move
+open Eonego.Position
+open Eonego.Evaluation
+open Eonego.MoveGeneration
+open Eonego.History
+open Eonego.MovePick
+open Eonego.Transposition
+open Eonego.Search
+
+/// Bit-serialization loop shoot-out.
+///
+/// The engine's hottest inner loop walks the set bits of a bitboard (one per
+/// piece / target square) during move generation. We compare the two classic
+/// ways to advance to the next bit:
+///   A. ResetAnd  — clear the lowest set bit with `b &= b - 1`  (BLSR on BMI1)
+///   B. ClearXor  — clear the *found* bit with `b ^= (1UL << sq)`
+/// plus a direct-intrinsic baseline (TZCNT + BLSR via Bmi1.X64).
+///
+/// Workload: 4096 bitboards across a spread of densities (8..48 bits), so the
+/// result reflects real move-gen occupancy rather than one pathological case.
+[<MemoryDiagnoser>]
+[<ShortRunJob>]
+type BitloopBench() =
+
+    let data: uint64[] = Array.zeroCreate 4096
+
+    [<GlobalSetup>]
+    member _.Setup() =
+        let rng = Random(20260620)
+
+        let r () =
+            uint64 (rng.NextInt64()) ||| ((uint64 (rng.Next(0, 2))) <<< 63)
+
+        for i in 0 .. data.Length - 1 do
+            data.[i] <-
+                match i % 4 with
+                | 0 -> r () &&& r () &&& r () // very sparse (~8 bits)
+                | 1 -> r () &&& r () // sparse      (~16 bits)
+                | 2 -> r () // medium      (~32 bits)
+                | _ -> r () ||| r () // dense       (~48 bits)
+
+    /// A — reset the lowest set bit via `b &= b - 1` (this is what popLsb uses).
+    [<Benchmark(Baseline = true)>]
+    member _.ResetAnd() =
+        let mutable acc = 0
+
+        for i in 0 .. data.Length - 1 do
+            let mutable b = data.[i]
+
+            while b <> 0UL do
+                let sq = BitOperations.TrailingZeroCount b
+                b <- b &&& (b - 1UL)
+                acc <- acc + sq
+
+        acc
+
+    /// B — clear the found bit via `b ^= (1UL <<< sq)`.
+    [<Benchmark>]
+    member _.ClearXor() =
+        let mutable acc = 0
+
+        for i in 0 .. data.Length - 1 do
+            let mutable b = data.[i]
+
+            while b <> 0UL do
+                let sq = BitOperations.TrailingZeroCount b
+                b <- b ^^^ (1UL <<< sq)
+                acc <- acc + sq
+
+        acc
+
+    /// Direct BMI1 intrinsics: TZCNT + ResetLowestSetBit (BLSR). Falls back to A
+    /// on hardware without BMI1 so the run never throws.
+    [<Benchmark>]
+    member _.Bmi1Direct() =
+        let mutable acc = 0
+
+        if Bmi1.X64.IsSupported then
+            for i in 0 .. data.Length - 1 do
+                let mutable b = data.[i]
+
+                while b <> 0UL do
+                    acc <- acc + int (Bmi1.X64.TrailingZeroCount b)
+                    b <- Bmi1.X64.ResetLowestSetBit b
+        else
+            for i in 0 .. data.Length - 1 do
+                let mutable b = data.[i]
+
+                while b <> 0UL do
+                    let sq = BitOperations.TrailingZeroCount b
+                    b <- b &&& (b - 1UL)
+                    acc <- acc + sq
+
+        acc
+
+/// Attack-lookup baseline: PEXT vs magic for the sliders, plus a leaper lookup.
+/// 4096 (square, random-occupancy) pairs XOR-folded so nothing is optimized away.
+[<MemoryDiagnoser>]
+[<ShortRunJob>]
+type AttackBench() =
+
+    let n = 4096
+    let sqs = Array.zeroCreate n: int[]
+    let occ = Array.zeroCreate n: uint64[]
+
+    [<GlobalSetup>]
+    member _.Setup() =
+        let rng = Random(99)
+
+        for i in 0 .. n - 1 do
+            sqs.[i] <- rng.Next(64)
+            occ.[i] <- uint64 (rng.NextInt64()) ||| ((uint64 (rng.Next(0, 2))) <<< 63)
+
+    [<Benchmark(Baseline = true)>]
+    member _.RookMagic() =
+        let mutable a = 0UL
+
+        for i in 0 .. n - 1 do
+            a <- a ^^^ rookAttacksMagic sqs.[i] occ.[i]
+
+        a
+
+    [<Benchmark>]
+    member _.RookPext() =
+        let mutable a = 0UL
+
+        for i in 0 .. n - 1 do
+            a <- a ^^^ rookAttacksPext sqs.[i] occ.[i]
+
+        a
+
+    [<Benchmark>]
+    member _.BishopMagic() =
+        let mutable a = 0UL
+
+        for i in 0 .. n - 1 do
+            a <- a ^^^ bishopAttacksMagic sqs.[i] occ.[i]
+
+        a
+
+    [<Benchmark>]
+    member _.BishopPext() =
+        let mutable a = 0UL
+
+        for i in 0 .. n - 1 do
+            a <- a ^^^ bishopAttacksPext sqs.[i] occ.[i]
+
+        a
+
+    [<Benchmark>]
+    member _.QueenUnified() =
+        let mutable a = 0UL
+
+        for i in 0 .. n - 1 do
+            a <- a ^^^ queenAttacks sqs.[i] occ.[i]
+
+        a
+
+    [<Benchmark>]
+    member _.KnightLookup() =
+        let mutable a = 0UL
+
+        for i in 0 .. n - 1 do
+            a <- a ^^^ knightAttacks sqs.[i]
+
+        a
+
+/// Move encode/decode/UCI throughput. 4096 mixed moves (normal/promo/ep/castle),
+/// folded so nothing is elided. The hot encode/decode/byref paths should report
+/// 0 B/op; the cold UCI string paths (ToUci/ParseUci) are benched separately to
+/// document their allocation profile.
+[<MemoryDiagnoser>]
+[<ShortRunJob>]
+type MoveBench() =
+
+    let n = 4096
+    let moves = Array.zeroCreate n: int[]
+    let scored = Array.zeroCreate n: ScoredMove[]
+    let strs = Array.zeroCreate n: string[]
+    let froms = Array.zeroCreate n: int[]
+    let dsts = Array.zeroCreate n: int[]
+
+    [<GlobalSetup>]
+    member _.Setup() =
+        let rng = Random(20260620)
+        let promos = [| Knight; Bishop; Rook; Queen |]
+
+        for i in 0 .. n - 1 do
+            let from = rng.Next(64)
+            let mutable dst = rng.Next(64)
+
+            if dst = from then
+                dst <- (dst + 1) &&& 63
+
+            froms.[i] <- from
+            dsts.[i] <- dst
+
+            let m =
+                match i % 4 with
+                | 0 -> mkMove from dst
+                | 1 -> mkPromotion from dst (promos.[rng.Next(4)])
+                | 2 -> mkEnPassant from dst
+                | _ -> mkCastling from dst
+
+            moves.[i] <- m
+            scored.[i] <- mkScored m (rng.Next())
+            strs.[i] <- toUci m
+
+    /// Encode then decode: build a move and fold its decoded fields (0 B/op expected).
+    [<Benchmark(Baseline = true)>]
+    member _.EncodeDecode() =
+        let mutable acc = 0
+
+        for i in 0 .. n - 1 do
+            let m = mkMove froms.[i] dsts.[i]
+            acc <- acc ^^^ fromSq m ^^^ toSq m ^^^ moveFlag m
+
+        acc
+
+    /// Decode-only over pre-built moves.
+    [<Benchmark>]
+    member _.DecodeOnly() =
+        let mutable acc = 0
+
+        for i in 0 .. n - 1 do
+            let m = moves.[i]
+            acc <- acc ^^^ fromSq m ^^^ toSq m ^^^ moveFlag m
+
+        acc
+
+    /// Butterfly history-key extraction.
+    [<Benchmark>]
+    member _.FromToKey() =
+        let mutable acc = 0
+
+        for i in 0 .. n - 1 do
+            acc <- acc ^^^ fromTo moves.[i]
+
+        acc
+
+    /// TT compaction round-trip (pack to uint16, unpack back).
+    [<Benchmark>]
+    member _.Packed16RoundTrip() =
+        let mutable acc = 0
+
+        for i in 0 .. n - 1 do
+            acc <- acc ^^^ ofPacked (packed16 moves.[i])
+
+        acc
+
+    /// Copy-free byref read of the [<Struct; IsReadOnly>] ScoredMove.
+    [<Benchmark>]
+    member _.ScoredByRefFold() =
+        let mutable acc = 0
+
+        for i in 0 .. n - 1 do
+            let sm = &scored.[i]
+            acc <- acc ^^^ sm.Move ^^^ sm.Score
+
+        acc
+
+    /// COLD path: format to a UCI string (allocates).
+    [<Benchmark>]
+    member _.ToUci() =
+        let mutable acc = 0
+
+        for i in 0 .. n - 1 do
+            acc <- acc ^^^ (toUci moves.[i]).Length
+
+        acc
+
+    /// COLD path: parse from a UCI string (allocates / branches).
+    [<Benchmark>]
+    member _.ParseUci() =
+        let mutable acc = 0
+
+        for i in 0 .. n - 1 do
+            acc <- acc ^^^ parseUci strs.[i]
+
+        acc
+
+/// Move-generation throughput + allocation profile. The bulk generators and perft must report 0 B/op
+/// (caller-owned stackalloc Span<Move>, no module state); perft is the strongest 0-alloc proof since it
+/// stackallocs per recursion frame.
+[<MemoryDiagnoser>]
+[<ShortRunJob>]
+type MoveGenBench() =
+
+    let fens =
+        [| "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1" // startpos
+           "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -" // Kiwipete
+           "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - -" |] // endgame
+
+    let mutable positions: Position[] = [||]
+
+    [<GlobalSetup>]
+    member _.Setup() =
+        positions <- fens |> Array.map Position.OfFen
+
+    /// Pseudo-legal bulk generation across the fixed position set (0 B/op expected).
+    [<Benchmark(Baseline = true)>]
+    member _.GenerateNonEvasions() =
+        let pbuf = NativePtr.stackalloc<Move> 256
+        let buf = Span<Move>(NativePtr.toVoidPtr pbuf, 256)
+        let mutable acc = 0
+
+        for pos in positions do
+            acc <- acc + generate pos buf NonEvasions
+
+        acc
+
+    /// Fully-legal generation (pseudo-legal + isLegal filter) over the same set (0 B/op expected).
+    [<Benchmark>]
+    member _.GenerateLegal() =
+        let pbuf = NativePtr.stackalloc<Move> 256
+        let buf = Span<Move>(NativePtr.toVoidPtr pbuf, 256)
+        let mutable acc = 0
+
+        for pos in positions do
+            acc <- acc + generateLegal pos buf
+
+        acc
+
+    /// perft throughput headlines — stackalloc per recursion frame, 0 B/op managed.
+    [<Benchmark>]
+    member _.PerftStartpos4() = perft positions.[0] 4
+
+    [<Benchmark>]
+    member _.PerftKiwipete3() = perft positions.[1] 3
+
+/// MovePick drain + early-cutoff + SEE throughput. The picker drain must be 0 B/op: both buffers are
+/// caller-owned stackalloc Spans, mkMain/nextMove are allocation-free, and Tables is built once in setup.
+/// The lazy-cutoff benchmark takes only the first two moves (a simulated beta cutoff) — structurally it
+/// never reaches QuietInit, so generate(Quiets) is never called; it should be both 0 B/op and much cheaper
+/// than the full drain.
+[<MemoryDiagnoser>]
+[<ShortRunJob>]
+type MovePickBench() =
+
+    let fens =
+        [| "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1" // startpos
+           "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -" // Kiwipete
+           "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - -" |] // endgame
+
+    let mutable positions: Position[] = [||]
+    let mutable tables = Unchecked.defaultof<Tables>
+
+    [<GlobalSetup>]
+    member _.Setup() =
+        positions <- fens |> Array.map Position.OfFen
+        tables <- Tables()
+
+    /// Construct + fully drain the staged picker over the fixed set (0 B/op expected).
+    [<Benchmark(Baseline = true)>]
+    member _.PickerDrainFull() =
+        let pm = NativePtr.stackalloc<Move> 256
+        let moves = Span<Move>(NativePtr.toVoidPtr pm, 256)
+        let ps = NativePtr.stackalloc<int> 256
+        let scores = Span<int>(NativePtr.toVoidPtr ps, 256)
+        let mutable acc = 0
+
+        for pos in positions do
+            let mutable mp =
+                mkMain pos tables MoveNone MoveNone MoveNone MoveNone 8 moves scores
+
+            let mutable m = nextMove &mp false
+
+            while m <> MoveNone do
+                acc <- acc ^^^ m
+                m <- nextMove &mp false
+
+        acc
+
+    /// Construct + take only the first two moves (simulated fail-high) — quiets are never generated.
+    [<Benchmark>]
+    member _.PickerLazyCutoff() =
+        let pm = NativePtr.stackalloc<Move> 256
+        let moves = Span<Move>(NativePtr.toVoidPtr pm, 256)
+        let ps = NativePtr.stackalloc<int> 256
+        let scores = Span<int>(NativePtr.toVoidPtr ps, 256)
+        let mutable acc = 0
+
+        for pos in positions do
+            let mutable mp =
+                mkMain pos tables MoveNone MoveNone MoveNone MoveNone 8 moves scores
+
+            acc <- acc ^^^ nextMove &mp false
+            acc <- acc ^^^ nextMove &mp false
+
+        acc
+
+    /// SEE throughput: see_ge over every capture of the (capture-rich) positions (0 B/op expected).
+    [<Benchmark>]
+    member _.SeeGeDrain() =
+        let pm = NativePtr.stackalloc<Move> 256
+        let buf = Span<Move>(NativePtr.toVoidPtr pm, 256)
+        let mutable acc = 0
+
+        for pos in positions do
+            let n = generate pos buf Captures
+
+            for i in 0 .. n - 1 do
+                if pos.SeeGe buf.[i] 0 then
+                    acc <- acc + 1
+
+        acc
+
+/// Static eval throughput. `eval` must be 0 B/op: the Mg/Eg tables are built once at module init,
+/// `accumulate` returns a struct tuple (stack), Position is a reference type passed by handle, and popLsb
+/// is a byref iterator. The XOR-fold is returned so BenchmarkDotNet cannot dead-code-eliminate the loop.
+[<MemoryDiagnoser>]
+[<ShortRunJob>]
+type EvalBench() =
+
+    let fens =
+        [| "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1" // startpos (phase 24)
+           "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -" // Kiwipete (midgame)
+           "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - -" // rook endgame (low phase)
+           "8/8/8/3k4/8/3K4/4P3/8 w - -" |] // pawn endgame (phase 0)
+
+    let mutable positions: Position[] = [||]
+
+    [<GlobalSetup>]
+    member _.Setup() =
+        positions <- fens |> Array.map Position.OfFen
+
+    /// Evaluate the fixed set; XOR-fold and return. 0 B/op expected.
+    [<Benchmark>]
+    member _.EvalFixedSet() =
+        let mutable acc = 0
+
+        for pos in positions do
+            acc <- acc ^^^ eval pos
+
+        acc
+
+/// Fixed-depth search allocation profile. The Worker (per-thread stack/PV/move/score/quiet buffers) and
+/// the TT are built ONCE in Setup, so the per-op figure measures STEADY-STATE search allocation only —
+/// expected 0 B/op (preallocated buffers, the byref-like picker on the stack, 0-B/op eval, no boxing).
+[<MemoryDiagnoser>]
+[<ShortRunJob>]
+type SearchBench() =
+
+    let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -" // Kiwipete (rich tree)
+    let mutable worker = Unchecked.defaultof<Worker>
+
+    [<GlobalSetup>]
+    member _.Setup() =
+        let cfg =
+            { defaultConfig with
+                Threads = 1
+                HashMb = 16
+                UseTt = true
+                UsePruning = true }
+
+        let tt = TranspositionTable(16)
+        let control = SearchControl(cfg, defaultLimits, tt, fen, [||])
+        worker <- Worker(0, true, control)
+        worker.SetupRoot()
+        control.Reset()
+        control.StartClock 0L 0L
+
+    /// One fixed-depth full-window search over the preallocated worker. 0 B/op expected.
+    [<Benchmark>]
+    member _.SearchDepth7() =
+        negamax worker worker.Pos (-INF) INF 7 0 true
+
+[<EntryPoint>]
+let main argv =
+    // `--filter *` runs every benchmark non-interactively when no args are given.
+    let args = if Array.isEmpty argv then [| "--filter"; "*" |] else argv
+
+    BenchmarkSwitcher
+        .FromTypes(
+            [| typeof<BitloopBench>
+               typeof<AttackBench>
+               typeof<MoveBench>
+               typeof<MoveGenBench>
+               typeof<MovePickBench>
+               typeof<EvalBench>
+               typeof<SearchBench> |]
+        )
+        .Run(args)
+    |> ignore
+
+    0

@@ -1,0 +1,175 @@
+/// Eonego — lock-free shared transposition table (the ONLY shared writable structure in the engine).
+///
+/// Hyatt XOR-lockless entries: each 16-byte entry is two naturally-aligned uint64 (`Key`, `Data`) with
+/// `Key = realKey ^^^ Data`. A probe accepts an entry iff `Key ^^^ Data = realKey`; a torn read (one field
+/// written by another thread between the reader's two reads) breaks that equality and is rejected as a MISS.
+/// Aligned 64-bit reads/writes are atomic on the 64-bit runtime, so each field is individually torn-free and
+/// the XOR ties the two together — no locks, no Interlocked on the hot path. Volatile.Read/Write on both
+/// fields is MANDATORY: it stops the JIT from hoisting a stale `Key` read out of the cluster loop and pins
+/// the store order (Data before Key, so a fresh Key implies a fresh Data).
+///
+/// `Data` packing (LSB->MSB): move:16 | score:int16 | eval:int16 | depth:uint8 | genBound:uint8 ,
+/// where genBound = (generation6 << 2) | bound. generation is therefore only 6 bits (wraps mod 64).
+/// Clusters of 4 entries (64 B, cache-line sized). Replacement = empty/key-match first, else min
+/// (depth - relativeAge*2). Scores are mate-ply-corrected by the CALLER (Search.valueToTt/valueFromTt).
+///
+/// Probe/Store are safe under concurrency, but MUST NOT run concurrently with Resize/Clear — the UCI driver
+/// guarantees this by stopping+joining any active search before setoption Hash / ucinewgame.
+module Eonego.Transposition
+
+open System
+open System.Threading
+open Eonego.Move
+
+[<assembly: System.Runtime.CompilerServices.InternalsVisibleTo("Eonego.Tests")>]
+do ()
+
+// --- bound flags (named Bound* so they never shadow F# `None`) ------------------------------------
+[<Literal>]
+let BoundNone = 0
+
+[<Literal>]
+let BoundUpper = 1 // fail-low : true value <= stored
+
+[<Literal>]
+let BoundLower = 2 // fail-high: true value >= stored
+
+[<Literal>]
+let BoundExact = 3
+
+[<Literal>]
+let ClusterSize = 4
+
+/// 16-byte XOR-lockless entry. Empty <=> Key = 0 && Data = 0 (a real entry always has bound <> BoundNone).
+[<Struct>]
+type TtEntry =
+    { mutable Key: uint64
+      mutable Data: uint64 }
+
+// --- Data <-> fields ------------------------------------------------------------------------------
+// score/eval are signed: stored as the low 16 bits of their int16 two's-complement, sign-extended on read.
+let inline packData (move: Move) (score: int) (eval: int) (depth: int) (genBound: int) : uint64 =
+    (uint64 (uint16 move))
+    ||| (uint64 (uint16 (int16 score)) <<< 16)
+    ||| (uint64 (uint16 (int16 eval)) <<< 32)
+    ||| (uint64 (byte depth) <<< 48)
+    ||| (uint64 (byte genBound) <<< 56)
+
+let inline dMove (d: uint64) : Move = int (uint16 d)
+let inline dScore (d: uint64) : int = int (int16 (uint16 (d >>> 16)))
+let inline dEval (d: uint64) : int = int (int16 (uint16 (d >>> 32)))
+let inline dDepth (d: uint64) : int = int (byte (d >>> 48))
+let inline dGenBound (d: uint64) : int = int (byte (d >>> 56))
+let inline dBound (d: uint64) : int = (dGenBound d) &&& 3
+let inline dGen (d: uint64) : int = (dGenBound d) >>> 2
+
+/// Largest power-of-two cluster count that fits `mb` MiB (>= 1).
+let private clustersFor (mb: int) : int =
+    let bytes = int64 (max 1 mb) * 1024L * 1024L
+    let perCluster = int64 (ClusterSize * 16)
+    let mutable nc = 1L
+
+    while (nc * 2L) * perCluster <= bytes do
+        nc <- nc * 2L
+
+    int nc
+
+[<Sealed>]
+type TranspositionTable(mb: int) =
+    let mutable entries: TtEntry[] = Array.zeroCreate (clustersFor mb * ClusterSize)
+    let mutable clusterMask: int = (entries.Length / ClusterSize) - 1
+    let mutable generation: int = 0 // 6-bit; (g+1) &&& 0x3F per NewSearch
+
+    member private _.Base(key: uint64) : int =
+        (int ((key >>> 32) &&& uint64 clusterMask)) * ClusterSize
+
+    /// Zero every entry and reset the generation (new game).
+    member _.Clear() : unit =
+        Array.Clear(entries, 0, entries.Length)
+        generation <- 0
+
+    /// Reallocate for a new size (MiB). Caller guarantees no search is running.
+    member _.Resize(newMb: int) : unit =
+        entries <- Array.zeroCreate (clustersFor newMb * ClusterSize)
+        clusterMask <- (entries.Length / ClusterSize) - 1
+        generation <- 0
+
+    /// Advance the age counter at the start of a search (6-bit wrap).
+    member _.NewSearch() : unit = generation <- (generation + 1) &&& 0x3F
+
+    /// Size in MiB actually allocated.
+    member _.SizeMb: int = (entries.Length * 16) / (1024 * 1024)
+
+    /// XOR-validated probe. Returns struct(hit, move, score(raw — caller applies valueFromTt), eval, depth, bound).
+    member this.Probe(key: uint64) : struct (bool * Move * int * int * int * int) =
+        let b = this.Base key
+        let mutable i = 0
+        let mutable result = struct (false, MoveNone, 0, 0, 0, BoundNone)
+        let mutable scanning = true
+
+        while scanning && i < ClusterSize do
+            let k = Volatile.Read(&entries.[b + i].Key)
+            let d = Volatile.Read(&entries.[b + i].Data)
+            // XOR self-check; reject the all-zero empty slot (bound = BoundNone) even if realKey = 0.
+            if (k ^^^ d) = key && dBound d <> BoundNone then
+                result <- struct (true, dMove d, dScore d, dEval d, dDepth d, dBound d)
+                scanning <- false
+            else
+                i <- i + 1
+
+        result
+
+    /// XOR-pack store with cluster replacement. `score`/`eval` are already mate-ply-corrected by the caller.
+    member this.Store (key: uint64) (depth: int) (bound: int) (score: int) (eval: int) (move: Move) : unit =
+        let b = this.Base key
+        // Pick the target slot: a key match wins; else an empty slot; else the lowest-quality entry.
+        let mutable slot = b
+        let mutable slotQ = Int32.MaxValue
+        let mutable matched = false
+        let mutable i = 0
+
+        while not matched && i < ClusterSize do
+            let idx = b + i
+            let k = entries.[idx].Key
+            let d = entries.[idx].Data
+
+            if (k ^^^ d) = key && dBound d <> BoundNone then
+                slot <- idx
+                matched <- true
+            elif k = 0UL && d = 0UL then
+                // empty: best possible target; keep scanning only to find a key match.
+                if slotQ <> Int32.MinValue then
+                    (slot <- idx
+                     slotQ <- Int32.MinValue)
+
+                i <- i + 1
+            else
+                let relAge = (generation - dGen d) &&& 0x3F
+                let q = dDepth d - relAge * 2
+
+                if q < slotQ then
+                    (slotQ <- q
+                     slot <- idx)
+
+                i <- i + 1
+
+        let ek = entries.[slot].Key
+        let ed = entries.[slot].Data
+        let isMatch = (ek ^^^ ed) = key && dBound ed <> BoundNone
+        // Keep the existing move when overwriting the same position with MoveNone (SF behaviour).
+        let mv = if move <> MoveNone || not isMatch then move else dMove ed
+        // On a key match, preserve a meaningfully deeper non-exact entry's value/depth/bound.
+        let updateValue = (not isMatch) || (bound = BoundExact) || (depth + 4 > dDepth ed)
+        let dpt = if updateValue then depth else dDepth ed
+        let sc = if updateValue then score else dScore ed
+        let ev = if updateValue then eval else dEval ed
+        let bd = if updateValue then bound else dBound ed
+        let data = packData mv sc ev dpt ((generation <<< 2) ||| bd)
+        // Data BEFORE Key: a reader that sees the fresh Key is guaranteed to see the fresh Data.
+        Volatile.Write(&entries.[slot].Data, data)
+        Volatile.Write(&entries.[slot].Key, key ^^^ data)
+
+    // --- internals for the test assembly (torn-read injection / inspection) ------------------------
+    member internal _.RawEntries: TtEntry[] = entries
+    member internal this.ClusterBase(key: uint64) : int = this.Base key
+    member internal _.Generation: int = generation

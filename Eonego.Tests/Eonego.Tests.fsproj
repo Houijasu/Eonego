@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="TestFixtures.fs" />
+    <Compile Include="BitboardTests.fs" />
+    <Compile Include="MoveTests.fs" />
+    <Compile Include="ZobristTests.fs" />
+    <Compile Include="PositionTests.fs" />
+    <Compile Include="MoveGenerationTests.fs" />
+    <Compile Include="SeeTests.fs" />
+    <Compile Include="IsPseudoLegalTests.fs" />
+    <Compile Include="PromotionSplitTests.fs" />
+    <Compile Include="HistoryTests.fs" />
+    <Compile Include="MovePickTests.fs" />
+    <Compile Include="MovePickProbeTests.fs" />
+    <Compile Include="EvaluationTests.fs" />
+    <Compile Include="TranspositionTests.fs" />
+    <Compile Include="PliesFromNullTests.fs" />
+    <Compile Include="SearchTests.fs" />
+    <Compile Include="DrawDetectionTests.fs" />
+    <Compile Include="LazySmpTests.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Eonego\Eonego.fsproj" />
+  </ItemGroup>
+
+</Project>
