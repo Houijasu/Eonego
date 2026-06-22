@@ -25,6 +25,28 @@ let perftFens =
        "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - -" |]
 
 // ---------------------------------------------------------------------------
+// Mirror FEN transform M(p): vertical flip (rank r <-> 7-r) + color swap, side-to-move KEPT (so a PST eval
+// satisfies eval(p) == -eval(M p)). Reverse the ORDER of the 8 rank substrings ONLY — reversing characters
+// within a rank is a 180° rotation (s^63), the classic bug. Castling/ep blanked ("-"): valid because the
+// eval/feature sets ignore them. (Promoted from EvaluationTests so the NNUE symmetry tests can reuse it.)
+// ---------------------------------------------------------------------------
+let mirrorFen (fen: string) : string =
+    let parts = fen.Split(' ')
+    let flipped = parts.[0].Split('/') |> Array.rev
+
+    let swapCase (s: string) =
+        String(
+            s.ToCharArray()
+            |> Array.map (fun ch ->
+                if Char.IsUpper ch then Char.ToLower ch
+                elif Char.IsLower ch then Char.ToUpper ch
+                else ch)
+        )
+
+    let board = flipped |> Array.map swapCase |> String.concat "/"
+    sprintf "%s %s - - 0 1" board parts.[1]
+
+// ---------------------------------------------------------------------------
 // Full-state snapshot (public copy of PositionTests' Snap) for Make/Unmake round-trip checks.
 // ---------------------------------------------------------------------------
 type Snap =

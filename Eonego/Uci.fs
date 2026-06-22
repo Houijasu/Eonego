@@ -13,6 +13,7 @@ open Eonego.Move
 open Eonego.Position
 open Eonego.MoveGeneration
 open Eonego.Transposition
+open Eonego.NnueNetwork
 open Eonego.Search
 
 let private writeLine (s: string) = Console.Out.WriteLine(s)
@@ -25,6 +26,9 @@ type private UciState =
       mutable UseRazoring: bool
       mutable UseHistoryPruning: bool
       mutable UseDeltaPruning: bool
+      mutable UseNnue: bool
+      mutable NnueFile: string
+      mutable Net: Network option
       mutable Tt: TranspositionTable
       mutable RootFen: string
       mutable RootMoves: Move[]
@@ -160,9 +164,11 @@ let private startSearch (st: UciState) (lim: SearchLimits) =
           UseIir = st.UseIir
           UseRazoring = st.UseRazoring
           UseHistoryPruning = st.UseHistoryPruning
-          UseDeltaPruning = st.UseDeltaPruning }
+          UseDeltaPruning = st.UseDeltaPruning
+          UseNnue = st.UseNnue && st.Net.IsSome
+          UseMaterialOnly = false }
 
-    let control = SearchControl(cfg, lim, st.Tt, st.RootFen, st.RootMoves)
+    let control = SearchControl(cfg, lim, st.Tt, st.RootFen, st.RootMoves, ?net = st.Net)
     st.Control <- Some control
     let t = Thread(ThreadStart(fun () -> Search.go control |> ignore), 16 * 1024 * 1024)
     t.IsBackground <- true
@@ -205,9 +211,41 @@ let private handleSetOption (st: UciState) (tokens: string[]) =
             match Boolean.TryParse tokens.[vi + 1] with
             | true, b -> st.UseDeltaPruning <- b
             | _ -> ()
+        elif String.Equals(name, "UseNnue", StringComparison.OrdinalIgnoreCase) then
+            match Boolean.TryParse tokens.[vi + 1] with
+            | true, b when b <> st.UseNnue ->
+                stopAndJoin st
+
+                if b && st.Net.IsNone then
+                    writeLine "info string UseNnue ignored: no net loaded; using material eval"
+                else
+                    st.UseNnue <- b
+                    st.Tt.Clear()
+            | _ -> ()
+        elif String.Equals(name, "NnueFile", StringComparison.OrdinalIgnoreCase) then
+            stopAndJoin st
+            let path = String.Join(" ", tokens.[vi + 1 ..])
+
+            match NnueNetwork.load path with
+            | Loaded net ->
+                st.Net <- Some net
+                st.NnueFile <- path
+                st.Tt.Clear()
+                writeLine (sprintf "info string NNUE loaded: %s (ver %d, quant %d)" path net.Version net.QuantScale)
+            | Failed reason ->
+                writeLine (sprintf "info string NNUE load failed (%s); keeping current eval" reason)
     | _ -> ()
 
 let run () =
+    // Auto-load the net shipped next to the exe (eonego.nnue); NNUE is on by default when it loads,
+    // and falls back to the material eval if the file is missing or invalid.
+    let defaultNetPath = System.IO.Path.Combine(AppContext.BaseDirectory, "eonego.nnue")
+
+    let defaultNet =
+        match NnueNetwork.load defaultNetPath with
+        | Loaded n -> Some n
+        | Failed _ -> None
+
     let st =
         { Threads = 1
           HashMb = 16
@@ -216,6 +254,9 @@ let run () =
           UseRazoring = true
           UseHistoryPruning = true
           UseDeltaPruning = true
+          UseNnue = defaultNet.IsSome
+          NnueFile = (if defaultNet.IsSome then defaultNetPath else "")
+          Net = defaultNet
           Tt = TranspositionTable(16)
           RootFen = StartPosFen
           RootMoves = [||]
@@ -242,8 +283,15 @@ let run () =
                     writeLine "option name UseRazoring type check default true"
                     writeLine "option name UseHistoryPruning type check default true"
                     writeLine "option name UseDeltaPruning type check default true"
+                    writeLine ("option name UseNnue type check default " + (if st.UseNnue then "true" else "false"))
+                    writeLine ("option name NnueFile type string default " + (if st.NnueFile = "" then "<empty>" else st.NnueFile))
                     writeLine "uciok"
-                | "isready" -> writeLine "readyok"
+                | "isready" ->
+                    if st.UseNnue && st.Net.IsNone then
+                        st.UseNnue <- false
+                        writeLine "info string UseNnue set but no net loaded; using material eval"
+
+                    writeLine "readyok"
                 | "ucinewgame" ->
                     stopAndJoin st
                     st.Tt.Clear()

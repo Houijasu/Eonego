@@ -7,6 +7,15 @@
 
   <ItemGroup>
     <Compile Include="TestFixtures.fs" />
+    <Compile Include="NnueRegionsTests.fs" />
+    <Compile Include="NnueAccumulatorTests.fs" />
+    <Compile Include="NnueTestFixtures.fs" />
+    <Compile Include="NnueL1AccumulatorTests.fs" />
+    <Compile Include="NnueLoaderTests.fs" />
+    <Compile Include="NnueForwardPassTests.fs" />
+    <Compile Include="NnueInputSymmetryTests.fs" />
+    <Compile Include="NnueEvalRangeTests.fs" />
+    <Compile Include="NnueSearchTests.fs" />
     <Compile Include="BitboardTests.fs" />
     <Compile Include="MoveTests.fs" />
     <Compile Include="ZobristTests.fs" />

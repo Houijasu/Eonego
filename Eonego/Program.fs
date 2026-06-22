@@ -3,9 +3,17 @@ module Eonego.Program
 open Eonego.Bitboard
 
 [<EntryPoint>]
-let main _ =
-    // Touch the Bitboard module so all attack/geometry tables initialise (the static-init AOT smoke test);
-    // the result is discarded — all output goes through Console (never printfn) once the UCI loop starts.
+let main argv =
     init () |> ignore
-    Eonego.Uci.run ()
-    0
+
+    if argv.Length > 0 then
+        match argv.[0] with
+        | "gen" -> Eonego.Tooling.runGen argv.[1..]
+        | "featuredump" -> Eonego.Tooling.runFeatureDump argv.[1..]
+        | "nnforward" -> Eonego.Tooling.runNnForward argv.[1..]
+        | _ ->
+            Eonego.Uci.run ()
+            0
+    else
+        Eonego.Uci.run ()
+        0

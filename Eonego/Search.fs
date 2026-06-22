@@ -19,6 +19,8 @@ open Eonego.Bitboard
 open Eonego.Move
 open Eonego.Position
 open Eonego.Evaluation
+open Eonego.NnueNetwork
+open Eonego.Nnue
 open Eonego.MoveGeneration
 open Eonego.History
 open Eonego.MovePick
@@ -86,7 +88,9 @@ type SearchConfig =
       UseIir: bool
       UseRazoring: bool
       UseHistoryPruning: bool
-      UseDeltaPruning: bool }
+      UseDeltaPruning: bool
+      UseNnue: bool
+      UseMaterialOnly: bool }
 
 type SearchLimits =
     { MoveTime: int
@@ -109,7 +113,9 @@ let defaultConfig =
       UseIir = true
       UseRazoring = true
       UseHistoryPruning = true
-      UseDeltaPruning = true }
+      UseDeltaPruning = true
+      UseNnue = false
+      UseMaterialOnly = false }
 
 let defaultLimits =
     { MoveTime = 0
@@ -223,7 +229,7 @@ let private isLegalRoot (pos: Position) (m: Move) : bool =
 // ---------------------------------------------------------------------------
 [<Sealed>]
 type SearchControl
-    (config: SearchConfig, limits: SearchLimits, tt: TranspositionTable, rootFen: string, rootMoves: Move[]) =
+    (config: SearchConfig, limits: SearchLimits, tt: TranspositionTable, rootFen: string, rootMoves: Move[], ?net: Network) =
     let mutable stopFlag = 0
     let sw = System.Diagnostics.Stopwatch()
     let mutable softMs = 0L
@@ -233,6 +239,7 @@ type SearchControl
     member _.Tt = tt
     member _.RootFen = rootFen
     member _.RootMoves = rootMoves
+    member _.Net: Network option = net
     member val LastBest: Move = MoveNone with get, set // result of the most recent go()
     member val LastScore: int = 0 with get, set
     /// Aggregate live node count across all workers (relaxed reads — reporting only, set by go()).
@@ -307,6 +314,11 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     /// Rebuild this worker's Position from the immutable root (FEN + replayed moves) and reset per-search state.
     member _.SetupRoot() =
         pos.LoadFen control.RootFen
+        pos.EnableNnue (control.Config.UseNnue && control.Net.IsSome)
+
+        match control.Net with
+        | Some net when control.Config.UseNnue -> Nnue.bind net pos
+        | _ -> ()
 
         for m in control.RootMoves do
             pos.Make m
@@ -317,6 +329,12 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
         rootBest <- MoveNone
         rootScore <- 0
         completedDepth <- 0
+
+let inline evalPos (w: Worker) (pos: Position) : int =
+    match w.Control.Net with
+    | Some net when w.Control.Config.UseNnue -> Nnue.evaluate net pos
+    | _ when w.Control.Config.UseMaterialOnly -> materialEval pos
+    | _ -> eval pos
 
 let private updatePv (w: Worker) (ply: int) (m: Move) =
     let pv = w.Pv
@@ -355,7 +373,7 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
     elif ply > 0 && isImmediateDraw pos then
         0
     elif ply >= MaxSearchPly then
-        (if pos.InCheck then 0 else eval pos)
+        (if pos.InCheck then 0 else evalPos w pos)
     else
         let cfg = w.Control.Config
         let useTt = cfg.UseTt
@@ -377,7 +395,7 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
         let mutable cutoff = false
 
         if not inCheck then
-            let sp = eval pos
+            let sp = evalPos w pos
             rawEval <- sp
             best <- sp
 
@@ -477,7 +495,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
     elif depthIn <= 0 then
         qsearch w pos alphaIn betaIn ply
     elif ply >= MaxSearchPly then
-        (if pos.InCheck then 0 else eval pos)
+        (if pos.InCheck then 0 else evalPos w pos)
     else
         let cfg = w.Control.Config
         let usePruning = cfg.UsePruning
@@ -535,7 +553,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
             staticEval <-
                 if inCheck then VALUE_NONE
                 elif ttHit && ttEval <> VALUE_NONE then ttEval
-                else eval pos
+                else evalPos w pos
 
             w.Stack.[ssCur].StaticEval <- staticEval
 
@@ -885,7 +903,7 @@ let private reportInfo (w: Worker) (depth: int) (score: int) =
 // Iterative deepening (aspiration). All workers run it; only the main reports + sets the time stop.
 // ---------------------------------------------------------------------------
 let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
-    let mutable prev = eval w.Pos
+    let mutable prev = evalPos w w.Pos
     let mutable depth = 1
 
     while depth <= maxDepth && not w.Control.Stopped do
@@ -1012,11 +1030,11 @@ let go (control: SearchControl) : Move =
 // ---------------------------------------------------------------------------
 // Test entry: a single fixed-depth, FULL-WINDOW negamax (bypasses aspiration/ID). The correctness oracle.
 // ---------------------------------------------------------------------------
-let searchToDepth (fen: string) (rootMoves: Move[]) (depth: int) (cfg: SearchConfig) : struct (int * int64 * Move) =
+let searchToDepthNet (fen: string) (rootMoves: Move[]) (depth: int) (cfg: SearchConfig) (net: Network option) : struct (int * int64 * Move) =
     let tt = TranspositionTable(max 1 cfg.HashMb)
 
     let control =
-        SearchControl(cfg, { defaultLimits with Depth = depth }, tt, fen, rootMoves)
+        SearchControl(cfg, { defaultLimits with Depth = depth }, tt, fen, rootMoves, ?net = net)
 
     let w = Worker(0, true, control)
     w.SetupRoot()
@@ -1024,3 +1042,28 @@ let searchToDepth (fen: string) (rootMoves: Move[]) (depth: int) (cfg: SearchCon
     control.StartClock 0L 0L
     let score = negamax w w.Pos (-INF) INF depth 0 true
     struct (score, w.Nodes, w.Pv.[0])
+
+/// Single-thread iterative deepening until the node budget is exhausted (no UCI stdout). Test/tooling entry.
+let searchToNodesNet (fen: string) (rootMoves: Move[]) (nodes: int64) (cfg: SearchConfig) (net: Network option) : struct (int * int64 * Move) =
+    let tt = TranspositionTable(max 1 cfg.HashMb)
+    let limits = { defaultLimits with Nodes = nodes }
+
+    let control =
+        SearchControl(cfg, limits, tt, fen, rootMoves, ?net = net)
+
+    let w = Worker(0, true, control)
+    w.SetupRoot()
+    control.Reset()
+    control.Tt.NewSearch()
+    control.NodeSum <- (fun () -> w.Nodes)
+    control.StartClock 0L 0L
+    iterativeDeepening w (MaxSearchPly - 1)
+    control.Stop()
+
+    let best =
+        if isLegalRoot w.Pos w.RootBest then w.RootBest else firstLegalMove w.Pos
+
+    struct (w.RootScore, w.Nodes, best)
+
+let searchToDepth (fen: string) (rootMoves: Move[]) (depth: int) (cfg: SearchConfig) : struct (int * int64 * Move) =
+    searchToDepthNet fen rootMoves depth cfg None

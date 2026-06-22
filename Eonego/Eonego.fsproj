@@ -27,7 +27,10 @@
     <!-- Native AOT publishing -->
     <PublishAot>true</PublishAot>
     <InvariantGlobalization>true</InvariantGlobalization>
-    <IlcOptimizationPreference>Speed</IlcOptimizationPreference>
+    <!-- OptimizationPreference (NOT IlcOptimizationPreference, which the ILCompiler targets ignore)
+         drives the optimize-for-speed codegen flag and auto-enables IlcPgoOptimize (framework MIBC PGO)
+         plus VxSort. Verified vs microsoft.dotnet.ilcompiler 10.0.5 Native.targets (lines 29/165/274). -->
+    <OptimizationPreference>Speed</OptimizationPreference>
     <!-- Use the build machine's full ISA (AVX2 + BMI1/BMI2/PEXT + POPCNT/LZCNT) so the AOT binary uses
          the PEXT slider backend instead of the magic fallback. `native` targets THIS CPU (13980HX) — the
          binary then requires a CPU with at least these features to run. -->
@@ -41,15 +44,26 @@
     <Compile Include="Bitboard.fs" />
     <Compile Include="Move.fs" />
     <Compile Include="Zobrist.fs" />
+    <Compile Include="NnueRegions.fs" />
     <Compile Include="Position.fs" />
     <Compile Include="Evaluation.fs" />
+    <Compile Include="NnueNetwork.fs" />
+    <Compile Include="Nnue.fs" />
     <Compile Include="MoveGeneration.fs" />
     <Compile Include="History.fs" />
     <Compile Include="MovePick.fs" />
     <Compile Include="Transposition.fs" />
     <Compile Include="Search.fs" />
+    <Compile Include="Tooling.fs" />
     <Compile Include="Uci.fs" />
     <Compile Include="Program.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Default net shipped beside the exe; Uci.run auto-loads it (NNUE on by default). -->
+    <None Include="eonego.nnue">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 
 </Project>

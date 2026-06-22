@@ -74,3 +74,11 @@ artifacts/
 
 # Planning documents (local superpowers plans)
 docs/superpowers/plans/
+
+# Trainer artifacts — large / regenerable (the .py scripts, suites/, and the shipped net stay tracked)
+trainer/data/
+trainer/nets/
+__pycache__/
+*.pyc
+*.npz
+trainer/*_state*.json

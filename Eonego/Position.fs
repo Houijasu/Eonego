@@ -151,10 +151,87 @@ type Position() =
     let mutable currentKey = 0UL
     let states: StateInfo[] = Array.zeroCreate MaxPly
     let mutable stPly = 0
+    // NNUE incremental region accumulator (layout owned by NnueRegions). Maintained ONLY when nnueActive
+    // (set via EnableNnue) — the default PeSTO path pays nothing. nnueStack is a single flat slab of MaxPly
+    // frames (AccSize bytes each), lazy-allocated on first enable; snapshot-on-Make, restore-on-Unmake.
+    let nnueAcc: sbyte[] = Array.zeroCreate NnueRegions.AccSize
+    let mutable nnueStack: sbyte[] = Array.empty
+    let mutable nnueActive = false
+    // NNUE L1 pre-activation accumulator (maintained when nnueActive && l1Bound). l1Stack mirrors nnueStack.
+    let l1acc: int[] = Array.zeroCreate 64
+    let mutable l1Stack: int[] = Array.empty
+    let mutable pieceColSumRef: int[] = Array.empty
+    let mutable auxColRef: int[] = Array.empty
+    let mutable l1bRef: int[] = Array.empty
+    let mutable l1Bound = false
+
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+    member private _.AddPieceColSum (sq: Square) (pc: Piece) (sign: int) : unit =
+        if l1Bound then
+            let pBase = (sq * NnueRegions.Channels + pc) * 64
+
+            for o in 0 .. 63 do
+                l1acc.[o] <- l1acc.[o] + sign * pieceColSumRef.[pBase + o]
+
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+    member private _.ApplyStmDelta (newStm: Color) : unit =
+        if l1Bound then
+            if newStm = Black then
+                for o in 0 .. 63 do
+                    l1acc.[o] <- l1acc.[o] + auxColRef.[o]
+            else
+                for o in 0 .. 63 do
+                    l1acc.[o] <- l1acc.[o] - auxColRef.[o]
+
+    member private _.ApplyKingAuxDeltas (wkOld: Square) (wkNew: Square) (bkOld: Square) (bkNew: Square) : unit =
+        if l1Bound then
+            if wkNew <> wkOld then
+                let oOld = (1 + wkOld) * 64
+                let oNew = (1 + wkNew) * 64
+
+                for o in 0 .. 63 do
+                    l1acc.[o] <- l1acc.[o] - auxColRef.[oOld + o] + auxColRef.[oNew + o]
+
+            if bkNew <> bkOld then
+                let oOld = (65 + bkOld) * 64
+                let oNew = (65 + bkNew) * 64
+
+                for o in 0 .. 63 do
+                    l1acc.[o] <- l1acc.[o] - auxColRef.[oOld + o] + auxColRef.[oNew + o]
+
+    member private this.RefreshL1Acc() : unit =
+        if l1Bound then
+            for o in 0 .. 63 do
+                l1acc.[o] <- l1bRef.[o]
+
+            let mutable occ = byTypeBB.[AllPieces]
+
+            while occ <> 0UL do
+                let sq = popLsb &occ
+                let pc = board.[sq]
+                let pBase = (sq * NnueRegions.Channels + pc) * 64
+
+                for o in 0 .. 63 do
+                    l1acc.[o] <- l1acc.[o] + pieceColSumRef.[pBase + o]
+
+            if sideToMove = Black then
+                for o in 0 .. 63 do
+                    l1acc.[o] <- l1acc.[o] + auxColRef.[o]
+
+            let wk = this.KingSquare White
+            let bk = this.KingSquare Black
+            let wBase = (1 + wk) * 64
+            let bBase = (65 + bk) * 64
+
+            for o in 0 .. 63 do
+                l1acc.[o] <- l1acc.[o] + auxColRef.[wBase + o] + auxColRef.[bBase + o]
+
+            if not (Array.isEmpty l1Stack) then
+                System.Array.Copy(l1acc, 0, l1Stack, 0, 64)
 
     // --- mutation choke points (the ONLY board writers) ---------------------
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-    member private _.PutPiece (pc: Piece) (sq: Square) =
+    member private this.PutPiece (pc: Piece) (sq: Square) =
         Debug.Assert(pc <> NoPiece, "PutPiece: NoPiece")
         let b = 1UL <<< sq
         let pt = pieceType pc
@@ -164,10 +241,11 @@ type Position() =
         byColorBB.[c] <- byColorBB.[c] ||| b
         board.[sq] <- pc
         currentKey <- currentKey ^^^ zPiece pc sq
-    // EVAL-HOOK: accumulator.activate pc sq
+        if nnueActive then NnueRegions.activate nnueAcc pc sq
+        this.AddPieceColSum sq pc 1
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-    member private _.RemovePiece (pc: Piece) (sq: Square) =
+    member private this.RemovePiece (pc: Piece) (sq: Square) =
         Debug.Assert(pc <> NoPiece, "RemovePiece: NoPiece")
         let b = 1UL <<< sq
         let pt = pieceType pc
@@ -177,10 +255,11 @@ type Position() =
         byColorBB.[c] <- byColorBB.[c] ^^^ b
         board.[sq] <- NoPiece
         currentKey <- currentKey ^^^ zPiece pc sq
-    // EVAL-HOOK: accumulator.deactivate pc sq
+        if nnueActive then NnueRegions.deactivate nnueAcc pc sq
+        this.AddPieceColSum sq pc -1
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-    member private _.MovePiece (pc: Piece) (from: Square) (dst: Square) =
+    member private this.MovePiece (pc: Piece) (from: Square) (dst: Square) =
         Debug.Assert(pc <> NoPiece, "MovePiece: NoPiece")
         // PRE: dst is empty for pt and color c (captures call RemovePiece on dst first).
         let fromTo = (1UL <<< from) ^^^ (1UL <<< dst)
@@ -192,7 +271,9 @@ type Position() =
         board.[from] <- NoPiece
         board.[dst] <- pc
         currentKey <- currentKey ^^^ zPiece pc from ^^^ zPiece pc dst
-    // EVAL-HOOK: accumulator.move pc from dst
+        if nnueActive then NnueRegions.move nnueAcc pc from dst
+        this.AddPieceColSum from pc -1
+        this.AddPieceColSum dst pc 1
 
     // Key-less siblings (used ONLY by unmake -> pure board restore, zero key-drift risk).
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
@@ -243,6 +324,67 @@ type Position() =
 
     member _.SideToMove: Color = sideToMove
     member _.GamePly: int = gamePly
+
+    // --- NNUE accumulator (maintained only when EnableNnue true; default PeSTO path leaves it untouched) ---
+    /// The live 2448-entry region accumulator — read-only view for the forward pass. DO NOT mutate.
+    member _.NnueAccumulator: sbyte[] = nnueAcc
+
+    /// The live 64-entry L1 pre-activation accumulator — read-only; valid when L1Bound.
+    member _.L1Accumulator: int[] = l1acc
+
+    /// True after BindNnueWeights; the incremental L1 path is active when this && nnueActive.
+    member _.L1Bound = l1Bound
+
+    /// Usable incremental L1 path iff NNUE is active AND the L1 tables are bound.
+    member _.L1Active = nnueActive && l1Bound
+
+    /// Bind precomputed L1 tables for incremental first-layer maintenance. MUST be called at the root
+    /// (stPly = 0), typically after EnableNnue. Rebuilds l1acc when NNUE is already active.
+    member this.BindNnueWeights (pieceColSum: int[]) (auxCol: int[]) (l1b: int[]) : unit =
+        Debug.Assert((stPly = 0), "BindNnueWeights must be called at the root (stPly = 0)")
+        pieceColSumRef <- pieceColSum
+        auxColRef <- auxCol
+        l1bRef <- l1b
+        l1Bound <- true
+
+        if Array.isEmpty l1Stack then
+            l1Stack <- Array.zeroCreate (MaxPly * 64)
+
+        if nnueActive then
+            this.RefreshL1Acc()
+
+    /// Turn NNUE accumulator maintenance on/off. MUST be called at the ROOT (stPly = 0) — typically right
+    /// after LoadFen, before any Make. Enabling lazy-allocates the per-ply snapshot slab and rebuilds the
+    /// accumulator + frame-0 snapshot from the current board. Enabling mid-stack is UNSUPPORTED: the snapshots
+    /// for plies made while NNUE was off were never taken, so a later Unmake would restore garbage.
+    member this.EnableNnue(on: bool) : unit =
+        Debug.Assert((stPly = 0), "EnableNnue must be called at the root (stPly = 0), before any Make")
+        nnueActive <- on
+
+        if on then
+            if Array.isEmpty nnueStack then
+                nnueStack <- Array.zeroCreate (MaxPly * NnueRegions.AccSize)
+
+            this.RefreshNnueAcc()
+        elif l1Bound && not (Array.isEmpty l1Stack) then
+            System.Array.Clear(l1acc, 0, 64)
+
+    /// Rebuild the region accumulator from scratch off the board (cold path: enable / FEN load / net reload).
+    /// Mirrors RecomputeKey's "from scratch" oracle role. No region work when NNUE is inactive.
+    member this.RefreshNnueAcc() : unit =
+        System.Array.Clear(nnueAcc, 0, NnueRegions.AccSize)
+
+        if nnueActive then
+            let mutable occ = byTypeBB.[AllPieces]
+
+            while occ <> 0UL do
+                let sq = popLsb &occ
+                NnueRegions.activate nnueAcc board.[sq] sq
+
+            System.Array.Copy(nnueAcc, 0, nnueStack, 0, NnueRegions.AccSize)
+
+        if l1Bound then
+            this.RefreshL1Acc()
 
     // --- StateInfo scalar accessors (byref-local read avoids the ~120 B struct copy; the getter itself
     //     is trivial and JIT-inlined — F# forbids MethodImpl on a parameterless property) -------------
@@ -559,6 +701,7 @@ type Position() =
         System.Array.Fill(board, NoPiece)
         System.Array.Clear(byTypeBB, 0, byTypeBB.Length)
         System.Array.Clear(byColorBB, 0, byColorBB.Length)
+        if nnueActive then System.Array.Clear(nnueAcc, 0, NnueRegions.AccSize)
         currentKey <- 0UL
         stPly <- 0
         gamePly <- 0
@@ -705,6 +848,12 @@ type Position() =
 
         this.SetCheckInfo()
         Debug.Assert((this.RecomputeKey() = currentKey), "LoadFen: incremental key != from-scratch")
+        // Keep the frame-0 snapshot coherent if NNUE is already active across a re-load (stPly is now 0).
+        if nnueActive then
+            System.Array.Copy(nnueAcc, 0, nnueStack, 0, NnueRegions.AccSize)
+
+        if l1Bound then
+            this.RefreshL1Acc()
 
     member _.ToFen() : string =
         let sb = System.Text.StringBuilder()
@@ -795,6 +944,15 @@ type Position() =
         st.EpSquare <- NoSquare
         st.CapturedPiece <- NoPiece
         st.Repetition <- 0
+        let wkOld = this.KingSquare White
+        let bkOld = this.KingSquare Black
+        // snapshot the PARENT accumulator into this child's slot BEFORE the hooks mutate it (restored verbatim
+        // by Unmake — the NK board-restore fires no hooks, exactly like Unmake reading the parent Key directly).
+        if nnueActive then
+            System.Array.Copy(nnueAcc, 0, nnueStack, stPly * NnueRegions.AccSize, NnueRegions.AccSize)
+
+        if l1Bound then
+            System.Array.Copy(l1acc, 0, l1Stack, stPly * 64, 64)
         // 2/3. apply (fast path first per Move.fs contract)
         if not (isSpecial m) then
             let captured = board.[dst]
@@ -849,6 +1007,10 @@ type Position() =
         st.Key <- currentKey
         this.SetCheckInfo()
 
+        if l1Bound then
+            this.ApplyStmDelta them
+            this.ApplyKingAuxDeltas wkOld (this.KingSquare White) bkOld (this.KingSquare Black)
+
     /// Undo the move applied by Make. Pure board restore — NO key math (the parent frame holds the key).
     member this.Unmake(m: Move) : unit =
         sideToMove <- flipColor sideToMove // back to the mover `us`
@@ -880,6 +1042,13 @@ type Position() =
                 this.MovePieceNK (makePiece us Rook) castleRookTo.[dst] castleRookFrom.[dst]
 
         Debug.Assert((stPly > 0), "Unmake: stack underflow")
+        // restore the pre-move accumulator from this ply's snapshot (pure memcpy — no region math).
+        if nnueActive then
+            System.Array.Copy(nnueStack, stPly * NnueRegions.AccSize, nnueAcc, 0, NnueRegions.AccSize)
+
+        if l1Bound then
+            System.Array.Copy(l1Stack, stPly * 64, l1acc, 0, 64)
+
         stPly <- stPly - 1
         gamePly <- gamePly - 1
         currentKey <- (let p = &states.[stPly] in p.Key)
@@ -905,12 +1074,23 @@ type Position() =
         st.PliesFromNull <- 0
         st.CapturedPiece <- NoPiece
         st.Repetition <- 0
+
+        if l1Bound then
+            System.Array.Copy(l1acc, 0, l1Stack, stPly * 64, 64)
+
         sideToMove <- flipColor sideToMove
         st.Key <- currentKey
         this.SetCheckInfo()
 
+        if l1Bound then
+            this.ApplyStmDelta sideToMove
+
     member this.UnmakeNull() : unit =
         Debug.Assert((stPly > 0), "UnmakeNull: stack underflow")
+
+        if l1Bound then
+            System.Array.Copy(l1Stack, stPly * 64, l1acc, 0, 64)
+
         stPly <- stPly - 1
         gamePly <- gamePly - 1
         sideToMove <- flipColor sideToMove

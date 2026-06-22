@@ -1,6 +1,6 @@
 # Eonego
 
-A from-scratch chess engine written in **F#** (.NET 10), built for speed and verified for correctness. Eonego implements a complete UCI-compatible search stack on top of a hand-tuned bitboard board representation: PEXT/magic sliders, a Stockfish-style staged move picker, alpha-beta / PVS search with LazySMP and aggressive forward pruning (ProbCut, log-based LMR, null-move, futility/SEE), and a lock-free transposition table — all allocation-free on the hot path and validated against published perft node counts and an in-test minimax oracle.
+A from-scratch chess engine written in **F#** (.NET 10), built for speed and verified for correctness. Eonego implements a complete UCI-compatible search stack on top of a hand-tuned bitboard board representation: PEXT/magic sliders, a Stockfish-style staged move picker, alpha-beta / PVS search with LazySMP and aggressive forward pruning (ProbCut, log-based LMR, null-move, futility/SEE), and a lock-free transposition table — all allocation-free on the hot path and validated against published perft node counts and an in-test minimax oracle. Evaluation is a quantized **NNUE** (region-piececount net with an incrementally-updated, bit-exact int8 accumulator) with a material-only fallback, plus a self-contained Python **training pipeline** (`trainer/`).
 
 - **Author:** Houijasu
 - **Language:** F# on `net10.0`
@@ -55,9 +55,9 @@ A from-scratch chess engine written in **F#** (.NET 10), built for speed and ver
 - `perft` + `perftDivide` driver; node counts pinned to the canonical CPW positions 1–6
 
 **Evaluation**
-- PeSTO-style tapered evaluation: material + piece-square tables, MG/EG interpolated by game phase
-- 0 bytes/op, thread-safe (read-only after one-time init)
-- White-relative accumulation with negamax sign flip; exact mirror symmetry `eval(p) == -eval(mirror p)`
+- Two evaluators: a fast **material-only** static eval (the NNUE-off default / fallback) and an **NNUE** network eval
+- **NNUE**: a custom *region-piececount* net (`2577 → 64 → 32 → 16 → 16 → 1`, int8/int16 quantized) with an **incremental first-layer accumulator** maintained across make/unmake/null — bit-exact int8 inference on both AVX2 and scalar paths, ~5–10× faster than recomputing, 0 B/op
+- Both are 0 B/op and thread-safe (read-only weights), white-relative with a negamax sign flip
 
 **Search**
 - Alpha-beta / **PVS**, fail-soft, with aspiration iterative deepening
@@ -99,8 +99,8 @@ The solution (`Eonego.slnx) contains three projects:
 The engine is compiled as a single ordered module chain (compile order is load-bearing — each module builds on the previous):
 
 ```
-Bitboard → Move → Zobrist → Position → Evaluation → MoveGeneration
-        → History → MovePick → Transposition → Search → Uci → Program
+Bitboard → Move → Zobrist → NnueRegions → Position → Evaluation → NnueNetwork → Nnue
+        → MoveGeneration → History → MovePick → Transposition → Search → Tooling → Uci → Program
 ```
 
 | Module | Responsibility |
@@ -108,13 +108,17 @@ Bitboard → Move → Zobrist → Position → Evaluation → MoveGeneration
 | [`Bitboard.fs`](Eonego/Bitboard.fs) | LERF bitboards, hardware caps, leaf bit ops, geometry tables, classical + magic + PEXT sliders, leaper tables |
 | [`Move.fs`](Eonego/Move.fs) | 16-bit packed move encoding, accessors, predicates, TT compaction, UCI parse/format |
 | [`Zobrist.fs`](Eonego/Zobrist.fs) | Fixed-seed Zobrist key tables (Psq, castling rights, en-passant file, side) |
-| [`Position.fs`](Eonego/Position.fs) | Mutable board state, make/unmake/null, FEN, SEE, check-info, pseudo-legality |
-| [`Evaluation.fs`](Eonego/Evaluation.fs) | PeSTO tapered material + PST eval (0 B/op, thread-safe) |
+| [`NnueRegions.fs`](Eonego/NnueRegions.fs) | Region-feature map (204 k×k regions × 12 channels) + incremental accumulator primitives (compiles before `Position`) |
+| [`Position.fs`](Eonego/Position.fs) | Mutable board state, make/unmake/null, FEN, SEE, check-info, pseudo-legality, NNUE region + L1 accumulators |
+| [`Evaluation.fs`](Eonego/Evaluation.fs) | Material-only static eval (NNUE-off default / fallback) |
+| [`NnueNetwork.fs`](Eonego/NnueNetwork.fs) | NNUE loader + quantized int8/int16 forward kernels (AVX2 + scalar) + incremental L1 forward |
+| [`Nnue.fs`](Eonego/Nnue.fs) | NNUE eval seam — feature assembly / maintained-accumulator read, clamp + negamax sign |
 | [`MoveGeneration.fs`](Eonego/MoveGeneration.fs) | Staged allocation-free generator, legality filter, perft |
 | [`History.fs`](Eonego/History.fs) | Per-thread move-ordering tables (main/capture history, killers, counters) |
 | [`MovePick.fs`](Eonego/MovePick.fs) | Stockfish-style staged lazy move picker |
 | [`Transposition.fs`](Eonego/Transposition.fs) | Lock-free XOR-lockless transposition table |
 | [`Search.fs`](Eonego/Search.fs) | PVS / alpha-beta, LazySMP, iterative deepening, pruning, time budget |
+| [`Tooling.fs`](Eonego/Tooling.fs) | Offline CLI subcommands: `gen` (self-play data), `featuredump`, `nnforward` (training / parity) |
 | [`Uci.fs`](Eonego/Uci.fs) | UCI driver (master search thread, console I/O) |
 | [`Program.fs`](Eonego/Program.fs) | Entry point: bitboard warmup + `Uci.run()` |
 
@@ -163,7 +167,7 @@ Sentinels: `MoveNone = 0`, `MoveNull = 0x41` (both have `from == to`, rejected b
 
 All board mutation flows through three choke points (`PutPiece`/`RemovePiece`/`MovePiece`) that also maintain the incremental Zobrist key. `Unmake` uses key-less siblings (`*NK`) for pure board restore — zero key-drift risk; the parent frame holds the key. `MakeNull`/`UnmakeNull` implement null moves (precondition: not in check).
 
-The material table `pieceValue {100, 320, 330, 500, 900, 0}` (Pawn..King) is the single source of truth for **SEE and move ordering**; King = 0 is the SEE sentinel. Evaluation keeps its own (PeSTO) values — intentionally distinct, as in Stockfish.
+The material table `pieceValue {100, 320, 330, 500, 900, 0}` (Pawn..King) is the single source of truth for **SEE and move ordering**; King = 0 is the SEE sentinel. The material-only `Evaluation.fs` sums piece values; all positional understanding lives in the NNUE (the former PeSTO tables were removed).
 
 `Position` also implements `SeeGe` (faithful swap-loop), `GivesCheck` (direct, discovered, and special-move post-occupancy cases), `IsPseudoLegal` (hand-rolled from Position accessors so the MovePick can emit a TT/killer/counter move without generating), and `AttackersTo(occ)`.
 
@@ -185,15 +189,22 @@ The material table `pieceValue {100, 320, 330, 500, 900, 0}` (Pawn..King) is the
 
 ## Evaluation
 
-`Evaluation.fs` is a PeSTO-style tapered static evaluation: material + piece-square tables, with middlegame and endgame values interpolated by game phase.
+Eonego has two evaluators behind one negamax-signed seam.
 
-- Material (`mgValue`/`egValue`) and PST tables are the published PeSTO values; combined into flat `Mg`/`Eg` arrays indexed `(pc <<< 6) + sq` (`pc = color*6 + pieceType`), built once at module load
-- Phase weights sum to `PhaseMax = 24`; phase is capped before the multiply and divided once on a white-relative signed numerator, so `eval(mirror p) == -eval(p)` holds to the centipawn
-- `accumulate` returns a `struct (int * int * int)` — stack only, 0 heap allocations
-- `eval` is 0 B/op and purely static: checkmate / stalemate / repetition / 50-move / insufficient material are the **search's** concern, never eval's
-- Thread-safe by construction: after the one-time `initTables`, the `Mg`/`Eg` arrays are only read, so any number of LazySMP threads may call `eval` concurrently on distinct `Position` instances
+### Material eval (`Evaluation.fs`)
 
-An incremental eval accumulator is scaffolded (`EVAL-HOOK` comments in `Position.fs`) but deferred; v1 recomputes from scratch.
+A deliberately minimal **material-only** static eval — piece values summed white-relative — used when NNUE is off and as the cold fallback when no net loads. No PST / king safety / taper. 0 B/op, thread-safe, and it doubles as the bootstrap teacher for early self-play data. Checkmate / stalemate / repetition / 50-move / insufficient material remain the **search's** concern, never eval's.
+
+### NNUE (`NnueRegions.fs` → `NnueNetwork.fs` → `Nnue.fs`)
+
+A custom *region-piececount* network, fully quantized for int8/int16 inference:
+
+- **Features (2577):** 2448 region piece-counts (204 axis-aligned k×k sub-squares × 12 piece channels) + 1 side-to-move bit + a 128-entry king one-hot. The region accumulator is maintained incrementally on every `Make`/`Unmake`.
+- **Network:** `2577 → 64 → 32 → 16 → 16 → 1`, int8 weights (int16 output), int32 accumulate, per-layer right-shift + ClippedReLU(127), divided by `quantScale` to centipawns. The `EONGNNUE` v2 file format carries the header, per-layer shifts, and unpadded weights.
+- **Incremental first-layer accumulator:** the 64-wide L1 pre-activation is maintained across `Make`/`Unmake`/`MakeNull` by adding/subtracting precomputed folded weight columns (`PieceColSum` / `AuxCol`), so `evaluate` skips the wide GEMV and just reads the accumulator. This is **bit-exact** with the from-scratch recompute (the small L1 inputs never saturate the int16 path) and is what makes NNUE ~5–10× faster than recomputing.
+- **Kernels:** AVX2 (`vpmaddubsw` + `vpmaddwd`) with a bit-identical scalar fallback (`EONEGO_FORCE_SCALAR=1`), gated by `NnueL1AccumulatorTests` and the loader/forward parity suites.
+
+`Nnue.evaluate` reads the maintained accumulator, runs L2→L5, clamps to ±`EvalMax`, and applies the negamax sign. The engine **auto-loads `eonego.nnue` from beside the executable** with NNUE on by default; `setoption name UseNnue` / `NnueFile` override at runtime.
 
 ---
 
@@ -278,7 +289,7 @@ Stat updates use SF's "gravity" formula `entry += clamp(bonus,-D,D) - entry*|cla
 
 | Command | Behavior |
 |---|---|
-| `uci` | Emit `id name Eonego` / `id author Houijasu`, the `Hash` / `Threads` / `UseProbCut` options, and `uciok` |
+| `uci` | Emit `id name Eonego` / `id author Houijasu`, the `Hash` / `Threads` / pruning toggles / `UseNnue` / `NnueFile` options, and `uciok` |
 | `isready` | Reply `readyok` |
 | `ucinewgame` | Stop any search, clear the TT, reset to startpos |
 | `position [startpos \| fen <fields>] moves m1 m2 ...` | Set the root; UCI moves are re-stamped against legal generation (recovers EP/castling flags, disambiguates under-promotions) |
@@ -291,12 +302,15 @@ Stat updates use SF's "gravity" formula `entry += clamp(bonus,-D,D) - entry*|cla
 | `setoption name UseRazoring value <true\|false>` | Toggle razoring at shallow depths (default on) |
 | `setoption name UseHistoryPruning value <true\|false>` | Toggle history-based quiet pruning (default on) |
 | `setoption name UseDeltaPruning value <true\|false>` | Toggle qsearch delta pruning (default on) |
+| `setoption name UseNnue value <true\|false>` | Toggle NNUE evaluation (default off; requires a loaded net via `NnueFile`) |
+| `setoption name NnueFile value <path>` | Load an NNUE network from disk; clears the TT on success |
 | `quit` | Stop + join, then exit |
 
 ### Defaults
 
 - `Threads = 1`, `Hash = 16` MiB
 - Forward-pruning toggles default to `true`: `UseProbCut`, `UseIir`, `UseRazoring`, `UseHistoryPruning`, `UseDeltaPruning`
+- **`UseNnue` defaults to `true` when `eonego.nnue` is found beside the exe** (auto-loaded at startup); otherwise it falls back to the material eval. `setoption name NnueFile value <path>` swaps the net at runtime; `UseNnue value false` forces material
 - Standard chess only (Chess960 castling is out of v1 scope; castling uses standard king-to-square encoding `e1g1`/`e1c1`/`e8g8`/`e8c8`)
 
 ### Draw detection (search-owned)
@@ -383,6 +397,17 @@ Run with `dotnet run --project Eonego.Benchmarks -c Release` (no args runs every
 
 ---
 
+## Training (NNUE)
+
+The `trainer/` directory is a self-contained Python pipeline for training the NNUE, anchored at the **King's Gambit Accepted** opening (a tactical-specialist focus). It is **bit-exact to the engine**: a numpy feature encoder is gated byte-for-byte against the engine's `featuredump`, and an integer-forward reference is gated against `nnforward`, so a net trained in PyTorch deploys with identical evals.
+
+- **Data:** the engine's `gen` subcommand self-plays KGA games (single-threaded, deterministic) into `(fen, cp, result)` records; `sflabel.py` re-labels positions with deep **Stockfish 18** eval for distillation.
+- **Train:** `train.py` fits the quantized net in win-probability space (`sigmoid(cp/K)`, eval/WDL blend), on GPU when available, and exports the `EONGNNUE` file with a round-trip parity check.
+- **Evaluate:** `match.py` (UCI match driver + SPRT) and `tactics.py` (Stockfish-verified KGA tactical suite) gate each net — all anchored at the KGA position.
+- **Loops:** `loop.py` (self-play RL) and `sfloop.py` (Stockfish-distillation, distribution-matched + warm-start) iterate generations with promotion gating.
+
+---
+
 ## Project structure
 
 ```
@@ -390,25 +415,23 @@ Eonego/
 ├── Eonego.slnx
 ├── Eonego/
 │   ├── Eonego.fsproj
-│   ├── Bitboard.fs
-│   ├── Move.fs
-│   ├── Zobrist.fs
-│   ├── Position.fs
-│   ├── Evaluation.fs
-│   ├── MoveGeneration.fs
-│   ├── History.fs
-│   ├── MovePick.fs
-│   ├── Transposition.fs
-│   ├── Search.fs
-│   ├── Uci.fs
-│   └── Program.fs
-├── Eonego.Tests/
-│   ├── Eonego.Tests.fsproj
-│   ├── TestFixtures.fs
-│   └── … (19 test modules)
-└── Eonego.Benchmarks/
-    ├── Eonego.Benchmarks.fsproj
-    └── Program.fs
+│   ├── Bitboard.fs  Move.fs  Zobrist.fs
+│   ├── NnueRegions.fs              # region-feature map + accumulator primitives
+│   ├── Position.fs  Evaluation.fs
+│   ├── NnueNetwork.fs  Nnue.fs     # NNUE loader/kernels + eval seam
+│   ├── MoveGeneration.fs  History.fs  MovePick.fs  Transposition.fs  Search.fs
+│   ├── Tooling.fs                  # gen / featuredump / nnforward subcommands
+│   ├── Uci.fs  Program.fs
+│   └── eonego.nnue                 # shipped default net (auto-loaded beside the exe)
+├── Eonego.Tests/                   # xUnit: perft gate, search oracle, NNUE parity (incl. NnueL1AccumulatorTests)
+├── Eonego.Benchmarks/              # BenchmarkDotNet microbenchmarks
+└── trainer/                        # Python NNUE training pipeline (data/ nets/ are gitignored)
+    ├── encoder.py  intref.py       # byte-exact feature encoder + integer-forward oracle
+    ├── model.py  train.py  export.py  dataset.py
+    ├── sflabel.py                  # parallel Stockfish-18 position labeler
+    ├── match.py  tactics.py  build_suite.py
+    ├── loop.py  sfloop.py          # self-play / Stockfish-distillation reinforcement loops
+    └── suites/kga_tactics.tsv      # Stockfish-verified KGA tactical suite
 ```
 
 ---
@@ -419,12 +442,13 @@ Eonego/
 - **No module-level mutable state** in move generation / move picking / history — LazySMP / lockless by construction; each thread owns its buffers and tables.
 - **`Position` is not thread-safe** — each search thread gets its own instance.
 - **Make assumes the move is legal** (as in every engine core); legality is movegen's job.
-- **Material values are split**: SEE/ordering values (`{100,320,330,500,900,0}`) are deliberately distinct from PeSTO eval values — do not unify them.
+- **Two evaluators, no HCE**: a minimal material-only static eval (SEE/ordering keep the dedicated `{100,320,330,500,900,0}` values) plus the NNUE network — the former PeSTO/PST eval was removed.
 - **Zobrist draw order is load-bearing** — reordering the PRNG draws shifts every subsequent key; `ZobristTests` pins specific entries to literals.
 
 ### Deferred / out of v1 scope
 
-- Incremental evaluation accumulator (scaffolded via `EVAL-HOOK` comments in `Position.fs`; v1 recomputes from scratch)
+- NNUE: the region-piececount architecture is small (~165k params) — a tactical *specialist* ceiling, not a general 3000-Elo net; a larger king-conditioned (HalfKP / HalfKA) feature set is the path beyond it
+- SIMD for the incremental L1 update loops; lazy (skip-interior-node) accumulator updates
 - Continuation history and `QuietChecks` generation
 - Chess960 / Fischer random castling
 - Pin-aware SEE refinement (the king-terminate rule already covers the dominant illegal-recapture case)
