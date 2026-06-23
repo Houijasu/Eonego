@@ -372,7 +372,7 @@ type MovePickBench() =
 
         for pos in positions do
             let mutable mp =
-                mkMain pos tables MoveNone MoveNone MoveNone MoveNone 8 moves scores
+                mkMain pos tables MoveNone MoveNone MoveNone MoveNone 8 -1 -1 -1 -1 moves scores
 
             let mutable m = nextMove &mp false
 
@@ -393,7 +393,7 @@ type MovePickBench() =
 
         for pos in positions do
             let mutable mp =
-                mkMain pos tables MoveNone MoveNone MoveNone MoveNone 8 moves scores
+                mkMain pos tables MoveNone MoveNone MoveNone MoveNone 8 -1 -1 -1 -1 moves scores
 
             acc <- acc ^^^ nextMove &mp false
             acc <- acc ^^^ nextMove &mp false
@@ -474,7 +474,7 @@ type SearchBench() =
     /// One fixed-depth full-window search over the preallocated worker. 0 B/op expected.
     [<Benchmark>]
     member _.SearchDepth7() =
-        negamax worker worker.Pos (-INF) INF 7 0 true
+        negamax worker worker.Pos (-INF) INF 7 0 true false
 
 [<EntryPoint>]
 let main argv =

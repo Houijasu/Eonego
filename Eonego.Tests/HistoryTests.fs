@@ -61,6 +61,36 @@ let ``counter-moves round-trip per (prevPiece, prevTo)`` () =
     Assert.Equal(MoveNone, t.CounterMove prevPc (sq 0 0)) // untouched slot
 
 [<Fact>]
+let ``continuation history saturates within int16 and disables on the -1 sentinel`` () =
+    let prevPc = makePiece Black Knight
+    let prevTo = sq 5 2
+    let pc = makePiece White Pawn
+    let dst = sq 4 3
+    let t = Tables()
+
+    for _ in 1..1000 do
+        t.UpdateCont1 prevPc prevTo pc dst ContHistD
+        t.UpdateCont2 prevPc prevTo pc dst (-ContHistD)
+
+    Assert.Equal(ContHistD, t.ContHistory1 prevPc prevTo pc dst) // pins at +D
+    Assert.Equal(-ContHistD, t.ContHistory2 prevPc prevTo pc dst) // pins at -D
+    Assert.True(t.ContHistory1 prevPc prevTo pc dst <= 32767) // fits int16
+    Assert.Equal(0, t.ContHistory1 prevPc prevTo pc (sq 0 0)) // a different slot is untouched
+    Assert.Equal(0, t.ContHistory1 -1 prevTo pc dst) // -1 prevPc sentinel reads 0
+
+[<Fact>]
+let ``continuation history -1 sentinel makes updates a no-op`` () =
+    let pc = makePiece White Pawn
+    let dst = sq 4 3
+    let t = Tables()
+
+    for _ in 1..1000 do
+        t.UpdateCont1 -1 -1 pc dst ContHistD // disabled context: must not write anywhere
+
+    // cont1/cont2 stay zero everywhere (spot-check a real context slot)
+    Assert.Equal(0, t.ContHistory1 (makePiece Black Knight) (sq 5 2) pc dst)
+
+[<Fact>]
 let ``killers slide and de-duplicate per ply`` () =
     let t = Tables()
     let k1 = mkMove (sq 1 0) (sq 2 2) // b1c3

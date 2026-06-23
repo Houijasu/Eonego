@@ -24,7 +24,12 @@ let private cfgBase =
         UseIir = false
         UseRazoring = false
         UseHistoryPruning = false
-        UseDeltaPruning = false }
+        UseDeltaPruning = false
+        UseContHist = false
+        UseSingular = false
+        UseNmpVerify = false
+        UseLmrTweaks = false
+        UseAspTweaks = false }
 
 let private cfgOn = cfgBase                                         // UseProbCut = true
 let private cfgOff = { cfgBase with UseProbCut = false }
@@ -82,8 +87,8 @@ let ``mate score round-trips through a BoundLower ProbCut store`` (ply: int) =
     let tt = TranspositionTable(1)
     let key = 0x51A2B3C4D5E6F708UL
     let vWin = MATE - 11
-    tt.Store key 6 BoundLower (valueToTt vWin ply) 0 0x123
-    let struct (hit, _, sc, _, _, bd) = tt.Probe key
+    tt.Store key 6 BoundLower (valueToTt vWin ply) 0 0x123 false
+    let struct (hit, _, sc, _, _, bd, _) = tt.Probe key
     Assert.True hit
     Assert.Equal(BoundLower, bd)
     Assert.Equal(vWin, valueFromTt sc ply)

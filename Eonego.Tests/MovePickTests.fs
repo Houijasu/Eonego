@@ -35,7 +35,7 @@ let private drainMain
     let moves = Span<Move>(NativePtr.toVoidPtr pm, MaxMoves)
     let ps = NativePtr.stackalloc<int> MaxMoves
     let scores = Span<int>(NativePtr.toVoidPtr ps, MaxMoves)
-    let mutable mp = mkMain pos tables tt k1 k2 cm depth moves scores
+    let mutable mp = mkMain pos tables tt k1 k2 cm depth -1 -1 -1 -1 moves scores
     let r = ResizeArray<Move>()
     let mutable m = nextMove &mp skipQ
 
@@ -230,7 +230,7 @@ let ``skipQuiets never generates quiets (structural laziness)`` () =
     let moves = Span<Move>(NativePtr.toVoidPtr pm, MaxMoves)
     let ps = NativePtr.stackalloc<int> MaxMoves
     let scores = Span<int>(NativePtr.toVoidPtr ps, MaxMoves)
-    let mutable mp = mkMain p tables MoveNone MoveNone MoveNone MoveNone 8 moves scores
+    let mutable mp = mkMain p tables MoveNone MoveNone MoveNone MoveNone 8 -1 -1 -1 -1 moves scores
     let first = nextMove &mp true
     Assert.Equal(MoveNone, first) // nothing to emit (quiets skipped)
     Assert.Equal(0, mp.EndMoves) // generate(Quiets) NEVER ran (would set ~20)

@@ -65,6 +65,31 @@ let ``oracle: pruning-off TT-off negamax score equals minimax`` (fen: string) (d
     let refScore = refMinimax w w.Pos depth 0
     Assert.Equal(refScore, engine)
 
+/// Gating guard: every new heuristic (continuation history, singular extensions, NMP verification, richer
+/// LMR, aspiration tweaks) is explicitly ON, yet with pruning OFF the score must STILL equal minimax — i.e.
+/// none of them leaks behaviour outside the `usePruning` gate. (Pins the invariant against default drift.)
+let private oracleAllFlagsCfg =
+    { defaultConfig with
+        UseTt = false
+        UsePruning = false
+        Threads = 1
+        UseContHist = true
+        UseSingular = true
+        UseNmpVerify = true
+        UseLmrTweaks = true
+        UseAspTweaks = true }
+
+[<Theory>]
+[<InlineData("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 3)>]
+[<InlineData("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1", 2)>]
+[<InlineData("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1", 3)>]
+[<InlineData("8/8/4k3/8/8/4K3/4P3/8 w - - 0 1", 4)>]
+let ``oracle: all new heuristics ON but pruning OFF still equals minimax`` (fen: string) (depth: int) =
+    let struct (engine, _, _) = searchToDepth fen [||] depth oracleAllFlagsCfg
+    let w = makeWorker fen oracleAllFlagsCfg
+    let refScore = refMinimax w w.Pos depth 0
+    Assert.Equal(refScore, engine)
+
 [<Fact>]
 let ``single-thread node count is deterministic`` () =
     let struct (_, n1, _) = searchToDepth StartPosFen [||] 5 oracleCfg
@@ -129,11 +154,11 @@ let ``mate score round-trips through store and probe at every ply`` (ply: int) =
     let key = 0xABCDEF1234567890UL
     let vWin = MATE - 7
     let vLose = -MATE + 7
-    tt.Store key 4 BoundExact (valueToTt vWin ply) 0 0x10
-    let struct (h1, _, sc1, _, _, _) = tt.Probe key
+    tt.Store key 4 BoundExact (valueToTt vWin ply) 0 0x10 false
+    let struct (h1, _, sc1, _, _, _, _) = tt.Probe key
     Assert.True h1
     Assert.Equal(vWin, valueFromTt sc1 ply)
-    tt.Store key 4 BoundExact (valueToTt vLose ply) 0 0x11
-    let struct (h2, _, sc2, _, _, _) = tt.Probe key
+    tt.Store key 4 BoundExact (valueToTt vLose ply) 0 0x11 false
+    let struct (h2, _, sc2, _, _, _, _) = tt.Probe key
     Assert.True h2
     Assert.Equal(vLose, valueFromTt sc2 ply)

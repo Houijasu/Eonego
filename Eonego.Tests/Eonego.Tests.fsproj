@@ -35,6 +35,7 @@
     <Compile Include="LazySmpTests.fs" />
     <Compile Include="ProbCutTests.fs" />
     <Compile Include="PruningTests.fs" />
+    <Compile Include="SingularTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

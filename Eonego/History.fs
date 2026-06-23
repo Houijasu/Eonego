@@ -28,6 +28,9 @@ let MainHistD = 7183 // SF ButterflyHistory
 [<Literal>]
 let CaptureHistD = 10692 // SF CapturePieceToHistory
 
+[<Literal>]
+let ContHistD = 29952 // SF PieceToHistory (continuation); < int16 max so the gravity store can't overflow
+
 /// Stat bonus as a function of depth (representative SF shape; tunable when the search lands).
 let inline statBonus (depth: int) : int = min (160 * depth - 100) 1700
 
@@ -41,6 +44,10 @@ type Tables() =
     let counter: Move[] = Array.create (12 * 64) MoveNone
     // [ply*2 + slot] -> killer pair for that ply.
     let killers: Move[] = Array.create (2 * MaxPly) MoveNone
+    // Continuation history: int16[768*768] indexed [(prevPc*64+prevTo)*768 + (pc*64+to)]. cont1 keyed by the
+    // 1-ply-back move (ss-1), cont2 by the 2-ply-back move (ss-2). 768 = 12 pieces * 64 squares.
+    let cont1: int16[] = Array.zeroCreate (768 * 768)
+    let cont2: int16[] = Array.zeroCreate (768 * 768)
 
     /// Zero every table (new game / clear between searches).
     member _.Clear() : unit =
@@ -48,6 +55,8 @@ type Tables() =
         Array.Clear(capture, 0, capture.Length)
         Array.Fill(counter, MoveNone)
         Array.Fill(killers, MoveNone)
+        Array.Clear(cont1, 0, cont1.Length)
+        Array.Clear(cont2, 0, cont2.Length)
 
     // --- reads (AggressiveInlining ATTRIBUTE: they touch the private arrays yet inline in-assembly) ---
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
@@ -62,6 +71,21 @@ type Tables() =
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member _.Killer (ply: int) (slot: int) : Move = killers.[ply * 2 + slot]
+
+    // Continuation-history reads. Callers pass a `-1` prevPc sentinel (root / after null / NoPiece) -> 0.
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+    member _.ContHistory1 (prevPc: int) (prevTo: int) (pc: Piece) (dst: Square) : int =
+        if prevPc < 0 then
+            0
+        else
+            int cont1.[(prevPc * 64 + prevTo) * 768 + (pc * 64 + dst)]
+
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+    member _.ContHistory2 (prevPc: int) (prevTo: int) (pc: Piece) (dst: Square) : int =
+        if prevPc < 0 then
+            0
+        else
+            int cont2.[(prevPc * 64 + prevTo) * 768 + (pc * 64 + dst)]
 
     // --- writes -----------------------------------------------------------------------------------
     member _.SetCounter (prevPc: Piece) (prevTo: Square) (m: Move) : unit = counter.[prevPc * 64 + prevTo] <- m
@@ -87,3 +111,19 @@ type Tables() =
         let b = max -CaptureHistD (min CaptureHistD bonus)
         let v = int capture.[i]
         capture.[i] <- int16 (v + b - v * (abs b) / CaptureHistD)
+
+    /// SF gravity update of 1-ply continuation history (no-op when prevPc < 0).
+    member _.UpdateCont1 (prevPc: int) (prevTo: int) (pc: Piece) (dst: Square) (bonus: int) : unit =
+        if prevPc >= 0 then
+            let i = (prevPc * 64 + prevTo) * 768 + (pc * 64 + dst)
+            let b = max -ContHistD (min ContHistD bonus)
+            let v = int cont1.[i]
+            cont1.[i] <- int16 (v + b - v * (abs b) / ContHistD)
+
+    /// SF gravity update of 2-ply continuation history (no-op when prevPc < 0).
+    member _.UpdateCont2 (prevPc: int) (prevTo: int) (pc: Piece) (dst: Square) (bonus: int) : unit =
+        if prevPc >= 0 then
+            let i = (prevPc * 64 + prevTo) * 768 + (pc * 64 + dst)
+            let b = max -ContHistD (min ContHistD bonus)
+            let v = int cont2.[i]
+            cont2.[i] <- int16 (v + b - v * (abs b) / ContHistD)

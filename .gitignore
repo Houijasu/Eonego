@@ -75,6 +75,9 @@ artifacts/
 # Planning documents (local superpowers plans)
 docs/superpowers/plans/
 
+# MCP / agent tooling caches
+.serena/
+
 # Trainer artifacts — large / regenerable (the .py scripts, suites/, and the shipped net stay tracked)
 trainer/data/
 trainer/nets/

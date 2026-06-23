@@ -89,6 +89,12 @@ type SearchConfig =
       UseRazoring: bool
       UseHistoryPruning: bool
       UseDeltaPruning: bool
+      UseContHist: bool
+      UseSingular: bool
+      UseNmpVerify: bool
+      UseLmrTweaks: bool
+      UseAspTweaks: bool
+      MoveOverhead: int
       UseNnue: bool
       UseMaterialOnly: bool }
 
@@ -114,6 +120,12 @@ let defaultConfig =
       UseRazoring = true
       UseHistoryPruning = true
       UseDeltaPruning = true
+      UseContHist = true
+      UseSingular = true
+      UseNmpVerify = true
+      UseLmrTweaks = true
+      UseAspTweaks = true
+      MoveOverhead = 10
       UseNnue = false
       UseMaterialOnly = false }
 
@@ -133,7 +145,8 @@ let defaultLimits =
 type StackEntry =
     { mutable StaticEval: int
       mutable CurrentMove: Move
-      mutable MovedPiece: Piece }
+      mutable MovedPiece: Piece
+      mutable ExcludedMove: Move } // singular-extension exclusion: the move banned in THIS node's search
 
 // ---------------------------------------------------------------------------
 // Draw / material helpers (the search owns draw detection; eval deferred it)
@@ -234,6 +247,7 @@ type SearchControl
     let sw = System.Diagnostics.Stopwatch()
     let mutable softMs = 0L
     let mutable hardMs = 0L
+    let mutable baseSoftMs = 0L // the un-scaled optimum; the per-iteration manager rescales softMs from it
     member _.Config = config
     member _.Limits = limits
     member _.Tt = tt
@@ -249,9 +263,12 @@ type SearchControl
     member _.Reset() = Volatile.Write(&stopFlag, 0)
     member _.ElapsedMs: int64 = sw.ElapsedMilliseconds
     member _.SoftTimeUp: bool = softMs > 0L && sw.ElapsedMilliseconds >= softMs
+    member _.BaseSoftMs: int64 = baseSoftMs
+    member _.SetSoft(v: int64) = softMs <- v
 
     member _.StartClock (soft: int64) (hard: int64) =
         softMs <- soft
+        baseSoftMs <- soft
         hardMs <- hard
         sw.Restart()
 
@@ -274,12 +291,21 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     let moveBuf: Move[] = Array.zeroCreate (MaxSearchPly * MaxMoves)
     let scoreBuf: int[] = Array.zeroCreate (MaxSearchPly * MaxMoves)
     let quietsBuf: Move[] = Array.zeroCreate (MaxSearchPly * MaxMoves)
+    // Dedicated per-ply buffers for the singular-extension exclusion search (which re-enters negamax at the
+    // SAME ply). Must be per-ply, NOT a single set: SE at ply P recurses into a normal child at P+1 that can
+    // trigger its OWN exclusion search, so two exclusion searches at different plies are live on the call
+    // stack simultaneously and must not share a buffer. (Same-ply SE still cannot nest — the ExcludedMove
+    // guard blocks that — so one slot per ply suffices.)
+    let exclMoveBuf: Move[] = Array.zeroCreate (MaxSearchPly * MaxMoves)
+    let exclScoreBuf: int[] = Array.zeroCreate (MaxSearchPly * MaxMoves)
+    let exclQuietsBuf: Move[] = Array.zeroCreate (MaxSearchPly * MaxMoves)
     let pv: Move[] = Array.zeroCreate (MaxSearchPly * MaxSearchPly)
     let mutable nodes = 0L
     let mutable selDepth = 0
     let mutable rootBest = MoveNone
     let mutable rootScore = 0
     let mutable completedDepth = 0
+    let mutable nmpMinPly = 0 // NMP allowed only at ply >= this; set during an NMP-verification region (Feature 7)
     member _.Id = id
     member _.IsMain = isMain
     member _.Control = control
@@ -289,6 +315,9 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     member _.MoveBuf = moveBuf
     member _.ScoreBuf = scoreBuf
     member _.QuietsBuf = quietsBuf
+    member _.ExclMoveBuf = exclMoveBuf
+    member _.ExclScoreBuf = exclScoreBuf
+    member _.ExclQuietsBuf = exclQuietsBuf
     member _.Pv = pv
 
     member _.Nodes
@@ -310,6 +339,10 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     member _.CompletedDepth
         with get () = completedDepth
         and set v = completedDepth <- v
+
+    member _.NmpMinPly
+        with get () = nmpMinPly
+        and set v = nmpMinPly <- v
 
     /// Rebuild this worker's Position from the immutable root (FEN + replayed moves) and reset per-search state.
     member _.SetupRoot() =
@@ -384,7 +417,7 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
         let mutable ttMove = MoveNone
 
         if useTt then
-            let struct (hit, m, _, _, _, _) = w.Control.Tt.Probe pos.Key
+            let struct (hit, m, _, _, _, _, _) = w.Control.Tt.Probe pos.Key
 
             if hit then
                 ttMove <- m
@@ -468,14 +501,14 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
                         elif best >= beta then BoundLower
                         else BoundExact
 
-                    w.Control.Tt.Store pos.Key 0 bound (valueToTt best ply) rawEval bestMove
+                    w.Control.Tt.Store pos.Key 0 bound (valueToTt best ply) rawEval bestMove false
 
                 best
 
 // ---------------------------------------------------------------------------
 // Negamax / PVS (fail-soft)
 // ---------------------------------------------------------------------------
-let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthIn: int) (ply: int) (isPv: bool) : int =
+let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthIn: int) (ply: int) (isPv: bool) (cutNode: bool) : int =
     w.Nodes <- w.Nodes + 1L
 
     if w.IsMain && (w.Nodes &&& 2047L) = 0L then
@@ -502,6 +535,10 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
         let useTt = cfg.UseTt
         let inCheck = pos.InCheck
         let ssCur = ply + StackOffset
+        // Singular extension: this node's own excluded move (set by the parent for a singular search). Clear
+        // the CHILD's slot so a normal recursion sees no exclusion; never clear our own (that erases it).
+        let excludedMove = w.Stack.[ssCur].ExcludedMove
+        w.Stack.[ssCur + 1].ExcludedMove <- MoveNone
         let mutable alpha = alphaIn
         let mutable beta = betaIn
         let mutable result = 0
@@ -511,6 +548,9 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
         let mutable ttScore = 0
         let mutable ttEval = VALUE_NONE
         let mutable ttDepth = 0
+        let mutable ttBound = BoundNone
+        // ttPv: this node is (or was) on a PV. Sticky — start from isPv, OR in a probed former-PV mark.
+        let mutable ttPv = isPv
 
         // 1. mate-distance pruning (gated -> oracle stays strictly full-window)
         if usePruning then
@@ -526,7 +566,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
         // 2. TT probe + (non-PV) cutoff
         if not produced && useTt then
-            let struct (hit, m, sc, ev, dp, bd) = w.Control.Tt.Probe pos.Key
+            let struct (hit, m, sc, ev, dp, bd, pv) = w.Control.Tt.Probe pos.Key
 
             if hit then
                 ttHit <- true
@@ -534,8 +574,10 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                 ttScore <- valueFromTt sc ply
                 ttEval <- ev
                 ttDepth <- dp
+                ttBound <- bd
+                ttPv <- ttPv || pv
 
-                if not isPv && dp >= depthIn then
+                if not isPv && excludedMove = MoveNone && dp >= depthIn then
                     if
                         bd = BoundExact
                         || (bd = BoundLower && ttScore >= beta)
@@ -562,9 +604,13 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                 && (let prev2 = w.Stack.[ssCur - 2].StaticEval in
                     prev2 = VALUE_NONE || staticEval > prev2)
 
-        // 4. pruning block (gated, non-PV, not in check)
-        if not produced && usePruning && not isPv && not inCheck then
-            if depthIn <= 6 && staticEval - 120 * depthIn >= beta && abs beta < MATE_IN_MAX_PLY then
+        // 4. pruning block (gated, non-PV, not in check; disabled during a singular exclusion search)
+        if not produced && usePruning && not isPv && not inCheck && excludedMove = MoveNone then
+            if
+                depthIn <= 6
+                && staticEval - 120 * depthIn - (if ttPv then 20 else 0) >= beta
+                && abs beta < MATE_IN_MAX_PLY
+            then
                 result <- staticEval
                 produced <- true
             // razoring: at shallow depth a static eval far below alpha is verified by qsearch;
@@ -582,6 +628,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                     produced <- true
             elif
                 depthIn >= 3
+                && ply >= w.NmpMinPly
                 && pos.PliesFromNull > 0
                 && staticEval >= beta
                 && hasNonPawnMaterial pos
@@ -590,12 +637,27 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                 w.Stack.[ssCur].CurrentMove <- MoveNull
                 w.Stack.[ssCur].MovedPiece <- NoPiece
                 pos.MakeNull()
-                let v = -(negamax w pos (-beta) (-beta + 1) (depthIn - r) (ply + 1) false)
+                let v = -(negamax w pos (-beta) (-beta + 1) (depthIn - r) (ply + 1) false false)
                 pos.UnmakeNull()
 
                 if v >= beta && not w.Control.Stopped then
-                    result <- (if v >= MATE_IN_MAX_PLY then beta else v)
-                    produced <- true
+                    // Zugzwang verification: at high depth (and not already inside a verification region),
+                    // re-search the ORIGINAL position with NMP suppressed for the next few plies (NmpMinPly),
+                    // and only trust the cutoff if it also fails high. NmpMinPly both bounds the verification
+                    // cost (deeper plies resume NMP) and prevents re-verifying at every node.
+                    let clampedV = if v >= MATE_IN_MAX_PLY then beta else v
+
+                    if (not cfg.UseNmpVerify) || depthIn < 12 || w.NmpMinPly > 0 then
+                        result <- clampedV
+                        produced <- true
+                    else
+                        w.NmpMinPly <- ply + 3 * (depthIn - r) / 4
+                        let vv = negamax w pos (beta - 1) beta (depthIn - r) ply false false
+                        w.NmpMinPly <- 0
+
+                        if vv >= beta && not w.Control.Stopped then
+                            result <- clampedV
+                            produced <- true
 
         // 4.5 ProbCut: a strong capture that HOLDS a reduced search above beta+margin is a cutoff.
         if
@@ -604,6 +666,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
             && cfg.UseProbCut
             && not isPv
             && not inCheck
+            && excludedMove = MoveNone
             && depthIn >= 5
             && abs beta < MATE_IN_MAX_PLY
         then
@@ -633,7 +696,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                         let mutable v = -(qsearch w pos (-probCutBeta) (-probCutBeta + 1) (ply + 1))
 
                         if v >= probCutBeta then
-                            v <- -(negamax w pos (-probCutBeta) (-probCutBeta + 1) (depthIn - 4) (ply + 1) false)
+                            v <- -(negamax w pos (-probCutBeta) (-probCutBeta + 1) (depthIn - 4) (ply + 1) false (not cutNode))
 
                         pos.Unmake pcMove
 
@@ -643,7 +706,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                                 result <- ttScore
                             else
                                 if useTt then
-                                    w.Control.Tt.Store pos.Key (depthIn - 3) BoundLower (valueToTt v ply) staticEval pcMove
+                                    w.Control.Tt.Store pos.Key (depthIn - 3) BoundLower (valueToTt v ply) staticEval pcMove false
 
                                 result <- v
 
@@ -677,16 +740,45 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
             let k1 = w.Tables.Killer ply 0
             let k2 = w.Tables.Killer ply 1
+
+            // Continuation-history context: the 1-ply (ss-1) and 2-ply (ss-2) previous moves' piece/to.
+            // `-1` disables a term (root / after null / NoPiece, or UseContHist off). Zero-init stack slots
+            // below the root carry CurrentMove = MoveNone, so the MoveNone/MoveNull guard rejects them.
+            let contOn = cfg.UseContHist
+
+            let struct (prev1Pc, prev1To) =
+                if contOn && prevMove <> MoveNone && prevMove <> MoveNull && prevPiece <> NoPiece then
+                    struct (prevPiece, toSq prevMove)
+                else
+                    struct (-1, -1)
+
+            let prev2Move = w.Stack.[ssCur - 2].CurrentMove
+            let prev2Piece = w.Stack.[ssCur - 2].MovedPiece
+
+            let struct (prev2Pc, prev2To) =
+                if contOn && prev2Move <> MoveNone && prev2Move <> MoveNull && prev2Piece <> NoPiece then
+                    struct (prev2Piece, toSq prev2Move)
+                else
+                    struct (-1, -1)
+
             let us = pos.SideToMove
             let ksq = pos.KingSquare us
-            let moves = w.MoveBuf.AsSpan(ply * MaxMoves, MaxMoves)
-            let scores = w.ScoreBuf.AsSpan(ply * MaxMoves, MaxMoves)
-            let mutable mp = mkMain pos w.Tables ttMove k1 k2 cm depth moves scores
+            // During a singular exclusion search (same ply) use dedicated per-ply buffers so we don't clobber
+            // the OUTER node's in-flight move/score/quiet data at this ply (nor a concurrent exclusion search
+            // at another ply up the call stack).
+            let useExcl = excludedMove <> MoveNone
+            let bufBase = ply * MaxMoves
+            let moves = (if useExcl then w.ExclMoveBuf else w.MoveBuf).AsSpan(bufBase, MaxMoves)
+            let scores = (if useExcl then w.ExclScoreBuf else w.ScoreBuf).AsSpan(bufBase, MaxMoves)
+            let quietsBuf = if useExcl then w.ExclQuietsBuf else w.QuietsBuf
+
+            let mutable mp =
+                mkMain pos w.Tables ttMove k1 k2 cm depth prev1Pc prev1To prev2Pc prev2To moves scores
 
             if isPv then
                 w.Pv.[ply * MaxSearchPly] <- MoveNone
 
-            let quietsBase = ply * MaxMoves
+            let quietsBase = bufBase
             let mutable best = -INF
             let mutable bestMove = MoveNone
             let mutable moveCount = 0
@@ -699,7 +791,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                 let needsCheck =
                     isEnPassant m || fromSq m = ksq || testBit (pos.BlockersForKing us) (fromSq m)
 
-                if (not needsCheck) || isLegal pos m then
+                if m <> excludedMove && ((not needsCheck) || isLegal pos m) then
                     moveCount <- moveCount + 1
 
                     let isQuiet =
@@ -742,22 +834,51 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                             doMove <- false
 
                     if doMove then
-                        let ext = if usePruning && givesCheck && pos.SeeGe m 0 then 1 else 0
+                        let mutable ext = if usePruning && givesCheck && pos.SeeGe m 0 then 1 else 0
+
+                        // Singular / double extension: the TT move, at depth >= 8 with a depth-sufficient
+                        // lower-bound TT score, is "singular" if every OTHER move fails low against a
+                        // reduced exclusion window. Extend it (twice if it fails low by a clear margin).
+                        if
+                            usePruning
+                            && cfg.UseSingular
+                            && excludedMove = MoveNone
+                            && m = ttMove
+                            && depth >= 8
+                            && ttDepth >= depth - 3
+                            && (ttBound &&& BoundLower) <> 0
+                            && abs ttScore < MATE_IN_MAX_PLY
+                        then
+                            let singularBeta = ttScore - 2 * depth
+                            let sDepth = (depth - 1) / 2
+                            w.Stack.[ssCur].ExcludedMove <- m
+                            let sv = negamax w pos (singularBeta - 1) singularBeta sDepth ply false cutNode
+                            w.Stack.[ssCur].ExcludedMove <- MoveNone
+
+                            if not w.Control.Stopped && sv < singularBeta then
+                                ext <- ext + (if (not isPv) && sv < singularBeta - 16 then 2 else 1)
+
+                        // Cap so check + double extensions can't push newDepth past depthIn + 1.
+                        let maxExt = depthIn + 1 - (depth - 1)
+
+                        if ext > maxExt then
+                            ext <- max 0 maxExt
+
                         let newDepth = depth - 1 + ext
                         w.Stack.[ssCur].CurrentMove <- m
                         w.Stack.[ssCur].MovedPiece <- pos.PieceOn(fromSq m)
 
                         if isQuiet && nQuiets < MaxMoves - 1 then
-                            w.QuietsBuf.[quietsBase + nQuiets] <- m
+                            quietsBuf.[quietsBase + nQuiets] <- m
                             nQuiets <- nQuiets + 1
 
                         pos.Make m
                         let mutable v = 0
 
                         if moveCount = 1 then
-                            v <- -(negamax w pos (-beta) (-alpha) newDepth (ply + 1) isPv)
+                            v <- -(negamax w pos (-beta) (-alpha) newDepth (ply + 1) isPv (if isPv then false else not cutNode))
                         elif not usePruning then
-                            v <- -(negamax w pos (-beta) (-alpha) newDepth (ply + 1) false)
+                            v <- -(negamax w pos (-beta) (-alpha) newDepth (ply + 1) false (not cutNode))
                         else
                             // LMR: table reduction, deeper for non-improving / quiet moves, lighter for captures
                             let mutable r =
@@ -770,6 +891,27 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                                     if not isQuiet then
                                         rr <- rr - 1
 
+                                    // Richer LMR (gated; OFF => exactly the legacy reduction above). Net-REDUCING
+                                    // tweaks only: reduce MORE at expected cut-nodes and for strongly-negative
+                                    // continuation/main history. The "reduce less" variants (ttPv, strong
+                                    // history) were dropped — each r-1 deepens the scout and triggers cascading
+                                    // full-depth re-searches, which roughly doubled the tree for no measured
+                                    // gain. Good moves already sort first (continuation history) so they get a
+                                    // small move-count reduction anyway.
+                                    if cfg.UseLmrTweaks then
+                                        if cutNode && m <> ttMove then
+                                            rr <- rr + 2
+
+                                        let pc = w.Stack.[ssCur].MovedPiece
+
+                                        let hist =
+                                            w.Tables.MainHistory us (fromTo m)
+                                            + w.Tables.ContHistory1 prev1Pc prev1To pc (toSq m)
+                                            + w.Tables.ContHistory2 prev2Pc prev2To pc (toSq m)
+
+                                        if hist < -12000 then
+                                            rr <- rr + 1
+
                                     rr
                                 else
                                     0
@@ -780,13 +922,13 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                             if r < 0 then
                                 r <- 0
 
-                            v <- -(negamax w pos (-alpha - 1) (-alpha) (newDepth - r) (ply + 1) false)
+                            v <- -(negamax w pos (-alpha - 1) (-alpha) (newDepth - r) (ply + 1) false true)
 
                             if v > alpha && r > 0 then
-                                v <- -(negamax w pos (-alpha - 1) (-alpha) newDepth (ply + 1) false)
+                                v <- -(negamax w pos (-alpha - 1) (-alpha) newDepth (ply + 1) false (not cutNode))
 
                             if v > alpha && v < beta then
-                                v <- -(negamax w pos (-beta) (-alpha) newDepth (ply + 1) isPv)
+                                v <- -(negamax w pos (-beta) (-alpha) newDepth (ply + 1) isPv false)
 
                         pos.Unmake m
 
@@ -810,10 +952,17 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                                     let bonus = statBonus depth
 
                                     if isQuiet then
+                                        let mPc = pos.PieceOn(fromSq m)
                                         w.Tables.UpdateMain us m bonus
+                                        w.Tables.UpdateCont1 prev1Pc prev1To mPc (toSq m) bonus
+                                        w.Tables.UpdateCont2 prev2Pc prev2To mPc (toSq m) bonus
 
                                         for qi in 0 .. nQuiets - 2 do
-                                            w.Tables.UpdateMain us (w.QuietsBuf.[quietsBase + qi]) (-bonus)
+                                            let q = quietsBuf.[quietsBase + qi]
+                                            let qPc = pos.PieceOn(fromSq q)
+                                            w.Tables.UpdateMain us q (-bonus)
+                                            w.Tables.UpdateCont1 prev1Pc prev1To qPc (toSq q) (-bonus)
+                                            w.Tables.UpdateCont2 prev2Pc prev2To qPc (toSq q) (-bonus)
 
                                         w.Tables.SetKiller ply m
 
@@ -836,15 +985,17 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                 m <- if cutoff then MoveNone else nextMove &mp skipQuiets
 
             if moveCount = 0 then
-                result <- (if inCheck then -MATE + ply else 0)
+                // No legal move searched. During an exclusion search this means the excluded move was the
+                // only move -> report a fail-low so the caller treats it as singular (don't store).
+                result <- (if excludedMove <> MoveNone then alpha elif inCheck then -MATE + ply else 0)
             else
-                if useTt && not w.Control.Stopped then
+                if useTt && not w.Control.Stopped && excludedMove = MoveNone then
                     let bound =
                         if best <= alphaIn then BoundUpper
                         elif best >= beta then BoundLower
                         else BoundExact
 
-                    w.Control.Tt.Store pos.Key depth bound (valueToTt best ply) staticEval bestMove
+                    w.Control.Tt.Store pos.Key depth bound (valueToTt best ply) staticEval bestMove ttPv
 
                 result <- best
 
@@ -903,19 +1054,26 @@ let private reportInfo (w: Worker) (depth: int) (score: int) =
 // Iterative deepening (aspiration). All workers run it; only the main reports + sets the time stop.
 // ---------------------------------------------------------------------------
 let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
+    let cfg = w.Control.Config
     let mutable prev = evalPos w w.Pos
     let mutable depth = 1
 
     while depth <= maxDepth && not w.Control.Stopped do
-        let mutable delta = 16
+        // Tweaked: initial window scaled by score magnitude (tighter near equal scores). OFF => flat 16.
+        let mutable delta =
+            if cfg.UseAspTweaks then 10 + prev * prev / 15000 else 16
+
         let fullWindow = depth <= 4 || abs prev >= MATE_IN_MAX_PLY
         let mutable alpha = if fullWindow then -INF else max (-INF) (prev - delta)
         let mutable beta = if fullWindow then INF else min INF (prev + delta)
         let mutable score = 0
         let mutable searching = true
+        // Tweaked: drop the re-search depth by up to 3 plies on consecutive fail-highs (reported depth
+        // stays `depth`). OFF (or no fail-high) => attemptDepth = depth, i.e. the legacy behaviour.
+        let mutable attemptDepth = depth
 
         while searching do
-            score <- negamax w w.Pos alpha beta depth 0 true
+            score <- negamax w w.Pos alpha beta (max 1 attemptDepth) 0 true false
 
             if w.Control.Stopped then
                 searching <- false
@@ -923,9 +1081,13 @@ let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
                 beta <- (alpha + beta) / 2
                 alpha <- max (-INF) (score - delta)
                 delta <- delta * 2
+                attemptDepth <- depth // a fail-low re-search runs at full depth again
             elif score >= beta then
                 beta <- min INF (score + delta)
                 delta <- delta * 2
+
+                if cfg.UseAspTweaks && attemptDepth > depth - 3 && abs score < MATE_IN_MAX_PLY then
+                    attemptDepth <- attemptDepth - 1
             else
                 searching <- false
 
@@ -940,15 +1102,22 @@ let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
 
         depth <- depth + 1
 
+        // Between iterations the main worker stops once the soft (optimum) budget is spent; the hard budget
+        // stops a running iteration mid-flight via CheckTime. (Best-move-stability / predictive scaling was
+        // tried but over-conserved time without SPRT tuning — reverted; MoveOverhead is kept below.)
         if w.IsMain && w.Control.SoftTimeUp then
             w.Control.Stop()
 
 // ---------------------------------------------------------------------------
 // Time budget (v1): movetime, or wtime/winc(+movestogo); depth/nodes/mate/infinite => no time stop.
 // ---------------------------------------------------------------------------
-let private computeTimes (l: SearchLimits) (stm: Color) : int64 * int64 =
+let private computeTimes (moveOverhead: int) (l: SearchLimits) (stm: Color) : int64 * int64 =
+    let overhead = int64 (max 0 moveOverhead)
+
     if l.MoveTime > 0 then
-        (int64 l.MoveTime, int64 l.MoveTime)
+        // Fixed move time: pure HARD limit (soft = 0 disables the soft/stability/predictive early-stop) so
+        // the search uses the whole budget and CheckTime stops it mid-iteration at the deadline.
+        (0L, max 1L (int64 l.MoveTime - overhead))
     elif l.Infinite || l.Depth > 0 || l.Nodes > 0L || l.Mate > 0 then
         (0L, 0L)
     else
@@ -958,8 +1127,12 @@ let private computeTimes (l: SearchLimits) (stm: Color) : int64 * int64 =
         if time <= 0 then
             (0L, 0L)
         else
+            // Proven baseline budget + MoveOverhead: soft ~ (clock - overhead)/movestogo + 3/4*inc; hard caps
+            // one move at 40% of the clock (or 4x soft). The SF optimum/maximum-scaling experiment over the
+            // soft limit was reverted as an un-tuned regression (it spent only ~1/3 of the budget).
             let mtg = if l.MovesToGo > 0 then l.MovesToGo else 30
-            let soft = int64 (time / mtg + inc * 3 / 4)
+            let avail = max 1L (int64 time - overhead)
+            let soft = avail / int64 mtg + int64 inc * 3L / 4L
             let hard = min (int64 (float time * 0.4)) (soft * 4L)
             (max 1L soft, max 1L hard)
 
@@ -987,7 +1160,7 @@ let go (control: SearchControl) : Move =
     let stm = workers.[0].Pos.SideToMove
 
     let struct (soft, hard) =
-        (let (a, b) = computeTimes control.Limits stm in struct (a, b))
+        (let (a, b) = computeTimes control.Config.MoveOverhead control.Limits stm in struct (a, b))
 
     control.StartClock soft hard
 
@@ -1040,7 +1213,7 @@ let searchToDepthNet (fen: string) (rootMoves: Move[]) (depth: int) (cfg: Search
     w.SetupRoot()
     control.Reset()
     control.StartClock 0L 0L
-    let score = negamax w w.Pos (-INF) INF depth 0 true
+    let score = negamax w w.Pos (-INF) INF depth 0 true false
     struct (score, w.Nodes, w.Pv.[0])
 
 /// Single-thread iterative deepening until the node budget is exhausted (no UCI stdout). Test/tooling entry.

@@ -9,7 +9,8 @@
 /// the store order (Data before Key, so a fresh Key implies a fresh Data).
 ///
 /// `Data` packing (LSB->MSB): move:16 | score:int16 | eval:int16 | depth:uint8 | genBound:uint8 ,
-/// where genBound = (generation6 << 2) | bound. generation is therefore only 6 bits (wraps mod 64).
+/// where genBound = (generation5 << 3) | (ttPv << 2) | bound. generation is therefore only 5 bits
+/// (wraps mod 32); bit 2 is the SF-style ttPv flag (set at former-PV nodes).
 /// Clusters of 4 entries (64 B, cache-line sized). Replacement = empty/key-match first, else min
 /// (depth - relativeAge*2). Scores are mate-ply-corrected by the CALLER (Search.valueToTt/valueFromTt).
 ///
@@ -61,7 +62,8 @@ let inline dEval (d: uint64) : int = int (int16 (uint16 (d >>> 32)))
 let inline dDepth (d: uint64) : int = int (byte (d >>> 48))
 let inline dGenBound (d: uint64) : int = int (byte (d >>> 56))
 let inline dBound (d: uint64) : int = (dGenBound d) &&& 3
-let inline dGen (d: uint64) : int = (dGenBound d) >>> 2
+let inline dTtPv (d: uint64) : bool = ((dGenBound d) >>> 2) &&& 1 = 1
+let inline dGen (d: uint64) : int = (dGenBound d) >>> 3
 
 /// Largest power-of-two cluster count that fits `mb` MiB (>= 1).
 let private clustersFor (mb: int) : int =
@@ -78,7 +80,7 @@ let private clustersFor (mb: int) : int =
 type TranspositionTable(mb: int) =
     let mutable entries: TtEntry[] = Array.zeroCreate (clustersFor mb * ClusterSize)
     let mutable clusterMask: int = (entries.Length / ClusterSize) - 1
-    let mutable generation: int = 0 // 6-bit; (g+1) &&& 0x3F per NewSearch
+    let mutable generation: int = 0 // 5-bit; (g+1) &&& 0x1F per NewSearch
 
     member private _.Base(key: uint64) : int =
         (int ((key >>> 32) &&& uint64 clusterMask)) * ClusterSize
@@ -94,17 +96,18 @@ type TranspositionTable(mb: int) =
         clusterMask <- (entries.Length / ClusterSize) - 1
         generation <- 0
 
-    /// Advance the age counter at the start of a search (6-bit wrap).
-    member _.NewSearch() : unit = generation <- (generation + 1) &&& 0x3F
+    /// Advance the age counter at the start of a search (5-bit wrap).
+    member _.NewSearch() : unit = generation <- (generation + 1) &&& 0x1F
 
     /// Size in MiB actually allocated.
     member _.SizeMb: int = (entries.Length * 16) / (1024 * 1024)
 
-    /// XOR-validated probe. Returns struct(hit, move, score(raw — caller applies valueFromTt), eval, depth, bound).
-    member this.Probe(key: uint64) : struct (bool * Move * int * int * int * int) =
+    /// XOR-validated probe. Returns struct(hit, move, score(raw — caller applies valueFromTt), eval, depth,
+    /// bound, ttPv).
+    member this.Probe(key: uint64) : struct (bool * Move * int * int * int * int * bool) =
         let b = this.Base key
         let mutable i = 0
-        let mutable result = struct (false, MoveNone, 0, 0, 0, BoundNone)
+        let mutable result = struct (false, MoveNone, 0, 0, 0, BoundNone, false)
         let mutable scanning = true
 
         while scanning && i < ClusterSize do
@@ -112,7 +115,7 @@ type TranspositionTable(mb: int) =
             let d = Volatile.Read(&entries.[b + i].Data)
             // XOR self-check; reject the all-zero empty slot (bound = BoundNone) even if realKey = 0.
             if (k ^^^ d) = key && dBound d <> BoundNone then
-                result <- struct (true, dMove d, dScore d, dEval d, dDepth d, dBound d)
+                result <- struct (true, dMove d, dScore d, dEval d, dDepth d, dBound d, dTtPv d)
                 scanning <- false
             else
                 i <- i + 1
@@ -120,7 +123,7 @@ type TranspositionTable(mb: int) =
         result
 
     /// XOR-pack store with cluster replacement. `score`/`eval` are already mate-ply-corrected by the caller.
-    member this.Store (key: uint64) (depth: int) (bound: int) (score: int) (eval: int) (move: Move) : unit =
+    member this.Store (key: uint64) (depth: int) (bound: int) (score: int) (eval: int) (move: Move) (ttPv: bool) : unit =
         let b = this.Base key
         // Pick the target slot: a key match wins; else an empty slot; else the lowest-quality entry.
         let mutable slot = b
@@ -144,7 +147,7 @@ type TranspositionTable(mb: int) =
 
                 i <- i + 1
             else
-                let relAge = (generation - dGen d) &&& 0x3F
+                let relAge = (generation - dGen d) &&& 0x1F
                 let q = dDepth d - relAge * 2
 
                 if q < slotQ then
@@ -164,7 +167,10 @@ type TranspositionTable(mb: int) =
         let sc = if updateValue then score else dScore ed
         let ev = if updateValue then eval else dEval ed
         let bd = if updateValue then bound else dBound ed
-        let data = packData mv sc ev dpt ((generation <<< 2) ||| bd)
+        // ttPv is sticky: once a position is marked PV, keep it marked across overwrites (SF behaviour).
+        let pvOut = ttPv || (isMatch && dTtPv ed)
+        let pvBit = if pvOut then 1 else 0
+        let data = packData mv sc ev dpt ((generation <<< 3) ||| (pvBit <<< 2) ||| bd)
         // Data BEFORE Key: a reader that sees the fresh Key is guaranteed to see the fresh Data.
         Volatile.Write(&entries.[slot].Data, data)
         Volatile.Write(&entries.[slot].Key, key ^^^ data)

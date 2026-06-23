@@ -26,6 +26,12 @@ type private UciState =
       mutable UseRazoring: bool
       mutable UseHistoryPruning: bool
       mutable UseDeltaPruning: bool
+      mutable UseContHist: bool
+      mutable UseSingular: bool
+      mutable UseNmpVerify: bool
+      mutable UseLmrTweaks: bool
+      mutable UseAspTweaks: bool
+      mutable MoveOverhead: int
       mutable UseNnue: bool
       mutable NnueFile: string
       mutable Net: Network option
@@ -165,6 +171,12 @@ let private startSearch (st: UciState) (lim: SearchLimits) =
           UseRazoring = st.UseRazoring
           UseHistoryPruning = st.UseHistoryPruning
           UseDeltaPruning = st.UseDeltaPruning
+          UseContHist = st.UseContHist
+          UseSingular = st.UseSingular
+          UseNmpVerify = st.UseNmpVerify
+          UseLmrTweaks = st.UseLmrTweaks
+          UseAspTweaks = st.UseAspTweaks
+          MoveOverhead = st.MoveOverhead
           UseNnue = st.UseNnue && st.Net.IsSome
           UseMaterialOnly = false }
 
@@ -211,6 +223,28 @@ let private handleSetOption (st: UciState) (tokens: string[]) =
             match Boolean.TryParse tokens.[vi + 1] with
             | true, b -> st.UseDeltaPruning <- b
             | _ -> ()
+        elif String.Equals(name, "UseContHist", StringComparison.OrdinalIgnoreCase) then
+            match Boolean.TryParse tokens.[vi + 1] with
+            | true, b -> st.UseContHist <- b
+            | _ -> ()
+        elif String.Equals(name, "UseSingular", StringComparison.OrdinalIgnoreCase) then
+            match Boolean.TryParse tokens.[vi + 1] with
+            | true, b -> st.UseSingular <- b
+            | _ -> ()
+        elif String.Equals(name, "UseNmpVerify", StringComparison.OrdinalIgnoreCase) then
+            match Boolean.TryParse tokens.[vi + 1] with
+            | true, b -> st.UseNmpVerify <- b
+            | _ -> ()
+        elif String.Equals(name, "UseLmrTweaks", StringComparison.OrdinalIgnoreCase) then
+            match Boolean.TryParse tokens.[vi + 1] with
+            | true, b -> st.UseLmrTweaks <- b
+            | _ -> ()
+        elif String.Equals(name, "UseAspTweaks", StringComparison.OrdinalIgnoreCase) then
+            match Boolean.TryParse tokens.[vi + 1] with
+            | true, b -> st.UseAspTweaks <- b
+            | _ -> ()
+        elif String.Equals(name, "MoveOverhead", StringComparison.OrdinalIgnoreCase) then
+            st.MoveOverhead <- max 0 (min 5000 v)
         elif String.Equals(name, "UseNnue", StringComparison.OrdinalIgnoreCase) then
             match Boolean.TryParse tokens.[vi + 1] with
             | true, b when b <> st.UseNnue ->
@@ -231,9 +265,9 @@ let private handleSetOption (st: UciState) (tokens: string[]) =
                 st.Net <- Some net
                 st.NnueFile <- path
                 st.Tt.Clear()
-                writeLine (sprintf "info string NNUE loaded: %s (ver %d, quant %d)" path net.Version net.QuantScale)
+                writeLine ("info string NNUE loaded: " + path + " (ver " + string net.Version + ", quant " + string net.QuantScale + ")")
             | Failed reason ->
-                writeLine (sprintf "info string NNUE load failed (%s); keeping current eval" reason)
+                writeLine ("info string NNUE load failed (" + reason + "); keeping current eval")
     | _ -> ()
 
 let run () =
@@ -254,6 +288,12 @@ let run () =
           UseRazoring = true
           UseHistoryPruning = true
           UseDeltaPruning = true
+          UseContHist = true
+          UseSingular = true
+          UseNmpVerify = true
+          UseLmrTweaks = true
+          UseAspTweaks = true
+          MoveOverhead = 10
           UseNnue = defaultNet.IsSome
           NnueFile = (if defaultNet.IsSome then defaultNetPath else "")
           Net = defaultNet
@@ -283,6 +323,12 @@ let run () =
                     writeLine "option name UseRazoring type check default true"
                     writeLine "option name UseHistoryPruning type check default true"
                     writeLine "option name UseDeltaPruning type check default true"
+                    writeLine "option name UseContHist type check default true"
+                    writeLine "option name UseSingular type check default true"
+                    writeLine "option name UseNmpVerify type check default true"
+                    writeLine "option name UseLmrTweaks type check default true"
+                    writeLine "option name UseAspTweaks type check default true"
+                    writeLine "option name MoveOverhead type spin default 10 min 0 max 5000"
                     writeLine ("option name UseNnue type check default " + (if st.UseNnue then "true" else "false"))
                     writeLine ("option name NnueFile type string default " + (if st.NnueFile = "" then "<empty>" else st.NnueFile))
                     writeLine "uciok"

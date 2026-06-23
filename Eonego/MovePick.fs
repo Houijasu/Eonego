@@ -106,6 +106,12 @@ type MovePick =
     val mutable CounterMove: Move
     val mutable Depth: int
     val mutable Threshold: int // ProbCut SEE threshold (0 for the main search)
+    // Continuation-history context (the previous moves' piece/to). `-1` prevPc disables the term
+    // (root / after null / NoPiece). prev1 = 1-ply-back (ss-1), prev2 = 2-ply-back (ss-2).
+    val mutable PrevPc1: int
+    val mutable PrevTo1: int
+    val mutable PrevPc2: int
+    val mutable PrevTo2: int
 
     // Explicit constructor: a by-ref-like struct cannot be zero-init'd (`MovePick()` /
     // `Unchecked.defaultof` both fail — Span fields + the byref-as-generic-arg rule). The four cursors
@@ -122,7 +128,11 @@ type MovePick =
             k2: Move,
             cm: Move,
             depth: int,
-            threshold: int
+            threshold: int,
+            prevPc1: int,
+            prevTo1: int,
+            prevPc2: int,
+            prevTo2: int
         ) =
         { Stage = stage
           Cur = 0
@@ -138,7 +148,11 @@ type MovePick =
           Killer2 = k2
           CounterMove = cm
           Depth = depth
-          Threshold = threshold }
+          Threshold = threshold
+          PrevPc1 = prevPc1
+          PrevTo1 = prevTo1
+          PrevPc2 = prevPc2
+          PrevTo2 = prevTo2 }
 
 // ---------------------------------------------------------------------------
 // Helpers (module functions over byref<MovePick> so swaps/scoring persist). A move is a "capture" for
@@ -209,11 +223,19 @@ let private scoreCaptures (mp: byref<MovePick>) (s: int) (e: int) : unit =
         mp.Scores.[i] <- 7 * pieceValueOf capturedPT + tables.CaptureHistory pc (toSq m) capturedPT
 
 let private scoreQuiets (mp: byref<MovePick>) (s: int) (e: int) : unit =
-    let us = mp.Pos.SideToMove
+    let pos = mp.Pos
+    let us = pos.SideToMove
     let tables = mp.Tables
 
     for i in s .. e - 1 do
-        mp.Scores.[i] <- tables.MainHistory us (fromTo mp.Moves.[i])
+        let m = mp.Moves.[i]
+        let pc = pos.PieceOn(fromSq m)
+        let dst = toSq m
+
+        mp.Scores.[i] <-
+            tables.MainHistory us (fromTo m)
+            + tables.ContHistory1 mp.PrevPc1 mp.PrevTo1 pc dst
+            + tables.ContHistory2 mp.PrevPc2 mp.PrevTo2 pc dst
 
 let private scoreEvasions (mp: byref<MovePick>) (s: int) (e: int) : unit =
     let pos = mp.Pos
@@ -244,6 +266,10 @@ let mkMain
     (k2: Move)
     (cm: Move)
     (depth: int)
+    (prevPc1: int)
+    (prevTo1: int)
+    (prevPc2: int)
+    (prevTo2: int)
     (moves: Span<Move>)
     (scores: Span<int>)
     : MovePick =
@@ -254,7 +280,7 @@ let mkMain
             MoveNone
 
     let stage = if pos.InCheck then StgEvasionTT else StgMainTT
-    MovePick(pos, tables, moves, scores, stage, tt, k1, k2, cm, depth, 0)
+    MovePick(pos, tables, moves, scores, stage, tt, k1, k2, cm, depth, 0, prevPc1, prevTo1, prevPc2, prevTo2)
 
 let mkQSearch (pos: Position) (tables: Tables) (ttMove: Move) (moves: Span<Move>) (scores: Span<int>) : MovePick =
     let tt =
@@ -264,7 +290,7 @@ let mkQSearch (pos: Position) (tables: Tables) (ttMove: Move) (moves: Span<Move>
             MoveNone
 
     let stage = if pos.InCheck then StgEvasionTT else StgQSearchTT
-    MovePick(pos, tables, moves, scores, stage, tt, MoveNone, MoveNone, MoveNone, 0, 0)
+    MovePick(pos, tables, moves, scores, stage, tt, MoveNone, MoveNone, MoveNone, 0, 0, -1, -1, -1, -1)
 
 let mkProbCut
     (pos: Position)
@@ -281,7 +307,7 @@ let mkProbCut
         && pos.SeeGe ttMove threshold
 
     let tt = if ok then ttMove else MoveNone
-    MovePick(pos, tables, moves, scores, StgProbCutTT, tt, MoveNone, MoveNone, MoveNone, 0, threshold)
+    MovePick(pos, tables, moves, scores, StgProbCutTT, tt, MoveNone, MoveNone, MoveNone, 0, threshold, -1, -1, -1, -1)
 
 // ---------------------------------------------------------------------------
 // nextMove — the staged advance. MODULE function over byref so mutation persists. Returns MoveNone when
@@ -491,7 +517,7 @@ let nextMove (mp: byref<MovePick>) (skipQuiets: bool) : Move =
 // regression guard (MovePickProbeTests). Not used in production.
 // ---------------------------------------------------------------------------
 let mkProbe (pos: Position) (tables: Tables) (moves: Span<Move>) (scores: Span<int>) : MovePick =
-    MovePick(pos, tables, moves, scores, 0, MoveNone, MoveNone, MoveNone, MoveNone, 0, 0)
+    MovePick(pos, tables, moves, scores, 0, MoveNone, MoveNone, MoveNone, MoveNone, 0, 0, -1, -1, -1, -1)
 
 let probeStep (mp: byref<MovePick>) : Move =
     mp.Stage <- mp.Stage + 1

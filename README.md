@@ -62,18 +62,19 @@ A from-scratch chess engine written in **F#** (.NET 10), built for speed and ver
 **Search**
 - Alpha-beta / **PVS**, fail-soft, with aspiration iterative deepening
 - **LazySMP**: N independent iterative-deepening workers, each with its own `Position` + history tables + stack/PV/buffers; the only shared writable state is the lock-free TT plus an atomic stop flag
-- Forward pruning: mate-distance, reverse-futility, null-move, **ProbCut**, **log-based late-move reductions (LMR)**, move-count (late-move) pruning, futility pruning, SEE pruning of losing quiets/captures, **history pruning** of late quiet losers, and **delta pruning** in qsearch — all scaled by an `improving` signal
+- Forward pruning: mate-distance, reverse-futility, null-move (+ optional zugzwang verification), **ProbCut**, **log-based late-move reductions (LMR)**, move-count (late-move) pruning, futility pruning, SEE pruning of losing quiets/captures, **history pruning** of late quiet losers, and **delta pruning** in qsearch — all scaled by an `improving` signal
+- **Continuation history** (1-/2-ply), **singular / double extensions**, a former-PV `ttPv` flag, and **Cut/All/PV node-type** threading feeding the LMR / extension / pruning decisions
 - **Internal iterative reductions (IIR)** when no TT move is available to improve ordering
 - **Razoring**: qsearch verification of shallow positions where static eval is far below alpha
-- Check extensions (SEE >= 0), quiescence search with SEE-based capture pruning
+- Check + singular extensions, quiescence search with SEE-based capture pruning
 - Triangular PV, `info` lines with `depth/seldepth/score/nodes/nps/time/pv` (aggregate node/nps across all workers)
 - Time management: `movetime`, `wtime`/`winc`/`btime`/`binc`/`movestogo`, `depth`, `nodes`, `mate`, `infinite` — soft + hard time stops
 - `UsePruning = false` collapses to plain full-window alpha-beta — the built-in correctness oracle
 
 **Transposition table**
 - Lock-free **XOR-lockless** (Hyatt) 16-byte entries, 4-entry cache-line clusters
-- `Data` packing: `move:16 | score:int16 | eval:int16 | depth:uint8 | genBound:uint8`
-- Mate-ply-corrected scores (caller-side `valueToTt`/`valueFromTt`), 6-bit generation aging, depth-and-age replacement
+- `Data` packing: `move:16 | score:int16 | eval:int16 | depth:uint8 | genBound:uint8` (`genBound = generation5 | ttPv | bound`)
+- Mate-ply-corrected scores (caller-side `valueToTt`/`valueFromTt`), 5-bit generation aging, a sticky `ttPv` flag, depth-and-age replacement
 
 **Move ordering**
 - Stockfish-style staged **MovePick**: TT move → good captures (SEE-split) → refutations (killers + countermove) → quiets → bad captures; separate evasion and ProbCut/qsearch chains
@@ -226,18 +227,19 @@ Each worker is a `Worker` object owning its own `Position`, `History.Tables`, se
   - Mate-distance pruning
   - Reverse futility (`staticEval - 120*depth >= beta`, `depth <= 6`)
   - **Razoring** (`depth <= 3`): qsearch verification when static eval is far below alpha; fail low if captures cannot lift alpha
-  - Null-move pruning (`depth >= 3`, `staticEval >= beta`, non-pawn material; `R = 3 + depth/4 + (eval≫beta)`)
+  - Null-move pruning (`depth >= 3`, `staticEval >= beta`, non-pawn material; `R = 3 + depth/4 + (eval≫beta)`), with optional **zugzwang verification** (`UseNmpVerify`): at `depth >= 12` a fail-high is re-searched on the original position with NMP suppressed and only trusted if it also fails high
   - **ProbCut** (`depth >= 5`): a strong-enough capture (SEE) that *holds* a reduced `negamax(depth-4)` above `beta + margin` is a cutoff — verified by qsearch then the reduced search, stored as a `BoundLower` at `depth-3`
-  - **LMR**: a log-based reduction table `r[depth][moveCount]`, deeper for non-improving / quiet moves, lighter for captures, with a zero-window re-search on fail-high
+  - **LMR**: a log-based reduction table `r[depth][moveCount]`, deeper for non-improving / quiet moves, lighter for captures; with `UseLmrTweaks` also reduced less at PV / TT-move / former-PV (`ttPv`) nodes, more at expected cut-nodes, and scaled by the combined main + continuation history; zero-window re-search on fail-high
   - Move-count (late-move) pruning, futility pruning of late quiets, SEE pruning of losing quiets / shallow losing captures, and **history pruning** of late quiet moves with strongly negative butterfly history
-- **Extensions**: check giving + SEE >= 0 → +1 ply
+- **Extensions**: check giving + SEE >= 0 → +1 ply; plus optional **singular / double extensions** (`UseSingular`, `depth >= 8`): when the TT move is a depth-sufficient lower bound, an exclusion search (the move banned via `StackEntry.ExcludedMove`) that fails low confirms it is singular → +1 ply (+2 if it fails low by a clear margin), capped so `newDepth <= depthIn + 1`
+- **Node-type threading**: a `cutNode` flag is propagated (Cut/All/PV) and feeds the LMR / IIR decisions
 - An **`improving`** signal (static eval vs two plies ago) tightens or loosens the pruning margins
-- ProbCut, IIR, razoring, history pruning, and delta pruning are *heuristic* forward pruning — they trade a little accuracy for depth and are **not** score-preserving (unlike the TT). Exact correctness is the pruning-off oracle below; each can be toggled at runtime via `setoption` for A/B testing.
-- **Move ordering feedback**: on a beta cutoff, the mover gets a `statBonus(depth)` history bump, quiet refuters get a negative bump, killers are set, and the countermove is recorded
+- ProbCut, IIR, razoring, history pruning, delta pruning, singular extensions, NMP verification, the richer-LMR tweaks, and the aspiration tweaks are *heuristic* — they trade a little accuracy for depth and are **not** score-preserving (unlike the TT). Exact correctness is the pruning-off oracle below; each can be toggled at runtime via `setoption` for A/B testing.
+- **Move ordering feedback**: on a beta cutoff, the mover gets a `statBonus(depth)` history bump (main **and** 1-/2-ply continuation history), quiet refuters get a negative bump, killers are set, and the countermove is recorded
 
 ### Time budget
 
-`computeTimes` derives soft/hard millisecond limits from `movetime`, or `wtime`/`winc`/`movestogo` (default 30 moves to go); `depth`/`nodes`/`mate`/`infinite` disable the time stop. The main worker checks time/nodes every 2048 nodes and converts an overrun into the shared stop flag.
+`computeTimes` derives an **optimum (soft)** and **maximum (hard)** millisecond budget from `wtime`/`winc`/`movestogo` (SF-style `optScale`/`maxScale` over `timeLeft = time + inc*(mtg-1) - overhead*(2+mtg)`, capped at 80 % of the remaining clock); `movetime` is a pure hard limit; `depth`/`nodes`/`mate`/`infinite` disable the time stop. A `MoveOverhead` UCI option (default 10 ms) reserves time for I/O. The main worker checks the hard limit / node budget every 2048 nodes; between iterations it rescales the soft limit by **best-move stability** (a stable root move spends less) and stops early if the next iteration almost certainly cannot finish (predicted ≈ 1.8× the last iteration).
 
 ### Reporting
 
@@ -245,7 +247,7 @@ Each worker is a `Worker` object owning its own `Position`, `History.Tables`, se
 
 ### Correctness oracle
 
-With `UsePruning = false` the search becomes plain full-window alpha-beta (PVS / LMR / extensions / null-move / ProbCut / IIR / razoring / history pruning / delta pruning / mate-distance / qsearch-SEE / history-writes all disabled). The test suite compares this against an exhaustive in-test minimax that shares the engine's own `qsearch` leaf and draw/terminal/mate semantics — they must return identical scores. This is the exact-correctness anchor; the heuristic pruning layered on top (IIR, razoring, history pruning, delta pruning, ProbCut, LMR, null-move, futility) only ever *speeds* the search relative to this oracle, never redefines correctness.
+With `UsePruning = false` the search becomes plain full-window alpha-beta (PVS / LMR / extensions / singular extensions / null-move / NMP verification / ProbCut / IIR / razoring / history pruning / delta pruning / mate-distance / qsearch-SEE / history-writes all disabled; continuation-history reads only reorder moves, which cannot change a full-window score). The test suite compares this against an exhaustive in-test minimax that shares the engine's own `qsearch` leaf and draw/terminal/mate semantics — they must return identical scores. This is the exact-correctness anchor; the heuristic pruning layered on top (IIR, razoring, history pruning, delta pruning, ProbCut, LMR, null-move, futility) only ever *speeds* the search relative to this oracle, never redefines correctness.
 
 Constants: `MaxSearchPly = 246`, `MATE = 32000`, `INF = 32001`, `MATE_IN_MAX_PLY = 31754`.
 
@@ -256,7 +258,7 @@ Constants: `MaxSearchPly = 246`, `MATE = 32000`, `INF = 32001`, `MATE_IN_MAX_PLY
 `Transposition.fs` is the only shared writable structure in the engine — a **lock-free XOR-lockless** table (Hyatt scheme).
 
 - Each 16-byte entry is two naturally-aligned `uint64` fields, `Key = realKey ^^^ Data`. A probe accepts an entry iff `Key ^^^ Data = realKey`; a torn read (one field written between the reader's two reads) breaks that equality and is rejected as a miss. Aligned 64-bit reads/writes are atomic on the 64-bit runtime, so each field is individually torn-free and the XOR ties them together.
-- `Data` packing (LSB → MSB): `move:16 | score:int16 | eval:int16 | depth:uint8 | genBound:uint8`, where `genBound = (generation6 << 2) | bound`.
+- `Data` packing (LSB → MSB): `move:16 | score:int16 | eval:int16 | depth:uint8 | genBound:uint8`, where `genBound = (generation5 << 3) | (ttPv << 2) | bound` (one bit was given to the SF-style `ttPv` flag, so the generation wraps mod 32). `ttPv` is sticky across overwrites of the same key.
 - **Clusters of 4 entries** (64 B, cache-line sized). Replacement: empty slot or key-match first, else the entry minimizing `depth - relativeAge*2`.
 - `Volatile.Read`/`Write` on both fields is mandatory — it stops the JIT from hoisting a stale `Key` read and pins the store order (Data before Key, so a fresh Key implies a fresh Data).
 - Scores are mate-ply-corrected by the caller (`valueToTt`/`valueFromTt`) so stored mate scores are root-relative.
@@ -274,6 +276,7 @@ Stages (main search): TT move → capture init → good captures (SEE-split, los
 
 - **Butterfly main history** `int16[2*4096]` indexed `color<<<12 | fromTo`
 - **Capture history** `int16[12*64*8]` indexed `((pc*64)+to)<<<3 | capturedPT`
+- **Continuation history** `int16[768*768]` (×2, for the 1-ply and 2-ply predecessors) indexed `(prevPc*64+prevTo)*768 + (pc*64+to)`; summed into the quiet move score and the LMR / history signals (divisor `ContHistD = 29952`)
 - **Counter-moves** `Move[12*64]` indexed `prevPc*64 + prevTo`
 - **Killers** `Move[2*MaxPly]` per-ply refutation pair
 
@@ -302,6 +305,12 @@ Stat updates use SF's "gravity" formula `entry += clamp(bonus,-D,D) - entry*|cla
 | `setoption name UseRazoring value <true\|false>` | Toggle razoring at shallow depths (default on) |
 | `setoption name UseHistoryPruning value <true\|false>` | Toggle history-based quiet pruning (default on) |
 | `setoption name UseDeltaPruning value <true\|false>` | Toggle qsearch delta pruning (default on) |
+| `setoption name UseContHist value <true\|false>` | Toggle continuation-history ordering/updates (default on) |
+| `setoption name UseSingular value <true\|false>` | Toggle singular / double extensions (default on) |
+| `setoption name UseNmpVerify value <true\|false>` | Toggle null-move zugzwang verification (default on) |
+| `setoption name UseLmrTweaks value <true\|false>` | Toggle the richer LMR adjustments (default on) |
+| `setoption name UseAspTweaks value <true\|false>` | Toggle the aspiration-window refinements (default on) |
+| `setoption name MoveOverhead value <ms>` | Reserve I/O time per move, 0..5000 ms (default 10) |
 | `setoption name UseNnue value <true\|false>` | Toggle NNUE evaluation (default off; requires a loaded net via `NnueFile`) |
 | `setoption name NnueFile value <path>` | Load an NNUE network from disk; clears the TT on success |
 | `quit` | Stop + join, then exit |
@@ -309,7 +318,7 @@ Stat updates use SF's "gravity" formula `entry += clamp(bonus,-D,D) - entry*|cla
 ### Defaults
 
 - `Threads = 1`, `Hash = 16` MiB
-- Forward-pruning toggles default to `true`: `UseProbCut`, `UseIir`, `UseRazoring`, `UseHistoryPruning`, `UseDeltaPruning`
+- Forward-pruning / heuristic toggles default to `true`: `UseProbCut`, `UseIir`, `UseRazoring`, `UseHistoryPruning`, `UseDeltaPruning`, `UseContHist`, `UseSingular`, `UseNmpVerify`, `UseLmrTweaks`, `UseAspTweaks`; `MoveOverhead = 10` ms
 - **`UseNnue` defaults to `true` when `eonego.nnue` is found beside the exe** (auto-loaded at startup); otherwise it falls back to the material eval. `setoption name NnueFile value <path>` swaps the net at runtime; `UseNnue value false` forces material
 - Standard chess only (Chess960 castling is out of v1 scope; castling uses standard king-to-square encoding `e1g1`/`e1c1`/`e8g8`/`e8c8`)
 
@@ -449,6 +458,6 @@ Eonego/
 
 - NNUE: the region-piececount architecture is small (~165k params) — a tactical *specialist* ceiling, not a general 3000-Elo net; a larger king-conditioned (HalfKP / HalfKA) feature set is the path beyond it
 - SIMD for the incremental L1 update loops; lazy (skip-interior-node) accumulator updates
-- Continuation history and `QuietChecks` generation
+- `QuietChecks` generation
 - Chess960 / Fischer random castling
 - Pin-aware SEE refinement (the king-terminate rule already covers the dominant illegal-recapture case)
