@@ -32,9 +32,9 @@ def _cp_white(score):
 
 
 def label_chunk(args):
-    fens, depth, nodes, hash_mb = args
+    fens, depth, nodes, hash_mb, sf_threads = args
     eng = chess.engine.SimpleEngine.popen_uci(SF)
-    eng.configure({"Threads": 1, "Hash": hash_mb})
+    eng.configure({"Threads": sf_threads, "Hash": hash_mb})
     limit = chess.engine.Limit(nodes=nodes) if nodes else chess.engine.Limit(depth=depth)
     out = []
     try:
@@ -72,18 +72,19 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--depth", type=int, default=16)
     ap.add_argument("--nodes", type=int, default=0, help="if >0, use fixed nodes instead of depth")
-    ap.add_argument("--workers", type=int, default=20)
-    ap.add_argument("--hash", type=int, default=64)
+    ap.add_argument("--workers", type=int, default=24)
+    ap.add_argument("--sf-threads", type=int, default=1, help="threads per Stockfish process (workers * sf-threads should be <= cores)")
+    ap.add_argument("--hash", type=int, default=16)
     args = ap.parse_args()
 
     fens = read_fens(args.inp)
     w = max(1, args.workers)
     chunks = [fens[i::w] for i in range(w)]  # round-robin -> even load
-    payloads = [(c, args.depth, args.nodes, args.hash) for c in chunks if c]
+    payloads = [(c, args.depth, args.nodes, args.hash, args.sf_threads) for c in chunks if c]
 
     print(f"labeling {len(fens)} unique FENs with Stockfish "
           f"({'nodes ' + str(args.nodes) if args.nodes else 'depth ' + str(args.depth)}), "
-          f"{w} workers", flush=True)
+          f"{w} workers x {args.sf_threads} threads, hash {args.hash}MB", flush=True)
 
     results = []
     done = 0
