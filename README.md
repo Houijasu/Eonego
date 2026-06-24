@@ -26,6 +26,7 @@ A from-scratch chess engine written in **F#** (.NET 10), built for speed and ver
 - [Benchmarks](#benchmarks)
 - [Project structure](#project-structure)
 - [Design notes and non-goals](#design-notes-and-non-goals)
+- [License](#license)
 
 ---
 
@@ -461,3 +462,25 @@ Eonego/
 - `QuietChecks` generation
 - Chess960 / Fischer random castling
 - Pin-aware SEE refinement (the king-terminate rule already covers the dominant illegal-recapture case)
+
+---
+
+## License
+
+Eonego is licensed under the **GNU Affero General Public License, version 3 or later
+(AGPL-3.0-or-later)** — see [`LICENSE`](LICENSE) for the full text.
+
+This means: you are free to use, study, modify, and redistribute Eonego, but any distributed
+work that includes or is derived from it must also be offered under the AGPL-3.0, with
+complete corresponding source — **including** when the program is made available to users
+over a network (AGPL §13).
+
+The AGPL-3.0 was chosen so that Eonego can incorporate networks from copyleft engines —
+notably **[Monty](https://github.com/official-monty/Monty)** (AGPL-3.0, policy network) and
+**[Stockfish](https://github.com/official-stockfish/Stockfish)** (GPL-3.0, NNUE value
+network). Monty's AGPL-3.0 is the binding term; the GPL-3.0/AGPL-3.0 §13 combination clauses
+make the two compatible in one combined work. Any incorporated network or upstream-derived
+code remains under its own license — see [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md).
+
+> Note: this notice is not legal advice. The controlling terms are in [`LICENSE`](LICENSE)
+> and the upstream projects' license files.

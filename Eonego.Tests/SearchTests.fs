@@ -6,7 +6,6 @@ module Eonego.Tests.SearchTests
 open Xunit
 open Eonego.Move
 open Eonego.Position
-open Eonego.Evaluation
 open Eonego.Transposition
 open Eonego.Search
 open Eonego.Tests.TestFixtures
@@ -35,7 +34,7 @@ let rec private refMinimax (w: Worker) (pos: Position) (depth: int) (ply: int) :
     elif depth = 0 then
         qsearch w pos (-INF) INF ply
     elif ply >= MaxSearchPly then
-        (if pos.InCheck then 0 else eval pos)
+        (if pos.InCheck then 0 else evalPos w pos)
     else
         let moves = collectLegal pos
 
@@ -142,7 +141,7 @@ let ``qsearch on a quiet position equals static eval`` () =
             UsePruning = false }
 
     let w = makeWorker "8/8/4k3/8/8/4K3/4P3/8 w - - 0 1" cfg
-    Assert.Equal(eval w.Pos, qsearch w w.Pos (-INF) INF 0)
+    Assert.Equal(evalPos w w.Pos, qsearch w w.Pos (-INF) INF 0)
 
 [<Theory>]
 [<InlineData(0)>]

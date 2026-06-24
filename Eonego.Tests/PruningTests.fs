@@ -11,6 +11,7 @@ open Xunit
 open Eonego.Bitboard
 open Eonego.Move
 open Eonego.Search
+open Eonego.Tests.TestFixtures
 
 // cfgOn: all four new heuristics on (defaults). cfgOff: the four off, but the legacy pruning suite
 // (RFP/null-move/LMP/futility/SEE/LMR/ProbCut) stays on — so node deltas isolate the new heuristics.
@@ -39,9 +40,12 @@ let ``pruning does not hide a mate in two`` () =
 
 [<Fact>]
 let ``pruning does not hide a winning capture`` () =
-    let struct (score, _, m) = searchToDepth "4k3/8/8/3q4/4P3/8/8/3RK3 w - - 0 1" [||] 8 cfgOn
-    Assert.Equal(mkSquare 3 4, toSq m) // exd5 captures the queen on d5
-    Assert.True(score > 500, "expected a decisive material win, got " + string score)
+    match tryLoadSfNet () with
+    | None -> () // soft-skip: SF net absent
+    | Some net ->
+        let struct (score, _, m) = searchToDepthNet "4k3/8/8/3q4/4P3/8/8/3RK3 w - - 0 1" [||] 8 cfgOn (Some net)
+        Assert.Equal(mkSquare 3 4, toSq m) // exd5 captures the queen on d5
+        Assert.True(score > 500, "expected a decisive material win, got " + string score)
 
 // ---------------------------------------------------------------------------
 // (b) Measured node reduction — the heuristics are accelerators, so the full suite must not search

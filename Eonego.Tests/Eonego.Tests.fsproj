@@ -7,15 +7,9 @@
 
   <ItemGroup>
     <Compile Include="TestFixtures.fs" />
-    <Compile Include="NnueRegionsTests.fs" />
-    <Compile Include="NnueAccumulatorTests.fs" />
-    <Compile Include="NnueTestFixtures.fs" />
-    <Compile Include="NnueL1AccumulatorTests.fs" />
-    <Compile Include="NnueLoaderTests.fs" />
-    <Compile Include="NnueForwardPassTests.fs" />
-    <Compile Include="NnueInputSymmetryTests.fs" />
-    <Compile Include="NnueEvalRangeTests.fs" />
-    <Compile Include="NnueSearchTests.fs" />
+    <Compile Include="SfAccumulatorTests.fs" />
+    <Compile Include="SfNnueTests.fs" />
+    <Compile Include="MontyPolicyTests.fs" />
     <Compile Include="BitboardTests.fs" />
     <Compile Include="MoveTests.fs" />
     <Compile Include="ZobristTests.fs" />
@@ -27,10 +21,10 @@
     <Compile Include="HistoryTests.fs" />
     <Compile Include="MovePickTests.fs" />
     <Compile Include="MovePickProbeTests.fs" />
-    <Compile Include="EvaluationTests.fs" />
     <Compile Include="TranspositionTests.fs" />
     <Compile Include="PliesFromNullTests.fs" />
     <Compile Include="SearchTests.fs" />
+    <Compile Include="MctsTests.fs" />
     <Compile Include="DrawDetectionTests.fs" />
     <Compile Include="LazySmpTests.fs" />
     <Compile Include="ProbCutTests.fs" />

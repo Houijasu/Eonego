@@ -85,3 +85,14 @@ __pycache__/
 *.pyc
 *.npz
 trainer/*_state*.json
+
+# External NNUE/policy nets (large, downloaded — Stockfish CC0 / Monty AGPL; not committed)
+nets/
+*.nnue
+*.network
+
+# Trainer scratch artifacts
+policy_data.bin
+
+# Downloaded Stockfish binary used only as a local parity oracle (GPL — never commit)
+tmp_sf/

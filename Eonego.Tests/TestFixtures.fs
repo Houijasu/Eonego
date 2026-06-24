@@ -12,6 +12,7 @@ open Eonego.Bitboard
 open Eonego.Move
 open Eonego.Position
 open Eonego.MoveGeneration
+open Eonego.SfNnue
 
 // ---------------------------------------------------------------------------
 // Canonical perft FEN set (CPW positions 1-6). Same strings as PositionTests.perftFens.
@@ -23,28 +24,6 @@ let perftFens =
        "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq -"
        "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ -"
        "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - -" |]
-
-// ---------------------------------------------------------------------------
-// Mirror FEN transform M(p): vertical flip (rank r <-> 7-r) + color swap, side-to-move KEPT (so a PST eval
-// satisfies eval(p) == -eval(M p)). Reverse the ORDER of the 8 rank substrings ONLY — reversing characters
-// within a rank is a 180° rotation (s^63), the classic bug. Castling/ep blanked ("-"): valid because the
-// eval/feature sets ignore them. (Promoted from EvaluationTests so the NNUE symmetry tests can reuse it.)
-// ---------------------------------------------------------------------------
-let mirrorFen (fen: string) : string =
-    let parts = fen.Split(' ')
-    let flipped = parts.[0].Split('/') |> Array.rev
-
-    let swapCase (s: string) =
-        String(
-            s.ToCharArray()
-            |> Array.map (fun ch ->
-                if Char.IsUpper ch then Char.ToLower ch
-                elif Char.IsLower ch then Char.ToUpper ch
-                else ch)
-        )
-
-    let board = flipped |> Array.map swapCase |> String.concat "/"
-    sprintf "%s %s - - 0 1" board parts.[1]
 
 // ---------------------------------------------------------------------------
 // Full-state snapshot (public copy of PositionTests' Snap) for Make/Unmake round-trip checks.
@@ -70,6 +49,19 @@ let snap (p: Position) : Snap =
       Ep = p.EpSquare
       Rule50 = p.Rule50
       Stm = p.SideToMove }
+
+/// Load the SF16 net for eval-dependent tests; None when nets/sf16.nnue is absent (soft-skip).
+let tryLoadSfNet () : SfNetwork option =
+    let mutable dir = System.IO.DirectoryInfo(System.AppContext.BaseDirectory)
+    let mutable root = None
+    while root.IsNone && not (isNull dir) do
+        if System.IO.File.Exists(System.IO.Path.Combine(dir.FullName, "Eonego.slnx")) then root <- Some dir.FullName
+        dir <- dir.Parent
+    match root with
+    | Some r ->
+        let p = System.IO.Path.Combine(r, "nets", "sf16.nnue")
+        if System.IO.File.Exists p then (match Eonego.SfNnue.load p with Loaded n -> Some n | _ -> None) else None
+    | None -> None
 
 /// Make then Unmake must restore every byte; and after Make incremental key == from-scratch.
 let assertRoundTrips (p: Position) (m: Move) =

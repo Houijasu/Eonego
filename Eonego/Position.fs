@@ -151,83 +151,27 @@ type Position() =
     let mutable currentKey = 0UL
     let states: StateInfo[] = Array.zeroCreate MaxPly
     let mutable stPly = 0
-    // NNUE incremental region accumulator (layout owned by NnueRegions). Maintained ONLY when nnueActive
-    // (set via EnableNnue) — the default PeSTO path pays nothing. nnueStack is a single flat slab of MaxPly
-    // frames (AccSize bytes each), lazy-allocated on first enable; snapshot-on-Make, restore-on-Unmake.
-    let nnueAcc: sbyte[] = Array.zeroCreate NnueRegions.AccSize
-    let mutable nnueStack: sbyte[] = Array.empty
-    let mutable nnueActive = false
-    // NNUE L1 pre-activation accumulator (maintained when nnueActive && l1Bound). l1Stack mirrors nnueStack.
-    let l1acc: int[] = Array.zeroCreate 64
-    let mutable l1Stack: int[] = Array.empty
-    let mutable pieceColSumRef: int[] = Array.empty
-    let mutable auxColRef: int[] = Array.empty
-    let mutable l1bRef: int[] = Array.empty
-    let mutable l1Bound = false
 
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-    member private _.AddPieceColSum (sq: Square) (pc: Piece) (sign: int) : unit =
-        if l1Bound then
-            let pBase = (sq * NnueRegions.Channels + pc) * 64
-
-            for o in 0 .. 63 do
-                l1acc.[o] <- l1acc.[o] + sign * pieceColSumRef.[pBase + o]
-
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-    member private _.ApplyStmDelta (newStm: Color) : unit =
-        if l1Bound then
-            if newStm = Black then
-                for o in 0 .. 63 do
-                    l1acc.[o] <- l1acc.[o] + auxColRef.[o]
-            else
-                for o in 0 .. 63 do
-                    l1acc.[o] <- l1acc.[o] - auxColRef.[o]
-
-    member private _.ApplyKingAuxDeltas (wkOld: Square) (wkNew: Square) (bkOld: Square) (bkNew: Square) : unit =
-        if l1Bound then
-            if wkNew <> wkOld then
-                let oOld = (1 + wkOld) * 64
-                let oNew = (1 + wkNew) * 64
-
-                for o in 0 .. 63 do
-                    l1acc.[o] <- l1acc.[o] - auxColRef.[oOld + o] + auxColRef.[oNew + o]
-
-            if bkNew <> bkOld then
-                let oOld = (65 + bkOld) * 64
-                let oNew = (65 + bkNew) * 64
-
-                for o in 0 .. 63 do
-                    l1acc.[o] <- l1acc.[o] - auxColRef.[oOld + o] + auxColRef.[oNew + o]
-
-    member private this.RefreshL1Acc() : unit =
-        if l1Bound then
-            for o in 0 .. 63 do
-                l1acc.[o] <- l1bRef.[o]
-
-            let mutable occ = byTypeBB.[AllPieces]
-
-            while occ <> 0UL do
-                let sq = popLsb &occ
-                let pc = board.[sq]
-                let pBase = (sq * NnueRegions.Channels + pc) * 64
-
-                for o in 0 .. 63 do
-                    l1acc.[o] <- l1acc.[o] + pieceColSumRef.[pBase + o]
-
-            if sideToMove = Black then
-                for o in 0 .. 63 do
-                    l1acc.[o] <- l1acc.[o] + auxColRef.[o]
-
-            let wk = this.KingSquare White
-            let bk = this.KingSquare Black
-            let wBase = (1 + wk) * 64
-            let bBase = (65 + bk) * 64
-
-            for o in 0 .. 63 do
-                l1acc.[o] <- l1acc.[o] + auxColRef.[wBase + o] + auxColRef.[bBase + o]
-
-            if not (Array.isEmpty l1Stack) then
-                System.Array.Copy(l1acc, 0, l1Stack, 0, 64)
+    // --- SF NNUE incremental accumulator (gated by sfActive; bound raw weight arrays, no SfNetwork type) ---
+    let mutable sfActive = false
+    let sfWhiteAcc: int[] = Array.zeroCreate SfAccumulator.L1
+    let sfWhitePsqt: int[] = Array.zeroCreate SfAccumulator.PsqtBuckets
+    let sfBlackAcc: int[] = Array.zeroCreate SfAccumulator.L1
+    let sfBlackPsqt: int[] = Array.zeroCreate SfAccumulator.PsqtBuckets
+    let mutable sfFtWeights: int16[] = Array.empty
+    let mutable sfFtPsqt: int[] = Array.empty
+    let mutable sfFtBiases: int16[] = Array.empty
+    let sfPlyStride = 2 * (SfAccumulator.L1 + SfAccumulator.PsqtBuckets)
+    // Per-ply snapshot stack, lazy-allocated only when sfActive. Sized MaxPly because stPly reaches
+    // (root moves replayed in SetupRoot) + (search depth). FOOTPRINT: MaxPly*sfPlyStride int32 ~= 12 MB
+    // per Position, i.e. ~12 MB PER LazySMP Worker (each owns its own Position). Deferred memory mitigations
+    // (this phase is correctness-first, int32 to stay bit-exact with the from-scratch oracle): narrow to
+    // int16 (halves it, matches SF), or a forward-accumulator model that avoids the full per-ply snapshot.
+    let mutable sfStack: int[] = Array.empty
+    let sfDirtyPc: int[] = Array.zeroCreate 8
+    let sfDirtySq: int[] = Array.zeroCreate 8
+    let sfDirtySign: int[] = Array.zeroCreate 8
+    let mutable sfDirtyN = 0
 
     // --- mutation choke points (the ONLY board writers) ---------------------
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
@@ -241,8 +185,8 @@ type Position() =
         byColorBB.[c] <- byColorBB.[c] ||| b
         board.[sq] <- pc
         currentKey <- currentKey ^^^ zPiece pc sq
-        if nnueActive then NnueRegions.activate nnueAcc pc sq
-        this.AddPieceColSum sq pc 1
+        if sfActive then
+            sfDirtyPc.[sfDirtyN] <- pc; sfDirtySq.[sfDirtyN] <- sq; sfDirtySign.[sfDirtyN] <- 1; sfDirtyN <- sfDirtyN + 1
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member private this.RemovePiece (pc: Piece) (sq: Square) =
@@ -255,8 +199,8 @@ type Position() =
         byColorBB.[c] <- byColorBB.[c] ^^^ b
         board.[sq] <- NoPiece
         currentKey <- currentKey ^^^ zPiece pc sq
-        if nnueActive then NnueRegions.deactivate nnueAcc pc sq
-        this.AddPieceColSum sq pc -1
+        if sfActive then
+            sfDirtyPc.[sfDirtyN] <- pc; sfDirtySq.[sfDirtyN] <- sq; sfDirtySign.[sfDirtyN] <- -1; sfDirtyN <- sfDirtyN + 1
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member private this.MovePiece (pc: Piece) (from: Square) (dst: Square) =
@@ -271,9 +215,9 @@ type Position() =
         board.[from] <- NoPiece
         board.[dst] <- pc
         currentKey <- currentKey ^^^ zPiece pc from ^^^ zPiece pc dst
-        if nnueActive then NnueRegions.move nnueAcc pc from dst
-        this.AddPieceColSum from pc -1
-        this.AddPieceColSum dst pc 1
+        if sfActive then
+            sfDirtyPc.[sfDirtyN] <- pc; sfDirtySq.[sfDirtyN] <- from; sfDirtySign.[sfDirtyN] <- -1; sfDirtyN <- sfDirtyN + 1
+            sfDirtyPc.[sfDirtyN] <- pc; sfDirtySq.[sfDirtyN] <- dst;  sfDirtySign.[sfDirtyN] <- 1;  sfDirtyN <- sfDirtyN + 1
 
     // Key-less siblings (used ONLY by unmake -> pure board restore, zero key-drift risk).
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
@@ -325,66 +269,55 @@ type Position() =
     member _.SideToMove: Color = sideToMove
     member _.GamePly: int = gamePly
 
-    // --- NNUE accumulator (maintained only when EnableNnue true; default PeSTO path leaves it untouched) ---
-    /// The live 2448-entry region accumulator — read-only view for the forward pass. DO NOT mutate.
-    member _.NnueAccumulator: sbyte[] = nnueAcc
+    // --- SF NNUE incremental accumulator public accessors + enable ---
+    member _.SfActive: bool = sfActive
+    member _.SfWhiteAcc: int[] = sfWhiteAcc
+    member _.SfWhitePsqt: int[] = sfWhitePsqt
+    member _.SfBlackAcc: int[] = sfBlackAcc
+    member _.SfBlackPsqt: int[] = sfBlackPsqt
 
-    /// The live 64-entry L1 pre-activation accumulator — read-only; valid when L1Bound.
-    member _.L1Accumulator: int[] = l1acc
+    /// Refresh one perspective from scratch (at enable + on a king move). Mirrors SfNnue.buildAcc.
+    member private this.SfRefresh(pColor: Color) =
+        let acc = if pColor = White then sfWhiteAcc else sfBlackAcc
+        let psqt = if pColor = White then sfWhitePsqt else sfBlackPsqt
+        let ksq = this.KingSquare pColor
+        for j in 0 .. SfAccumulator.L1 - 1 do
+            acc.[j] <- int sfFtBiases.[j]
+        System.Array.Clear(psqt, 0, SfAccumulator.PsqtBuckets)
+        for sq in 0 .. 63 do
+            let pc = board.[sq]
+            if pc <> NoPiece then
+                SfAccumulator.addFeature acc psqt sfFtWeights sfFtPsqt (SfAccumulator.makeIndex pColor pc sq ksq) 1 SfAccumulator.UseAvx2
 
-    /// True after BindNnueWeights; the incremental L1 path is active when this && nnueActive.
-    member _.L1Bound = l1Bound
+    /// Bind raw weight arrays + refresh both perspectives. ROOT ONLY.
+    member this.EnableSfNnue (ftWeights: int16[]) (ftPsqt: int[]) (ftBiases: int16[]) =
+        Debug.Assert((stPly = 0), "EnableSfNnue must be called at the root (stPly = 0)")
+        sfFtWeights <- ftWeights
+        sfFtPsqt <- ftPsqt
+        sfFtBiases <- ftBiases
+        if Array.isEmpty sfStack then sfStack <- Array.zeroCreate (MaxPly * sfPlyStride)
+        sfActive <- true
+        this.SfRefresh White
+        this.SfRefresh Black
 
-    /// Usable incremental L1 path iff NNUE is active AND the L1 tables are bound.
-    member _.L1Active = nnueActive && l1Bound
-
-    /// Bind precomputed L1 tables for incremental first-layer maintenance. MUST be called at the root
-    /// (stPly = 0), typically after EnableNnue. Rebuilds l1acc when NNUE is already active.
-    member this.BindNnueWeights (pieceColSum: int[]) (auxCol: int[]) (l1b: int[]) : unit =
-        Debug.Assert((stPly = 0), "BindNnueWeights must be called at the root (stPly = 0)")
-        pieceColSumRef <- pieceColSum
-        auxColRef <- auxCol
-        l1bRef <- l1b
-        l1Bound <- true
-
-        if Array.isEmpty l1Stack then
-            l1Stack <- Array.zeroCreate (MaxPly * 64)
-
-        if nnueActive then
-            this.RefreshL1Acc()
-
-    /// Turn NNUE accumulator maintenance on/off. MUST be called at the ROOT (stPly = 0) — typically right
-    /// after LoadFen, before any Make. Enabling lazy-allocates the per-ply snapshot slab and rebuilds the
-    /// accumulator + frame-0 snapshot from the current board. Enabling mid-stack is UNSUPPORTED: the snapshots
-    /// for plies made while NNUE was off were never taken, so a later Unmake would restore garbage.
-    member this.EnableNnue(on: bool) : unit =
-        Debug.Assert((stPly = 0), "EnableNnue must be called at the root (stPly = 0), before any Make")
-        nnueActive <- on
-
-        if on then
-            if Array.isEmpty nnueStack then
-                nnueStack <- Array.zeroCreate (MaxPly * NnueRegions.AccSize)
-
-            this.RefreshNnueAcc()
-        elif l1Bound && not (Array.isEmpty l1Stack) then
-            System.Array.Clear(l1acc, 0, 64)
-
-    /// Rebuild the region accumulator from scratch off the board (cold path: enable / FEN load / net reload).
-    /// Mirrors RecomputeKey's "from scratch" oracle role. No region work when NNUE is inactive.
-    member this.RefreshNnueAcc() : unit =
-        System.Array.Clear(nnueAcc, 0, NnueRegions.AccSize)
-
-        if nnueActive then
-            let mutable occ = byTypeBB.[AllPieces]
-
-            while occ <> 0UL do
-                let sq = popLsb &occ
-                NnueRegions.activate nnueAcc board.[sq] sq
-
-            System.Array.Copy(nnueAcc, 0, nnueStack, 0, NnueRegions.AccSize)
-
-        if l1Bound then
-            this.RefreshL1Acc()
+    /// Apply the dirty buffer to both perspectives (refresh a side iff its own king moved). Call AFTER the
+    /// board mutation completes.
+    member private this.SfUpdate() =
+        let mutable whiteKingMoved = false
+        let mutable blackKingMoved = false
+        for i in 0 .. sfDirtyN - 1 do
+            if pieceType sfDirtyPc.[i] = King then
+                if pieceColor sfDirtyPc.[i] = White then whiteKingMoved <- true else blackKingMoved <- true
+        if whiteKingMoved then this.SfRefresh White
+        else
+            let ksq = this.KingSquare White
+            for i in 0 .. sfDirtyN - 1 do
+                SfAccumulator.addFeature sfWhiteAcc sfWhitePsqt sfFtWeights sfFtPsqt (SfAccumulator.makeIndex White sfDirtyPc.[i] sfDirtySq.[i] ksq) sfDirtySign.[i] SfAccumulator.UseAvx2
+        if blackKingMoved then this.SfRefresh Black
+        else
+            let ksq = this.KingSquare Black
+            for i in 0 .. sfDirtyN - 1 do
+                SfAccumulator.addFeature sfBlackAcc sfBlackPsqt sfFtWeights sfFtPsqt (SfAccumulator.makeIndex Black sfDirtyPc.[i] sfDirtySq.[i] ksq) sfDirtySign.[i] SfAccumulator.UseAvx2
 
     // --- StateInfo scalar accessors (byref-local read avoids the ~120 B struct copy; the getter itself
     //     is trivial and JIT-inlined — F# forbids MethodImpl on a parameterless property) -------------
@@ -701,10 +634,13 @@ type Position() =
         System.Array.Fill(board, NoPiece)
         System.Array.Clear(byTypeBB, 0, byTypeBB.Length)
         System.Array.Clear(byColorBB, 0, byColorBB.Length)
-        if nnueActive then System.Array.Clear(nnueAcc, 0, NnueRegions.AccSize)
         currentKey <- 0UL
         stPly <- 0
         gamePly <- 0
+        // A bulk board load invalidates the incremental SF accumulator: disable it so the piece-placement
+        // below records NO deltas (32 PutPiece calls would overflow the small dirty buffer). The caller
+        // re-enables via EnableSfNnue, which rebuilds both perspectives from scratch (SfRefresh).
+        sfActive <- false
         let n = fen.Length
         let mutable i = 0
         // 1. piece placement (ranks 8->1, files a->h)
@@ -848,12 +784,6 @@ type Position() =
 
         this.SetCheckInfo()
         Debug.Assert((this.RecomputeKey() = currentKey), "LoadFen: incremental key != from-scratch")
-        // Keep the frame-0 snapshot coherent if NNUE is already active across a re-load (stPly is now 0).
-        if nnueActive then
-            System.Array.Copy(nnueAcc, 0, nnueStack, 0, NnueRegions.AccSize)
-
-        if l1Bound then
-            this.RefreshL1Acc()
 
     member _.ToFen() : string =
         let sb = System.Text.StringBuilder()
@@ -935,6 +865,14 @@ type Position() =
         let pCastling = prev.CastlingRights
         let pRule50 = prev.Rule50
         let pPlies = prev.PliesFromNull
+        // SF NNUE: snapshot parent accumulator before stPly advances; reset dirty buffer.
+        if sfActive then
+            let off = stPly * sfPlyStride
+            System.Array.Copy(sfWhiteAcc, 0, sfStack, off, SfAccumulator.L1)
+            System.Array.Copy(sfWhitePsqt, 0, sfStack, off + SfAccumulator.L1, SfAccumulator.PsqtBuckets)
+            System.Array.Copy(sfBlackAcc, 0, sfStack, off + SfAccumulator.L1 + SfAccumulator.PsqtBuckets, SfAccumulator.L1)
+            System.Array.Copy(sfBlackPsqt, 0, sfStack, off + 2 * SfAccumulator.L1 + SfAccumulator.PsqtBuckets, SfAccumulator.PsqtBuckets)
+            sfDirtyN <- 0
         stPly <- stPly + 1
         gamePly <- gamePly + 1
         let st = &states.[stPly]
@@ -944,15 +882,6 @@ type Position() =
         st.EpSquare <- NoSquare
         st.CapturedPiece <- NoPiece
         st.Repetition <- 0
-        let wkOld = this.KingSquare White
-        let bkOld = this.KingSquare Black
-        // snapshot the PARENT accumulator into this child's slot BEFORE the hooks mutate it (restored verbatim
-        // by Unmake — the NK board-restore fires no hooks, exactly like Unmake reading the parent Key directly).
-        if nnueActive then
-            System.Array.Copy(nnueAcc, 0, nnueStack, stPly * NnueRegions.AccSize, NnueRegions.AccSize)
-
-        if l1Bound then
-            System.Array.Copy(l1acc, 0, l1Stack, stPly * 64, 64)
         // 2/3. apply (fast path first per Move.fs contract)
         if not (isSpecial m) then
             let captured = board.[dst]
@@ -1006,10 +935,8 @@ type Position() =
         sideToMove <- them
         st.Key <- currentKey
         this.SetCheckInfo()
-
-        if l1Bound then
-            this.ApplyStmDelta them
-            this.ApplyKingAuxDeltas wkOld (this.KingSquare White) bkOld (this.KingSquare Black)
+        // SF NNUE: apply accumulated dirty buffer to both perspectives.
+        if sfActive then this.SfUpdate()
 
     /// Undo the move applied by Make. Pure board restore — NO key math (the parent frame holds the key).
     member this.Unmake(m: Move) : unit =
@@ -1042,16 +969,16 @@ type Position() =
                 this.MovePieceNK (makePiece us Rook) castleRookTo.[dst] castleRookFrom.[dst]
 
         Debug.Assert((stPly > 0), "Unmake: stack underflow")
-        // restore the pre-move accumulator from this ply's snapshot (pure memcpy — no region math).
-        if nnueActive then
-            System.Array.Copy(nnueStack, stPly * NnueRegions.AccSize, nnueAcc, 0, NnueRegions.AccSize)
-
-        if l1Bound then
-            System.Array.Copy(l1Stack, stPly * 64, l1acc, 0, 64)
-
         stPly <- stPly - 1
         gamePly <- gamePly - 1
         currentKey <- (let p = &states.[stPly] in p.Key)
+        // SF NNUE: restore parent accumulator from snapshot (stPly is now back at parent ply).
+        if sfActive then
+            let off = stPly * sfPlyStride
+            System.Array.Copy(sfStack, off, sfWhiteAcc, 0, SfAccumulator.L1)
+            System.Array.Copy(sfStack, off + SfAccumulator.L1, sfWhitePsqt, 0, SfAccumulator.PsqtBuckets)
+            System.Array.Copy(sfStack, off + SfAccumulator.L1 + SfAccumulator.PsqtBuckets, sfBlackAcc, 0, SfAccumulator.L1)
+            System.Array.Copy(sfStack, off + 2 * SfAccumulator.L1 + SfAccumulator.PsqtBuckets, sfBlackPsqt, 0, SfAccumulator.PsqtBuckets)
 
     /// Play a null move (side passes). PRE: not in check.
     member this.MakeNull() : unit =
@@ -1065,6 +992,14 @@ type Position() =
 
         let pCastling = prev.CastlingRights
         let pRule50 = prev.Rule50
+        // SF NNUE: snapshot parent accumulator before stPly advances; no pieces move so no dirty entries.
+        if sfActive then
+            let off = stPly * sfPlyStride
+            System.Array.Copy(sfWhiteAcc, 0, sfStack, off, SfAccumulator.L1)
+            System.Array.Copy(sfWhitePsqt, 0, sfStack, off + SfAccumulator.L1, SfAccumulator.PsqtBuckets)
+            System.Array.Copy(sfBlackAcc, 0, sfStack, off + SfAccumulator.L1 + SfAccumulator.PsqtBuckets, SfAccumulator.L1)
+            System.Array.Copy(sfBlackPsqt, 0, sfStack, off + 2 * SfAccumulator.L1 + SfAccumulator.PsqtBuckets, SfAccumulator.PsqtBuckets)
+            sfDirtyN <- 0
         stPly <- stPly + 1
         gamePly <- gamePly + 1
         let st = &states.[stPly]
@@ -1074,27 +1009,23 @@ type Position() =
         st.PliesFromNull <- 0
         st.CapturedPiece <- NoPiece
         st.Repetition <- 0
-
-        if l1Bound then
-            System.Array.Copy(l1acc, 0, l1Stack, stPly * 64, 64)
-
         sideToMove <- flipColor sideToMove
         st.Key <- currentKey
         this.SetCheckInfo()
 
-        if l1Bound then
-            this.ApplyStmDelta sideToMove
-
     member this.UnmakeNull() : unit =
         Debug.Assert((stPly > 0), "UnmakeNull: stack underflow")
-
-        if l1Bound then
-            System.Array.Copy(l1Stack, stPly * 64, l1acc, 0, 64)
-
         stPly <- stPly - 1
         gamePly <- gamePly - 1
         sideToMove <- flipColor sideToMove
         currentKey <- (let p = &states.[stPly] in p.Key)
+        // SF NNUE: restore parent accumulator from snapshot (stPly is now back at parent ply).
+        if sfActive then
+            let off = stPly * sfPlyStride
+            System.Array.Copy(sfStack, off, sfWhiteAcc, 0, SfAccumulator.L1)
+            System.Array.Copy(sfStack, off + SfAccumulator.L1, sfWhitePsqt, 0, SfAccumulator.PsqtBuckets)
+            System.Array.Copy(sfStack, off + SfAccumulator.L1 + SfAccumulator.PsqtBuckets, sfBlackAcc, 0, SfAccumulator.L1)
+            System.Array.Copy(sfStack, off + 2 * SfAccumulator.L1 + SfAccumulator.PsqtBuckets, sfBlackPsqt, 0, SfAccumulator.PsqtBuckets)
 
     // --- GivesCheck: does `m` give check? (search/movegen; perft does not use it) -------------------
     // Normal: direct via cached CheckSquares (valid because a `from`-blocked ray would mean the enemy king

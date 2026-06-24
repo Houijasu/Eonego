@@ -11,12 +11,13 @@ open BenchmarkDotNet.Running
 open Eonego.Bitboard
 open Eonego.Move
 open Eonego.Position
-open Eonego.Evaluation
+open Eonego.SfNnue
 open Eonego.MoveGeneration
 open Eonego.History
 open Eonego.MovePick
 open Eonego.Transposition
 open Eonego.Search
+open Eonego.Mcts
 
 /// Bit-serialization loop shoot-out.
 ///
@@ -416,9 +417,10 @@ type MovePickBench() =
 
         acc
 
-/// Static eval throughput. `eval` must be 0 B/op: the Mg/Eg tables are built once at module init,
-/// `accumulate` returns a struct tuple (stack), Position is a reference type passed by handle, and popLsb
-/// is a byref iterator. The XOR-fold is returned so BenchmarkDotNet cannot dead-code-eliminate the loop.
+/// Static eval throughput for the Stockfish NNUE — the sole evaluator. NOTE: the from-scratch `SfNnue.evalCp`
+/// is NOT 0 B/op (it allocates per-call accumulators) and is ~100x a material eval; this benchmark exists to
+/// MEASURE that cost and track the future incremental+AVX2 speedup. Soft-skips (does nothing) if the SF net
+/// `nets/sf16.nnue` is absent. The XOR-fold is returned so BenchmarkDotNet cannot dead-code-eliminate the loop.
 [<MemoryDiagnoser>]
 [<ShortRunJob>]
 type EvalBench() =
@@ -430,18 +432,38 @@ type EvalBench() =
            "8/8/8/3k4/8/3K4/4P3/8 w - -" |] // pawn endgame (phase 0)
 
     let mutable positions: Position[] = [||]
+    let mutable net: SfNetwork option = None
 
     [<GlobalSetup>]
     member _.Setup() =
         positions <- fens |> Array.map Position.OfFen
+        // Walk up to the repo root (holds Eonego.slnx) and load nets/sf16.nnue if present.
+        let mutable dir = System.IO.DirectoryInfo(System.AppContext.BaseDirectory)
+        let mutable root = None
 
-    /// Evaluate the fixed set; XOR-fold and return. 0 B/op expected.
+        while root.IsNone && not (isNull dir) do
+            if System.IO.File.Exists(System.IO.Path.Combine(dir.FullName, "Eonego.slnx")) then
+                root <- Some dir.FullName
+
+            dir <- dir.Parent
+
+        net <-
+            match root with
+            | Some r ->
+                let p = System.IO.Path.Combine(r, "nets", "sf16.nnue")
+                if System.IO.File.Exists p then (match load p with Loaded n -> Some n | _ -> None) else None
+            | None -> None
+
+    /// Evaluate the fixed set; XOR-fold and return. Does nothing if no net is loaded.
     [<Benchmark>]
     member _.EvalFixedSet() =
         let mutable acc = 0
 
-        for pos in positions do
-            acc <- acc ^^^ eval pos
+        match net with
+        | Some n ->
+            for pos in positions do
+                acc <- acc ^^^ evalCp n pos
+        | None -> ()
 
         acc
 
@@ -476,6 +498,26 @@ type SearchBench() =
     member _.SearchDepth7() =
         negamax worker worker.Pos (-INF) INF 7 0 true false
 
+/// MCTS-root / negamax-leaf hybrid throughput. Measures end-to-end iteration cost
+/// (selection, expansion, leaf negamax, backup) on a tactically rich position.
+[<MemoryDiagnoser>]
+[<ShortRunJob>]
+type MctsBench() =
+
+    let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -" // Kiwipete
+
+    [<Benchmark(Baseline = true)>]
+    member _.MctsDepth6_200Iters() =
+        let cfg = { defaultConfig with MctsLeafDepth = 6; MctsCpuct = 150; MctsK = 200 }
+        let struct (_, _, _) = mctsToIterations fen [||] 200 cfg None
+        0
+
+    [<Benchmark>]
+    member _.MctsDepth0_200Iters() =
+        let cfg = { defaultConfig with MctsLeafDepth = 0; MctsCpuct = 150; MctsK = 200 }
+        let struct (_, _, _) = mctsToIterations fen [||] 200 cfg None
+        0
+
 [<EntryPoint>]
 let main argv =
     // `--filter *` runs every benchmark non-interactively when no args are given.
@@ -489,7 +531,8 @@ let main argv =
                typeof<MoveGenBench>
                typeof<MovePickBench>
                typeof<EvalBench>
-               typeof<SearchBench> |]
+               typeof<SearchBench>
+               typeof<MctsBench> |]
         )
         .Run(args)
     |> ignore

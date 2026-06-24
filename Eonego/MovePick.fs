@@ -84,10 +84,10 @@ let StgDone = 16
 [<Literal>]
 let EvasionBonus = 268435456 // 1 <<< 28 — keeps capture-evasions above any history term, no overflow
 
-// ---------------------------------------------------------------------------
-// The layout (explicit `val mutable` form, NOT a struct-record: a record would auto-derive
-// equality/compare over the Span/ref fields). Span fields are legal ONLY because the container is
-// IsByRefLike; Position/Tables are ordinary GC references (legal fields in a ref struct).
+// --------------------------------------------------------------------------------------------------
+// The layout (explicit `val mutable` form, NOT a struct-record: a record would auto-derive         -
+// equality/compare over the Span/ref fields). Span fields are legal ONLY because the container is  -
+// IsByRefLike; Position/Tables are ordinary GC references (legal fields in a ref struct).          -
 // ---------------------------------------------------------------------------
 [<Struct; IsByRefLike>]
 type MovePick =

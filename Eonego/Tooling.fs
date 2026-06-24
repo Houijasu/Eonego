@@ -1,4 +1,4 @@
-/// Eonego — offline tooling subcommands (featuredump, nnforward, gen) for NNUE training parity and self-play.
+/// Eonego — offline tooling subcommands (gen) for self-play data generation.
 /// Console.Out only (AOT-safe); parse numbers with InvariantCulture.
 module Eonego.Tooling
 
@@ -14,9 +14,7 @@ open Eonego.Bitboard
 open Eonego.Move
 open Eonego.Position
 open Eonego.MoveGeneration
-open Eonego.Evaluation
-open Eonego.Nnue
-open Eonego.NnueNetwork
+open Eonego.SfNnue
 open Eonego.Search
 
 let private inv = CultureInfo.InvariantCulture
@@ -27,9 +25,7 @@ let private errLine (s: string) = Console.Error.WriteLine(s)
 
 let private usage () =
     writeLine "Eonego tooling subcommands:"
-    writeLine "  featuredump [--in <fens>] [--sparse|--dense]"
-    writeLine "  nnforward --net <path> [--in <fens>]"
-    writeLine "  gen --start <fen> --games N --out <file> [--net <path>] [--depth D | --nodes K] [--temp T] [--seed S] [--random-plies P] [--max-plies M]"
+    writeLine "  gen --start <fen> --games N --out <file> --net <path> [--depth D | --nodes K] [--temp T] [--seed S] [--random-plies P] [--max-plies M]"
 
 /// Hand-rolled `--key value` parser; returns a map of flag -> optional value.
 let private parseFlags (args: string[]) : Map<string, string option> =
@@ -80,28 +76,6 @@ let private flagFloat (m: Map<string, string option>) (name: string) (defaultVal
         | _ -> defaultVal
     | None -> defaultVal
 
-let private readFens (pathOpt: string option) : string[] =
-    match pathOpt with
-    | None ->
-        let acc = ResizeArray<string>()
-        let mutable line = Console.In.ReadLine()
-
-        while not (isNull line) do
-            let t = line.Trim()
-
-            if t.Length > 0 && not (t.StartsWith "#") then
-                acc.Add t
-
-            line <- Console.In.ReadLine()
-
-        acc.ToArray()
-    | Some path ->
-        File.ReadAllLines path
-        |> Array.choose (fun line ->
-            let t = line.Trim()
-
-            if t.Length = 0 || t.StartsWith "#" then None else Some t)
-
 let private matchMove (pos: Position) (uci: string) : Move =
     let t = parseUci uci
 
@@ -124,72 +98,6 @@ let private matchMove (pos: Position) (uci: string) : Move =
                 found <- m
 
         found
-
-let private dumpSparse (fen: string) (input: byte[]) =
-    let sb = StringBuilder(4096)
-    sb.Append(fen).Append('\t').Append("n=") |> ignore
-    let mutable count = 0
-
-    for i in 0 .. InputSize - 1 do
-        if input.[i] <> 0uy then
-            count <- count + 1
-
-    sb.Append(count) |> ignore
-
-    for i in 0 .. InputSize - 1 do
-        if input.[i] <> 0uy then
-            sb.Append('\t').Append(i).Append(':').Append(input.[i]) |> ignore
-
-    writeLine (sb.ToString())
-
-let private dumpDense (fen: string) (input: byte[]) =
-    let sb = StringBuilder(8192)
-    sb.Append(fen) |> ignore
-
-    for i in 0 .. InputSize - 1 do
-        sb.Append('\t').Append(input.[i]) |> ignore
-
-    writeLine (sb.ToString())
-
-let runFeatureDump (args: string[]) : int =
-    let m = parseFlags args
-    let fens = readFens (flag m "in")
-    let dense = Map.containsKey "dense" m
-
-    for fen in fens do
-        let pos = Position.OfFen fen
-        pos.EnableNnue true
-        let input = assembleInput pos
-
-        if dense then dumpDense fen input else dumpSparse fen input
-
-    0
-
-let runNnForward (args: string[]) : int =
-    let m = parseFlags args
-
-    match flag m "net" with
-    | None ->
-        errLine "nnforward requires --net <path>"
-        1
-    | Some path ->
-        match load path with
-        | Failed reason ->
-            errLine ("failed to load net: " + reason)
-            1
-        | Loaded net ->
-            let fens = readFens (flag m "in")
-
-            for fen in fens do
-                let pos = Position.OfFen fen
-                pos.EnableNnue true
-                let input = assembleInput pos
-
-                use p = fixed input
-                let cpWhite = forward net p
-                writeLine (sprintf "%s\t%d" fen cpWhite)
-
-            0
 
 [<Literal>]
 let DefaultKgaFen = "rnbqkbnr/pppp1ppp/8/8/4Pp2/8/PPPP2PP/RNBQKBNR w KQkq - 0 3"
@@ -218,8 +126,8 @@ let private collectLegal (pos: Position) : Move[] =
 let private isNoisyBest (pos: Position) (m: Move) : bool =
     isPromotion m || isEnPassant m || not (pos.IsEmpty(toSq m))
 
-let private whiteRelEval (pos: Position) : int =
-    let e = eval pos
+let private whiteRelEval (net: SfNetwork) (pos: Position) : int =
+    let e = SfNnue.evalCp net pos
     if pos.SideToMove = White then e else -e
 
 let private softmaxPick (rng: Random) (temp: float) (moves: Move[]) (scores: int[]) : Move =
@@ -248,7 +156,7 @@ let private softmaxPick (rng: Random) (temp: float) (moves: Move[]) (scores: int
 
         pick
 
-let private gameResult (pos: Position) (ply: int) (maxPlies: int) : float =
+let private gameResult (net: SfNetwork) (pos: Position) (ply: int) (maxPlies: int) : float =
     let legal = collectLegal pos
 
     if legal.Length = 0 then
@@ -259,7 +167,7 @@ let private gameResult (pos: Position) (ply: int) (maxPlies: int) : float =
     elif isImmediateDraw pos then
         0.5
     elif ply >= maxPlies then
-        let w = whiteRelEval pos
+        let w = whiteRelEval net pos
 
         if w > 150 then 1.0
         elif w < -150 then 0.0
@@ -273,7 +181,7 @@ let private searchMove
     (depth: int option)
     (nodes: int64 option)
     (cfg: SearchConfig)
-    (net: Network option)
+    (net: SfNetwork option)
     : struct (int * Move) =
     let fenNow = pos.ToFen()
 
@@ -303,11 +211,9 @@ let private playOneGame
     (depthOpt: int option)
     (nodesOpt: int64 option)
     (cfg: SearchConfig)
-    (net: Network option)
-    (useNnue: bool)
+    (net: SfNetwork)
     : unit =
     let pos = Position.OfFen startFen
-    pos.EnableNnue useNnue
     let mutable rootMoves = [||]
     let book = kgaBookLines.[rng.Next kgaBookLines.Length]
     let prefixTarget = max randomPlies book.Length
@@ -326,7 +232,7 @@ let private playOneGame
                 if mvFromBook <> MoveNone then
                     mvFromBook
                 else
-                    let struct (score, _) = searchMove pos rootMoves depthOpt nodesOpt cfg net
+                    let struct (score, _) = searchMove pos rootMoves depthOpt nodesOpt cfg (Some net)
                     let scores = legal |> Array.map (fun _ -> score)
                     softmaxPick rng temp legal scores
 
@@ -343,7 +249,7 @@ let private playOneGame
     let mutable finished = false
 
     while not finished do
-        let result = gameResult pos ply maxPlies
+        let result = gameResult net pos ply maxPlies
 
         if not (Double.IsNaN result) then
             for entry in pending do
@@ -351,10 +257,10 @@ let private playOneGame
 
             finished <- true
         else
-            let struct (scoreStm, best) = searchMove pos rootMoves depthOpt nodesOpt cfg net
+            let struct (scoreStm, best) = searchMove pos rootMoves depthOpt nodesOpt cfg (Some net)
 
             if best = MoveNone then
-                let r = gameResult pos ply maxPlies
+                let r = gameResult net pos ply maxPlies
 
                 for entry in pending do
                     writer.WriteLine(sprintf "%s;%d;%.1f" entry.Fen entry.CpWhite r)
@@ -375,8 +281,8 @@ let private playOneGame
                 ply <- ply + 1
 
 let runGen (args: string[]) : int =
-    let runGenGames outPath startFen games depthOpt nodesOpt temp seed randomPlies maxPlies net useNnue =
-        let cfg = { defaultConfig with Threads = 1; UseNnue = useNnue }
+    let runGenGames outPath startFen games depthOpt nodesOpt temp seed randomPlies maxPlies (net: SfNetwork) =
+        let cfg = { defaultConfig with Threads = 1 }
 
         use writer = new StreamWriter(outPath, false, Encoding.UTF8)
         writer.WriteLine("# eonego gen v1")
@@ -385,13 +291,12 @@ let runGen (args: string[]) : int =
         writer.WriteLine("# seed=" + string seed)
         writer.WriteLine("# depth=" + (match depthOpt with Some d -> string d | None -> "-"))
         writer.WriteLine("# nodes=" + (match nodesOpt with Some n -> string n | None -> "-"))
-        writer.WriteLine("# useNnue=" + string useNnue)
         writer.Flush()
 
         for g in 0 .. games - 1 do
             let rng = Random(seed + g)
 
-            playOneGame writer startFen rng temp randomPlies maxPlies depthOpt nodesOpt cfg net useNnue
+            playOneGame writer startFen rng temp randomPlies maxPlies depthOpt nodesOpt cfg net
 
         writer.Flush()
         0
@@ -423,9 +328,11 @@ let runGen (args: string[]) : int =
 
         match flag m "net" with
         | Some path ->
-            match load path with
-            | Failed r ->
+            match SfNnue.load path with
+            | SfNnue.Failed r ->
                 errLine ("failed to load net: " + r)
                 1
-            | Loaded n -> runGenGames outPath startFen games depthOpt nodesOpt temp seed randomPlies maxPlies (Some n) true
-        | None -> runGenGames outPath startFen games depthOpt nodesOpt temp seed randomPlies maxPlies None false
+            | SfNnue.Loaded n -> runGenGames outPath startFen games depthOpt nodesOpt temp seed randomPlies maxPlies n
+        | None ->
+            errLine "gen requires --net <path> (SF NNUE file)"
+            1

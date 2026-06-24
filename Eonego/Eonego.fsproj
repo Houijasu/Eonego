@@ -44,26 +44,20 @@
     <Compile Include="Bitboard.fs" />
     <Compile Include="Move.fs" />
     <Compile Include="Zobrist.fs" />
-    <Compile Include="NnueRegions.fs" />
+    <Compile Include="SfAccumulator.fs" />
     <Compile Include="Position.fs" />
-    <Compile Include="Evaluation.fs" />
-    <Compile Include="NnueNetwork.fs" />
-    <Compile Include="Nnue.fs" />
+    <Compile Include="SfNnue.fs" />
+    <Compile Include="MontyPolicy.fs" />
     <Compile Include="MoveGeneration.fs" />
     <Compile Include="History.fs" />
     <Compile Include="MovePick.fs" />
     <Compile Include="Transposition.fs" />
     <Compile Include="Search.fs" />
+    <Compile Include="Mcts.fs" />
     <Compile Include="Tooling.fs" />
     <Compile Include="Uci.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 
-  <ItemGroup>
-    <!-- Default net shipped beside the exe; Uci.run auto-loads it (NNUE on by default). -->
-    <None Include="eonego.nnue">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
-  </ItemGroup>
 
 </Project>

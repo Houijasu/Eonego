@@ -18,9 +18,7 @@ open Microsoft.FSharp.NativeInterop
 open Eonego.Bitboard
 open Eonego.Move
 open Eonego.Position
-open Eonego.Evaluation
-open Eonego.NnueNetwork
-open Eonego.Nnue
+open Eonego.SfNnue
 open Eonego.MoveGeneration
 open Eonego.History
 open Eonego.MovePick
@@ -95,8 +93,11 @@ type SearchConfig =
       UseLmrTweaks: bool
       UseAspTweaks: bool
       MoveOverhead: int
-      UseNnue: bool
-      UseMaterialOnly: bool }
+      UseMcts: bool // route `go` through the MCTS-root / negamax-leaf hybrid (Mcts.fs) instead of alpha-beta
+      MctsCpuct: int // PUCT exploration constant, fixed-point ×100 (150 => 1.5)
+      MctsLeafDepth: int // fixed negamax depth at each MCTS leaf (0 => qsearch-only leaf)
+      MctsK: int // logistic cp->winprob scale (centipawns); match the training K
+      UsePolicy: bool } // use policy network for MCTS priors (MontyPolicy.fs); requires a loaded policy net
 
 type SearchLimits =
     { MoveTime: int
@@ -126,8 +127,11 @@ let defaultConfig =
       UseLmrTweaks = true
       UseAspTweaks = true
       MoveOverhead = 10
-      UseNnue = false
-      UseMaterialOnly = false }
+      UseMcts = false
+      MctsCpuct = 150
+      MctsLeafDepth = 6
+      MctsK = 200
+      UsePolicy = false }
 
 let defaultLimits =
     { MoveTime = 0
@@ -216,13 +220,13 @@ let isImmediateDraw (pos: Position) : bool =
     || insufficientMaterial pos
     || (pos.Rule50 >= 100 && hasAnyLegalMove pos)
 
-let private firstLegalMove (pos: Position) : Move =
+let firstLegalMove (pos: Position) : Move =
     let p = NativePtr.stackalloc<Move> MaxMoves
     let buf = Span<Move>(NativePtr.toVoidPtr p, MaxMoves)
     let n = generateLegal pos buf
     if n > 0 then buf.[0] else MoveNone
 
-let private isLegalRoot (pos: Position) (m: Move) : bool =
+let isLegalRoot (pos: Position) (m: Move) : bool =
     if m = MoveNone then
         false
     else
@@ -242,7 +246,7 @@ let private isLegalRoot (pos: Position) (m: Move) : bool =
 // ---------------------------------------------------------------------------
 [<Sealed>]
 type SearchControl
-    (config: SearchConfig, limits: SearchLimits, tt: TranspositionTable, rootFen: string, rootMoves: Move[], ?net: Network) =
+    (config: SearchConfig, limits: SearchLimits, tt: TranspositionTable, rootFen: string, rootMoves: Move[], ?net: SfNetwork, ?policyNet: MontyPolicy.PolicyNetwork) =
     let mutable stopFlag = 0
     let sw = System.Diagnostics.Stopwatch()
     let mutable softMs = 0L
@@ -253,7 +257,8 @@ type SearchControl
     member _.Tt = tt
     member _.RootFen = rootFen
     member _.RootMoves = rootMoves
-    member _.Net: Network option = net
+    member _.Net: SfNetwork option = net
+    member _.PolicyNet: MontyPolicy.PolicyNetwork option = policyNet
     member val LastBest: Move = MoveNone with get, set // result of the most recent go()
     member val LastScore: int = 0 with get, set
     /// Aggregate live node count across all workers (relaxed reads — reporting only, set by go()).
@@ -347,11 +352,10 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     /// Rebuild this worker's Position from the immutable root (FEN + replayed moves) and reset per-search state.
     member _.SetupRoot() =
         pos.LoadFen control.RootFen
-        pos.EnableNnue (control.Config.UseNnue && control.Net.IsSome)
 
         match control.Net with
-        | Some net when control.Config.UseNnue -> Nnue.bind net pos
-        | _ -> ()
+        | Some net -> SfNnue.bindSfNnue net pos
+        | None -> ()
 
         for m in control.RootMoves do
             pos.Make m
@@ -363,11 +367,10 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
         rootScore <- 0
         completedDepth <- 0
 
-let inline evalPos (w: Worker) (pos: Position) : int =
+let evalPos (w: Worker) (pos: Position) : int =
     match w.Control.Net with
-    | Some net when w.Control.Config.UseNnue -> Nnue.evaluate net pos
-    | _ when w.Control.Config.UseMaterialOnly -> materialEval pos
-    | _ -> eval pos
+    | Some net -> SfNnue.evalCp net pos
+    | None -> 0 // unreachable in play: UCI refuses to search with no net (see Uci.startSearch)
 
 let private updatePv (w: Worker) (ply: int) (m: Move) =
     let pv = w.Pv
@@ -1111,7 +1114,7 @@ let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
 // ---------------------------------------------------------------------------
 // Time budget (v1): movetime, or wtime/winc(+movestogo); depth/nodes/mate/infinite => no time stop.
 // ---------------------------------------------------------------------------
-let private computeTimes (moveOverhead: int) (l: SearchLimits) (stm: Color) : int64 * int64 =
+let computeTimes (moveOverhead: int) (l: SearchLimits) (stm: Color) : int64 * int64 =
     let overhead = int64 (max 0 moveOverhead)
 
     if l.MoveTime > 0 then
@@ -1203,7 +1206,7 @@ let go (control: SearchControl) : Move =
 // ---------------------------------------------------------------------------
 // Test entry: a single fixed-depth, FULL-WINDOW negamax (bypasses aspiration/ID). The correctness oracle.
 // ---------------------------------------------------------------------------
-let searchToDepthNet (fen: string) (rootMoves: Move[]) (depth: int) (cfg: SearchConfig) (net: Network option) : struct (int * int64 * Move) =
+let searchToDepthNet (fen: string) (rootMoves: Move[]) (depth: int) (cfg: SearchConfig) (net: SfNetwork option) : struct (int * int64 * Move) =
     let tt = TranspositionTable(max 1 cfg.HashMb)
 
     let control =
@@ -1217,7 +1220,7 @@ let searchToDepthNet (fen: string) (rootMoves: Move[]) (depth: int) (cfg: Search
     struct (score, w.Nodes, w.Pv.[0])
 
 /// Single-thread iterative deepening until the node budget is exhausted (no UCI stdout). Test/tooling entry.
-let searchToNodesNet (fen: string) (rootMoves: Move[]) (nodes: int64) (cfg: SearchConfig) (net: Network option) : struct (int * int64 * Move) =
+let searchToNodesNet (fen: string) (rootMoves: Move[]) (nodes: int64) (cfg: SearchConfig) (net: SfNetwork option) : struct (int * int64 * Move) =
     let tt = TranspositionTable(max 1 cfg.HashMb)
     let limits = { defaultLimits with Nodes = nodes }
 

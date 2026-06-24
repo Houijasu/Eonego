@@ -11,6 +11,7 @@ open Xunit
 open Eonego.Bitboard
 open Eonego.Move
 open Eonego.Search
+open Eonego.Tests.TestFixtures
 
 let private cfgOn = defaultConfig                                  // UseSingular = true (default)
 let private cfgOff = { defaultConfig with UseSingular = false }
@@ -20,9 +21,12 @@ let private cfgOff = { defaultConfig with UseSingular = false }
 // ---------------------------------------------------------------------------
 [<Fact>]
 let ``singular extension does not hide a winning capture`` () =
-    let struct (score, _, m) = searchToDepth "4k3/8/8/3q4/4P3/8/8/3RK3 w - - 0 1" [||] 10 cfgOn
-    Assert.Equal(mkSquare 3 4, toSq m) // e4xd5 takes the queen
-    Assert.True(score > 500, "expected a decisive material win, got " + string score)
+    match tryLoadSfNet () with
+    | None -> () // soft-skip: SF net absent
+    | Some net ->
+        let struct (score, _, m) = searchToDepthNet "4k3/8/8/3q4/4P3/8/8/3RK3 w - - 0 1" [||] 10 cfgOn (Some net)
+        Assert.Equal(mkSquare 3 4, toSq m) // e4xd5 takes the queen
+        Assert.True(score > 500, "expected a decisive material win, got " + string score)
 
 [<Fact>]
 let ``singular extension does not hide a mate`` () =

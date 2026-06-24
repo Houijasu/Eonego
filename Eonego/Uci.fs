@@ -13,7 +13,7 @@ open Eonego.Move
 open Eonego.Position
 open Eonego.MoveGeneration
 open Eonego.Transposition
-open Eonego.NnueNetwork
+open Eonego.SfNnue
 open Eonego.Search
 
 let private writeLine (s: string) = Console.Out.WriteLine(s)
@@ -32,9 +32,15 @@ type private UciState =
       mutable UseLmrTweaks: bool
       mutable UseAspTweaks: bool
       mutable MoveOverhead: int
-      mutable UseNnue: bool
-      mutable NnueFile: string
-      mutable Net: Network option
+      mutable UseMcts: bool
+      mutable MctsCpuct: int
+      mutable MctsLeafDepth: int
+      mutable MctsK: int
+      mutable UsePolicy: bool
+      mutable PolicyFile: string
+      mutable PolicyNet: MontyPolicy.PolicyNetwork option
+      mutable EvalFile: string
+      mutable Net: SfNetwork option
       mutable Tt: TranspositionTable
       mutable RootFen: string
       mutable RootMoves: Move[]
@@ -161,31 +167,47 @@ let private parseGo (tokens: string[]) : SearchLimits =
 let private startSearch (st: UciState) (lim: SearchLimits) =
     stopAndJoin st
 
-    let cfg =
-        { Threads = st.Threads
-          HashMb = st.HashMb
-          UseTt = true
-          UsePruning = true
-          UseProbCut = st.UseProbCut
-          UseIir = st.UseIir
-          UseRazoring = st.UseRazoring
-          UseHistoryPruning = st.UseHistoryPruning
-          UseDeltaPruning = st.UseDeltaPruning
-          UseContHist = st.UseContHist
-          UseSingular = st.UseSingular
-          UseNmpVerify = st.UseNmpVerify
-          UseLmrTweaks = st.UseLmrTweaks
-          UseAspTweaks = st.UseAspTweaks
-          MoveOverhead = st.MoveOverhead
-          UseNnue = st.UseNnue && st.Net.IsSome
-          UseMaterialOnly = false }
+    match st.Net with
+    | None ->
+        writeLine "info string no NNUE net loaded (set EvalFile); cannot search"
+        let p = Position()
+        p.LoadFen st.RootFen
+        for m in st.RootMoves do p.Make m
+        writeLine ("bestmove " + toUci (Search.firstLegalMove p))
+    | Some _ ->
+        let cfg =
+            { Threads = st.Threads
+              HashMb = st.HashMb
+              UseTt = true
+              UsePruning = true
+              UseProbCut = st.UseProbCut
+              UseIir = st.UseIir
+              UseRazoring = st.UseRazoring
+              UseHistoryPruning = st.UseHistoryPruning
+              UseDeltaPruning = st.UseDeltaPruning
+              UseContHist = st.UseContHist
+              UseSingular = st.UseSingular
+              UseNmpVerify = st.UseNmpVerify
+              UseLmrTweaks = st.UseLmrTweaks
+              UseAspTweaks = st.UseAspTweaks
+              MoveOverhead = st.MoveOverhead
+              UseMcts = st.UseMcts
+              MctsCpuct = st.MctsCpuct
+              MctsLeafDepth = st.MctsLeafDepth
+              MctsK = st.MctsK
+              UsePolicy = st.UsePolicy && st.PolicyNet.IsSome }
 
-    let control = SearchControl(cfg, lim, st.Tt, st.RootFen, st.RootMoves, ?net = st.Net)
-    st.Control <- Some control
-    let t = Thread(ThreadStart(fun () -> Search.go control |> ignore), 16 * 1024 * 1024)
-    t.IsBackground <- true
-    st.SearchThread <- Some t
-    t.Start()
+        let control = SearchControl(cfg, lim, st.Tt, st.RootFen, st.RootMoves, ?net = st.Net, ?policyNet = st.PolicyNet)
+        st.Control <- Some control
+
+        let t =
+            Thread(
+                ThreadStart(fun () -> (if cfg.UseMcts then Mcts.mctsSearch control else Search.go control) |> ignore),
+                16 * 1024 * 1024
+            )
+        t.IsBackground <- true
+        st.SearchThread <- Some t
+        t.Start()
 
 let private handleSetOption (st: UciState) (tokens: string[]) =
     // setoption name <Name> value <Value>
@@ -245,40 +267,61 @@ let private handleSetOption (st: UciState) (tokens: string[]) =
             | _ -> ()
         elif String.Equals(name, "MoveOverhead", StringComparison.OrdinalIgnoreCase) then
             st.MoveOverhead <- max 0 (min 5000 v)
-        elif String.Equals(name, "UseNnue", StringComparison.OrdinalIgnoreCase) then
+        elif String.Equals(name, "UseMcts", StringComparison.OrdinalIgnoreCase) then
             match Boolean.TryParse tokens.[vi + 1] with
-            | true, b when b <> st.UseNnue ->
-                stopAndJoin st
-
-                if b && st.Net.IsNone then
-                    writeLine "info string UseNnue ignored: no net loaded; using material eval"
-                else
-                    st.UseNnue <- b
-                    st.Tt.Clear()
+            | true, b -> st.UseMcts <- b
             | _ -> ()
-        elif String.Equals(name, "NnueFile", StringComparison.OrdinalIgnoreCase) then
+        elif String.Equals(name, "MctsCpuct", StringComparison.OrdinalIgnoreCase) then
+            st.MctsCpuct <- max 0 (min 1000 v)
+        elif String.Equals(name, "MctsLeafDepth", StringComparison.OrdinalIgnoreCase) then
+            st.MctsLeafDepth <- max 0 (min 20 v)
+        elif String.Equals(name, "MctsK", StringComparison.OrdinalIgnoreCase) then
+            st.MctsK <- max 1 (min 2000 v)
+        elif String.Equals(name, "UsePolicy", StringComparison.OrdinalIgnoreCase) then
+            stopAndJoin st
+
+            match Boolean.TryParse tokens.[vi + 1] with
+            | true, b -> st.UsePolicy <- b
+            | _ -> ()
+        elif String.Equals(name, "PolicyFile", StringComparison.OrdinalIgnoreCase) then
             stopAndJoin st
             let path = String.Join(" ", tokens.[vi + 1 ..])
 
-            match NnueNetwork.load path with
+            match MontyPolicy.load path with
+            | MontyPolicy.Loaded net ->
+                st.PolicyNet <- Some net
+                st.PolicyFile <- path
+                writeLine ("info string policy net loaded: " + path)
+            | MontyPolicy.Failed reason ->
+                writeLine ("info string policy net load failed (" + reason + "); keeping current policy")
+        elif String.Equals(name, "EvalFile", StringComparison.OrdinalIgnoreCase) then
+            stopAndJoin st
+            let path = String.Join(" ", tokens.[vi + 1 ..])
+
+            match SfNnue.load path with
             | Loaded net ->
                 st.Net <- Some net
-                st.NnueFile <- path
+                st.EvalFile <- path
                 st.Tt.Clear()
-                writeLine ("info string NNUE loaded: " + path + " (ver " + string net.Version + ", quant " + string net.QuantScale + ")")
+                writeLine ("info string NNUE loaded: " + path + " (ver " + string net.Version + ")")
             | Failed reason ->
                 writeLine ("info string NNUE load failed (" + reason + "); keeping current eval")
     | _ -> ()
 
 let run () =
-    // Auto-load the net shipped next to the exe (eonego.nnue); NNUE is on by default when it loads,
-    // and falls back to the material eval if the file is missing or invalid.
-    let defaultNetPath = System.IO.Path.Combine(AppContext.BaseDirectory, "eonego.nnue")
+    let defaultNetPath = System.IO.Path.Combine(AppContext.BaseDirectory, "sf16.nnue")
 
     let defaultNet =
-        match NnueNetwork.load defaultNetPath with
+        match SfNnue.load defaultNetPath with
         | Loaded n -> Some n
         | Failed _ -> None
+
+    let defaultPolicyPath = System.IO.Path.Combine(AppContext.BaseDirectory, "policy.network")
+
+    let defaultPolicyNet, defaultPolicyFile =
+        match MontyPolicy.load defaultPolicyPath with
+        | MontyPolicy.Loaded n -> (Some n, defaultPolicyPath)
+        | MontyPolicy.Failed _ -> (None, "")
 
     let st =
         { Threads = 1
@@ -294,8 +337,14 @@ let run () =
           UseLmrTweaks = true
           UseAspTweaks = true
           MoveOverhead = 10
-          UseNnue = defaultNet.IsSome
-          NnueFile = (if defaultNet.IsSome then defaultNetPath else "")
+          UseMcts = false
+          MctsCpuct = 150
+          MctsLeafDepth = 6
+          MctsK = 200
+          UsePolicy = false
+          PolicyFile = defaultPolicyFile
+          PolicyNet = defaultPolicyNet
+          EvalFile = (if defaultNet.IsSome then defaultNetPath else "")
           Net = defaultNet
           Tt = TranspositionTable(16)
           RootFen = StartPosFen
@@ -329,14 +378,15 @@ let run () =
                     writeLine "option name UseLmrTweaks type check default true"
                     writeLine "option name UseAspTweaks type check default true"
                     writeLine "option name MoveOverhead type spin default 10 min 0 max 5000"
-                    writeLine ("option name UseNnue type check default " + (if st.UseNnue then "true" else "false"))
-                    writeLine ("option name NnueFile type string default " + (if st.NnueFile = "" then "<empty>" else st.NnueFile))
+                    writeLine "option name UseMcts type check default false"
+                    writeLine "option name MctsCpuct type spin default 150 min 0 max 1000"
+                    writeLine "option name MctsLeafDepth type spin default 6 min 0 max 20"
+                    writeLine "option name MctsK type spin default 200 min 1 max 2000"
+                    writeLine "option name UsePolicy type check default false"
+                    writeLine ("option name PolicyFile type string default " + (if st.PolicyFile = "" then "<empty>" else st.PolicyFile))
+                    writeLine ("option name EvalFile type string default " + (if st.EvalFile = "" then "<empty>" else st.EvalFile))
                     writeLine "uciok"
                 | "isready" ->
-                    if st.UseNnue && st.Net.IsNone then
-                        st.UseNnue <- false
-                        writeLine "info string UseNnue set but no net loaded; using material eval"
-
                     writeLine "readyok"
                 | "ucinewgame" ->
                     stopAndJoin st

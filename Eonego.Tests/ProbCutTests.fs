@@ -13,6 +13,7 @@ open Eonego.Bitboard
 open Eonego.Move
 open Eonego.Transposition
 open Eonego.Search
+open Eonego.Tests.TestFixtures
 
 // Isolate ProbCut against the legacy search: hold the later forward-pruning heuristics (IIR/razoring/
 // history/delta) OFF in both arms so these fixtures measure ProbCut alone. (The "same best move"
@@ -40,9 +41,12 @@ let private cfgOff = { cfgBase with UseProbCut = false }
 // ---------------------------------------------------------------------------
 [<Fact>]
 let ``ProbCut does not hide a winning capture`` () =
-    let struct (score, _, m) = searchToDepth "4k3/8/8/3q4/4P3/8/8/3RK3 w - - 0 1" [||] 8 cfgOn
-    Assert.Equal(mkSquare 3 4, toSq m)                              // the move captures the queen on d5
-    Assert.True(score > 500, "expected a decisive material win, got " + string score)
+    match tryLoadSfNet () with
+    | None -> () // soft-skip: SF net absent
+    | Some net ->
+        let struct (score, _, m) = searchToDepthNet "4k3/8/8/3q4/4P3/8/8/3RK3 w - - 0 1" [||] 8 cfgOn (Some net)
+        Assert.Equal(mkSquare 3 4, toSq m)                          // the move captures the queen on d5
+        Assert.True(score > 500, "expected a decisive material win, got " + string score)
 
 [<Fact>]
 let ``ProbCut does not hide a mate`` () =
@@ -56,12 +60,15 @@ let ``ProbCut does not hide a mate`` () =
 // ---------------------------------------------------------------------------
 [<Fact>]
 let ``ProbCut reduces nodes on a capture-rich position`` () =
-    let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"   // Kiwipete
-    let depth = 9
-    let struct (_, nOn, mOn) = searchToDepth fen [||] depth cfgOn
-    let struct (_, nOff, mOff) = searchToDepth fen [||] depth cfgOff
-    Assert.True(nOn < nOff, "expected ProbCut to cut nodes: nOn=" + string nOn + " nOff=" + string nOff)
-    Assert.Equal(toUci mOff, toUci mOn)
+    match tryLoadSfNet () with
+    | None -> () // soft-skip: SF net absent
+    | Some net ->
+        let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"   // Kiwipete
+        let depth = 9
+        let struct (_, nOn, mOn) = searchToDepthNet fen [||] depth cfgOn (Some net)
+        let struct (_, nOff, mOff) = searchToDepthNet fen [||] depth cfgOff (Some net)
+        Assert.True(nOn < nOff, "expected ProbCut to cut nodes: nOn=" + string nOn + " nOff=" + string nOff)
+        Assert.Equal(toUci mOff, toUci mOn)
 
 // ---------------------------------------------------------------------------
 // Best-move agreement on a few clear positions at fixed depth: ProbCut should not change the chosen move
