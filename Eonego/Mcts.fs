@@ -1142,9 +1142,16 @@ let private emitMctsInfo
     let iterNps = if ms > 0L then iters * 1000L / ms else iters
     let sb = System.Text.StringBuilder(192)
 
+    // seldepth: the tree `depth` plies are each followed by the fixed leafDepth-ply negamax leaf, so the
+    // deepest line examined is at least depth+leafDepth (qsearch/extensions go deeper). Reporting only the
+    // tree depth understated the search by the whole leaf depth in GUIs (Fritz). 0 when nothing was searched.
+    let seldepth = if depth > 0 then depth + max 0 control.Config.MctsLeafDepth else 0
+
     sb
         .Append("info depth ")
         .Append(depth)
+        .Append(" seldepth ")
+        .Append(seldepth)
         .Append(" score ")
         .Append(scoreStr score)
         .Append(" nodes ")
@@ -1267,7 +1274,11 @@ let private runWorker
                 looping <- false // shared global budget exhausted across all workers
             elif control.Stopped then
                 looping <- false
-            elif checkSoft && control.SoftTimeUp then
+            elif checkSoft && control.SoftTimeUp && Volatile.Read(&globalIters.[0]) > 0L then
+                // Honour the soft (optimum) budget only AFTER >=1 backed-up playout: on a tiny soft budget
+                // (blitz / low clock) the root Lc0 forward alone can exceed softMs, so without this floor the
+                // search exits with 0 playouts and reports a fake `cp 0`. The hard limit (control.Stopped,
+                // checked above) still bounds the deadline; test entries pass checkSoft=false so determinism holds.
                 looping <- false
             elif stopOnSolved && tree.NodeProven rootIdx <> PrUnknown then
                 looping <- false
