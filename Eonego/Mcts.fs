@@ -68,6 +68,7 @@ type MctsNode =
       mutable FirstEdge: int // index into edges[]; -1 = unexpanded
       mutable NumEdges: int
       mutable Proven: int // PrUnknown | PrWin | PrLoss | PrDraw
+      mutable ProofPly: int // plies to mate when Proven is PrWin/PrLoss (0 for terminal/draw/unknown)
       mutable Stm: int } // side-to-move at this node (debug/aux)
 
 [<Sealed>]
@@ -98,6 +99,7 @@ type MctsTree(nodeCap: int, edgeCap: int) =
         nodes.[i].FirstEdge <- -1
         nodes.[i].NumEdges <- 0
         nodes.[i].Proven <- PrUnknown
+        nodes.[i].ProofPly <- 0
         nodes.[i].Stm <- stm
         i
 
@@ -145,9 +147,18 @@ type MctsTree(nodeCap: int, edgeCap: int) =
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member _.EdgeChild(i) = edges.[i].Child
 
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+    member _.NodeProofPly(i) = nodes.[i].ProofPly
+
     // Mutations (always operate on the CURRENT arrays — no stale-ref foot-gun)
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member _.SetProven(i, p) = nodes.[i].Proven <- p
+
+    /// Prove a win/loss together with its mate distance (plies). Draws/unknown keep ProofPly = 0.
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+    member _.SetProvenPly(i, p, ply) =
+        nodes.[i].Proven <- p
+        nodes.[i].ProofPly <- ply
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member _.SetNodeEdges(i, fe, ne) =
@@ -269,13 +280,20 @@ let solverUpdate (tree: MctsTree) (p: int) : unit =
             let mutable allProven = true
             let mutable anyDraw = false
             let mutable allWin = true
+            let mutable minLossPly = System.Int32.MaxValue // shortest mate among our winning replies (PrLoss child)
+            let mutable maxWinPly = 0 // longest defence when every reply loses for us (all-PrWin children)
 
             for k in 0 .. ne - 1 do
                 let ci = tree.EdgeChild (fe + k)
                 let cp = if ci >= 0 then tree.NodeProven ci else PrUnknown
 
-                if cp = PrLoss then anyLoss <- true
-                elif cp = PrWin then ()
+                if cp = PrLoss then
+                    anyLoss <- true
+                    let ply = tree.NodeProofPly ci
+                    if ply < minLossPly then minLossPly <- ply
+                elif cp = PrWin then
+                    let ply = tree.NodeProofPly ci
+                    if ply > maxWinPly then maxWinPly <- ply
                 elif cp = PrDraw then
                     anyDraw <- true
                     allWin <- false
@@ -283,9 +301,12 @@ let solverUpdate (tree: MctsTree) (p: int) : unit =
                     allProven <- false
                     allWin <- false
 
-            if anyLoss then tree.SetProven(p, PrWin) // a child is lost for them => we win
-            elif allProven && allWin then tree.SetProven(p, PrLoss) // every reply wins for them => we lose
-            elif allProven && anyDraw then tree.SetProven(p, PrDraw) // best we force is a draw
+            if anyLoss then
+                tree.SetProvenPly(p, PrWin, minLossPly + 1) // a child is lost for them => we win, shortest mate
+            elif allProven && allWin then
+                tree.SetProvenPly(p, PrLoss, maxWinPly + 1) // every reply wins for them => we lose, longest defence
+            elif allProven && anyDraw then
+                tree.SetProven(p, PrDraw) // best we force is a draw
 
 // ---------------------------------------------------------------------------
 // Priors: softmax over a move-ordering score (replicated from MovePick's private scorers, over the
@@ -369,8 +390,10 @@ let private evalLeaf (tree: MctsTree) (w: Worker) (leafDepth: int) (k: float32) 
     w.NmpMinPly <- 0
     let cp = negamax w w.Pos (-INF) INF leafDepth 0 false false
 
-    if cp >= MATE_IN_MAX_PLY then tree.SetProven(leafIdx, PrWin)
-    elif cp <= -MATE_IN_MAX_PLY then tree.SetProven(leafIdx, PrLoss)
+    // Record the mate distance (plies) so the solver can prefer the shortest win / longest loss. The negamax
+    // mate score is MATE - ply, so the distance from this leaf is MATE - |cp|.
+    if cp >= MATE_IN_MAX_PLY then tree.SetProvenPly(leafIdx, PrWin, MATE - cp)
+    elif cp <= -MATE_IN_MAX_PLY then tree.SetProvenPly(leafIdx, PrLoss, MATE + cp)
 
     cpToWinProb cp k
 
@@ -693,6 +716,7 @@ let bestRootMove (tree: MctsTree) (rootIdx: int) : Move * int =
     else
         let mutable bestEi = -1
         let mutable bestCat = -1
+        let mutable bestPly = 0
         let mutable bestN = System.Int32.MinValue
         let mutable bestQ = System.Single.NegativeInfinity
 
@@ -706,6 +730,7 @@ let bestRootMove (tree: MctsTree) (rootIdx: int) : Move * int =
                 elif proven = PrWin then 0
                 else 1
 
+            let ply = if ci >= 0 then tree.NodeProofPly ci else 0
             let n = if ci >= 0 then tree.NodeN ci else 0
 
             let qv =
@@ -714,8 +739,27 @@ let bestRootMove (tree: MctsTree) (rootIdx: int) : Move * int =
                 else
                     0.0f
 
-            if cat > bestCat || (cat = bestCat && (n > bestN || (n = bestN && qv > bestQ))) then
+            // Higher category wins; within a winning category prefer the SHORTEST mate, within a losing one the
+            // LONGEST defence, else more visits then higher Q. Strict-only keeps the lowest edge index on ties.
+            let better =
+                if cat <> bestCat then
+                    cat > bestCat
+                elif cat = 2 then
+                    if ply <> bestPly then ply < bestPly
+                    elif n <> bestN then n > bestN
+                    else qv > bestQ
+                elif cat = 0 then
+                    if ply <> bestPly then ply > bestPly
+                    elif n <> bestN then n > bestN
+                    else qv > bestQ
+                elif n <> bestN then
+                    n > bestN
+                else
+                    qv > bestQ
+
+            if better then
                 bestCat <- cat
+                bestPly <- ply
                 bestN <- n
                 bestQ <- qv
                 bestEi <- ei
@@ -724,8 +768,8 @@ let bestRootMove (tree: MctsTree) (rootIdx: int) : Move * int =
 
 let private rootScoreCp (tree: MctsTree) (rootIdx: int) (bestEi: int) (k: float32) : int =
     match tree.NodeProven rootIdx with
-    | PrWin -> MATE - 1
-    | PrLoss -> -(MATE - 1)
+    | PrWin -> MATE - tree.NodeProofPly rootIdx
+    | PrLoss -> -(MATE - tree.NodeProofPly rootIdx)
     | PrDraw -> 0
     | _ ->
         if bestEi < 0 then
@@ -733,8 +777,8 @@ let private rootScoreCp (tree: MctsTree) (rootIdx: int) (bestEi: int) (k: float3
         else
             let ci = tree.EdgeChild bestEi
 
-            if ci >= 0 && tree.NodeProven ci = PrLoss then MATE - 1 // proven win for us
-            elif ci >= 0 && tree.NodeProven ci = PrWin then -(MATE - 1)
+            if ci >= 0 && tree.NodeProven ci = PrLoss then MATE - (tree.NodeProofPly ci + 1) // proven win for us
+            elif ci >= 0 && tree.NodeProven ci = PrWin then -(MATE - (tree.NodeProofPly ci + 1))
             elif ci < 0 || tree.NodeN ci = 0 then 0
             else winProbToCp (1.0f - tree.NodeW ci / float32 (tree.NodeN ci)) k
 
@@ -747,7 +791,8 @@ type private MergedMove =
     { mutable Move: Move
       mutable N: int // summed child visit counts across trees
       mutable W: float32 // summed child W (child POV) across trees
-      mutable Proven: int } // unioned proven tag (see combineProven)
+      mutable Proven: int // unioned proven tag (see combineProven)
+      mutable ProofPly: int } // mate distance for the unioned tag: shortest PrLoss / longest PrWin across trees
 
 /// Union proven tags across trees. Order-independent / idempotent. A single worker's αβ-leaf mate proof is
 /// exact, so any PrLoss child (proven win for us) wins; any PrWin child (proven loss for us) is next; any
@@ -776,7 +821,8 @@ let private mergeRoots (trees: MctsTree[]) (roots: int[]) : MergedMove[] =
                 { Move = t0.EdgeMove(fe0 + k)
                   N = 0
                   W = 0.0f
-                  Proven = PrUnknown })
+                  Proven = PrUnknown
+                  ProofPly = 0 })
 
         for ti in 0 .. trees.Length - 1 do
             let t = trees.[ti]
@@ -802,7 +848,18 @@ let private mergeRoots (trees: MctsTree[]) (roots: int[]) : MergedMove[] =
                         if ci >= 0 then
                             acc.[k].N <- acc.[k].N + t.NodeN ci
                             acc.[k].W <- acc.[k].W + t.NodeW ci
-                            acc.[k].Proven <- combineProven acc.[k].Proven (t.NodeProven ci)
+                            let cprov = t.NodeProven ci
+                            let cply = t.NodeProofPly ci
+                            let oldTag = acc.[k].Proven
+                            let newTag = combineProven oldTag cprov
+                            // mate distance: shortest among PrLoss contributors (merged win-for-us), longest
+                            // among PrWin contributors (merged loss).
+                            if newTag = PrLoss && cprov = PrLoss then
+                                acc.[k].ProofPly <- (if oldTag = PrLoss then min acc.[k].ProofPly cply else cply)
+                            elif newTag = PrWin && cprov = PrWin then
+                                acc.[k].ProofPly <- (if oldTag = PrWin then max acc.[k].ProofPly cply else cply)
+
+                            acc.[k].Proven <- newTag
 
         acc
 
@@ -815,6 +872,7 @@ let private bestMergedMove (acc: MergedMove[]) : Move * int =
     else
         let mutable best = -1
         let mutable bestCat = -1
+        let mutable bestPly = 0
         let mutable bestN = System.Int32.MinValue
         let mutable bestQ = System.Single.NegativeInfinity
 
@@ -828,8 +886,26 @@ let private bestMergedMove (acc: MergedMove[]) : Move * int =
 
             let qv = if a.N > 0 then 1.0f - a.W / float32 a.N else 0.0f
 
-            if cat > bestCat || (cat = bestCat && (a.N > bestN || (a.N = bestN && qv > bestQ))) then
+            // Mirror bestRootMove: shortest mate when winning, longest defence when losing, else visits then Q.
+            let better =
+                if cat <> bestCat then
+                    cat > bestCat
+                elif cat = 2 then
+                    if a.ProofPly <> bestPly then a.ProofPly < bestPly
+                    elif a.N <> bestN then a.N > bestN
+                    else qv > bestQ
+                elif cat = 0 then
+                    if a.ProofPly <> bestPly then a.ProofPly > bestPly
+                    elif a.N <> bestN then a.N > bestN
+                    else qv > bestQ
+                elif a.N <> bestN then
+                    a.N > bestN
+                else
+                    qv > bestQ
+
+            if better then
                 bestCat <- cat
+                bestPly <- a.ProofPly
                 bestN <- a.N
                 bestQ <- qv
                 best <- i
@@ -840,8 +916,8 @@ let private bestMergedMove (acc: MergedMove[]) : Move * int =
 /// the reported move: proven win/loss -> mate, proven draw / no visits -> 0, else sigmoid of parent-POV Q.
 let private mergedScoreCp (a: MergedMove) (k: float32) : int =
     match a.Proven with
-    | PrLoss -> MATE - 1
-    | PrWin -> -(MATE - 1)
+    | PrLoss -> MATE - (a.ProofPly + 1) // child PrLoss = a forced win for us, mate-in (ProofPly+1) plies
+    | PrWin -> -(MATE - (a.ProofPly + 1))
     | PrDraw -> 0
     | _ -> if a.N > 0 then winProbToCp (1.0f - a.W / float32 a.N) k else 0
 

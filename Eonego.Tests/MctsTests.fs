@@ -126,6 +126,46 @@ let ``solver never vacuously proves a zero-child node`` () =
     Assert.Equal(PrUnknown, tree.NodeProven n)
 
 // ---------------------------------------------------------------------------
+// MCTS-Solver mate distance (shortest win / longest loss)
+// ---------------------------------------------------------------------------
+/// mkSolverTree variant carrying (provenTag, proofPly) per child via SetProvenPly.
+let private mkSolverTreePly (children: (int * int) list) : MctsTree * int =
+    let tree = MctsTree()
+    let root = tree.AllocNode 0
+    let cnt = List.length children
+    let eb = tree.AllocEdges cnt
+
+    children
+    |> List.iteri (fun i (pr, ply) ->
+        let c = tree.AllocNode 1
+        tree.SetEdge(eb + i, MoveNone, 1.0f / float32 cnt)
+        tree.SetEdgeChild(eb + i, c)
+        tree.SetProvenPly(c, pr, ply))
+
+    tree.SetNodeEdges(root, eb, cnt)
+    (tree, root)
+
+[<Fact>]
+let ``solver proves the win with the shortest mate distance`` () =
+    let (tree, root) = mkSolverTreePly [ (PrLoss, 3); (PrLoss, 1); (PrWin, 2) ]
+    solverUpdate tree root
+    Assert.Equal(PrWin, tree.NodeProven root)
+    Assert.Equal(2, tree.NodeProofPly root) // min(3, 1) + 1
+
+[<Fact>]
+let ``solver proves the loss with the longest defence`` () =
+    let (tree, root) = mkSolverTreePly [ (PrWin, 2); (PrWin, 5); (PrWin, 3) ]
+    solverUpdate tree root
+    Assert.Equal(PrLoss, tree.NodeProven root)
+    Assert.Equal(6, tree.NodeProofPly root) // max(2, 5, 3) + 1
+
+[<Fact>]
+let ``bestRootMove prefers the shorter mate among winning moves`` () =
+    let (tree, root) = mkSolverTreePly [ (PrLoss, 5); (PrLoss, 2) ]
+    let (_, ei) = bestRootMove tree root
+    Assert.Equal(1, ei) // edge 1 = the PrLoss (win-for-us) child with the shorter proof ply
+
+// ---------------------------------------------------------------------------
 // Full hybrid (deterministic oracle)
 // ---------------------------------------------------------------------------
 [<Fact>]
