@@ -47,7 +47,10 @@
     <Compile Include="SfAccumulator.fs" />
     <Compile Include="Position.fs" />
     <Compile Include="SfNnue.fs" />
-    <Compile Include="MontyPolicy.fs" />
+    <Compile Include="Lc0Proto.fs" />
+    <Compile Include="Lc0PolicyMap.fs" />
+    <Compile Include="Lc0Encoder.fs" />
+    <Compile Include="Lc0Net.fs" />
     <Compile Include="MoveGeneration.fs" />
     <Compile Include="History.fs" />
     <Compile Include="MovePick.fs" />
@@ -59,5 +62,10 @@
     <Compile Include="Program.fs" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Embed the SF NNUE evaluator (leaf) into the binary so the exe is self-contained. The Lc0 policy
+         net (root) is large (113 MB) so it is loaded from disk via the EONEGO_LC0 env var, not embedded. -->
+    <EmbeddedResource Include="..\nets\sf16.nnue" LogicalName="sf16.nnue" />
+  </ItemGroup>
 
 </Project>

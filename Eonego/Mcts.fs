@@ -3,11 +3,14 @@
 /// engine, reused UNCHANGED as the oracle: NNUE + qsearch + the full pruning stack). MCTS-Solver
 /// propagates proven win/loss/draw so the averaging backup commits to forced lines the αβ leaf finds.
 ///
-/// v1 is SINGLE-THREAD. The board is real: the selection path is walked with Position.Make/Unmake and
-/// the leaf negamax runs on that exact Position, so repetition/50-move/insufficient-material detection
-/// works via the engine's own history. The MCTS tree is a flat index-based arena (no GC pointers),
-/// allocated once per `go` and grown by doubling. Gated behind cfg.UseMcts (default off); αβ stays
-/// the default and the correctness oracle.
+/// ROOT-PARALLEL: `mctsSearch` fans out N independent trees (one per Worker), sharing only the lock-free
+/// TT and the Volatile stop flag, and decides from their MERGED root statistics. The board is real: the
+/// selection path is walked with Position.Make/Unmake and the leaf negamax runs on that exact Position, so
+/// repetition/50-move/insufficient-material detection works via the engine's own history. Each tree is a
+/// flat index-based arena (no GC pointers), allocated once per `go` and grown by doubling. Priors come from
+/// the Lc0 policy CNN when one is loaded (EONEGO_LC0), else a softmax over move-ordering history scores.
+/// This is the UCI production search (Uci.fs hardwires UseMcts on); αβ (Search.go) remains the leaf oracle
+/// and the deterministic test path, and also takes over when a root is too deep for a fixed-depth leaf.
 ///
 /// AOT/F#: no printfn (Console.Out only); arena = struct records in raw arrays (same in-place mutation
 /// idiom as Search.StackEntry[]); never hold a byref/array-ref across an Alloc (a realloc invalidates).
@@ -45,6 +48,9 @@ let MctsIterPerDepth = 1000 // `go depth N` (no time stop) => N * this many iter
 
 let private Fpu = 0.5f // first-play-urgency for unvisited children (neutral)
 let private MctsPriorTemp = 1000.0f // softmax temperature over move-ordering scores
+// Periodic UCI info cadence: WALL-CLOCK, not iteration count. With Lc0 priors the driver runs a few it/s, so
+// an iteration-count trigger (e.g. every 256) would emit nothing for a minute+ and analysis looks frozen.
+let private MctsReportIntervalMs = 500L
 
 // ---------------------------------------------------------------------------
 // Flat arena (struct records in raw arrays — mirrors Search.StackEntry)
@@ -301,10 +307,14 @@ let private expand (tree: MctsTree) (w: Worker) (nodeIdx: int) (allowDraw: bool)
             let tables = w.Tables
             let stm = pos.SideToMove
 
-            if w.Control.Config.UsePolicy && w.Control.PolicyNet.IsSome then
-                // Policy network path: priors are already normalized (sum to 1), set them directly.
-                let net = w.Control.PolicyNet.Value
-                let priors = MontyPolicy.policyPriors net pos moves cnt
+            if w.Control.Config.UseLc0 && w.Control.Lc0Net.IsSome then
+                // Lc0 CNN priors (true hybrid: Lc0 policy + SF-NNUE alpha-beta leaf). v1 ignores the Lc0
+                // value head; the leaf eval stays the negamax+SF path below. Runs once per node-expansion.
+                let net = w.Control.Lc0Net.Value
+                Lc0Net.lc0PriorsInto SfAccumulator.UseAvx2 net pos moves cnt w.Lc0InBuf w.Lc0Scratch w.Lc0Priors
+                |> ignore
+
+                let priors = w.Lc0Priors
                 let edgeBase = tree.AllocEdges cnt
 
                 for i in 0 .. cnt - 1 do
@@ -352,7 +362,9 @@ let private evalLeaf (tree: MctsTree) (w: Worker) (leafDepth: int) (k: float32) 
 
 // ---------------------------------------------------------------------------
 // One MCTS iteration: SELECT (Make down) -> EXPAND/EVAL leaf -> BACKUP (flip up) -> Unmake back.
-// Returns the tree depth reached. pathNodes/pathEdges are caller-owned scratch (reused each iter).
+// Returns struct(tree depth reached, backedUp). backedUp is false when a stop aborted the playout
+// mid-leaf, so the caller can avoid counting an iteration that committed no value (root.N stays in
+// lockstep with the reported iteration count). pathNodes/pathEdges are caller-owned scratch (reused).
 // ---------------------------------------------------------------------------
 let private runIteration
     (tree: MctsTree)
@@ -364,7 +376,7 @@ let private runIteration
     (pathNodes: int[])
     (pathEdges: int[])
     (rootIdx: int)
-    : int =
+    : struct (int * bool) =
     let pos = w.Pos
     let mutable node = rootIdx
     let mutable pathLen = 0
@@ -413,7 +425,10 @@ let private runIteration
                     node <- ci
 
     // BACKUP (skip if a stop hit mid-leaf — a partial value). leaf gets q (own POV); ancestors flip.
-    if not w.Control.Stopped then
+    // Read the stop flag once so the backup decision and the reported `backedUp` are consistent.
+    let backedUp = not w.Control.Stopped
+
+    if backedUp then
         let mutable qq = q
         tree.AddVisit(leaf, qq)
         solverUpdate tree leaf
@@ -429,7 +444,7 @@ let private runIteration
     for d in pathLen - 1 .. -1 .. 0 do
         pos.Unmake(tree.EdgeMove(pathEdges.[d]))
 
-    pathLen
+    struct (pathLen, backedUp)
 
 // ---------------------------------------------------------------------------
 // Root selection / reporting
@@ -637,20 +652,60 @@ let private buildPv (tree: MctsTree) (rootIdx: int) (sb: System.Text.StringBuild
                 if ci < 0 then cont <- false else node <- ci
                 depth <- depth + 1
 
-let private reportMctsInfo
-    (w: Worker)
+/// Merged PV for the chosen root move across all workers' trees: head = the merged best move; tail
+/// descends the worker subtree that visited that move most (greedy max-N, reusing buildPv on the child).
+/// Reads live trees (safe: root edges are immutable after expand, child indices only grow, int/float
+/// reads are atomic — an approximate-but-crash-free PV is fine for an info line).
+let private buildMergedPv (trees: MctsTree[]) (roots: int[]) (mergedMove: Move) (sb: System.Text.StringBuilder) =
+    sb.Append(' ').Append(toUci mergedMove) |> ignore
+    let mutable bestTree = -1
+    let mutable bestChild = -1
+    let mutable bestN = -1
+
+    for ti in 0 .. trees.Length - 1 do
+        let t = trees.[ti]
+
+        if not (obj.ReferenceEquals(t, null)) then
+            let r = roots.[ti]
+            let fe = t.NodeFirstEdge r
+            let ne = t.NodeNumEdges r
+            let mutable k = 0
+
+            while k < ne do
+                if t.EdgeMove(fe + k) = mergedMove then
+                    let ci = t.EdgeChild(fe + k)
+                    let n = if ci >= 0 then t.NodeN ci else 0
+
+                    if n > bestN then
+                        bestN <- n
+                        bestChild <- ci
+                        bestTree <- ti
+
+                    k <- ne // found this tree's edge for the move; stop scanning it
+                else
+                    k <- k + 1
+
+    if bestTree >= 0 && bestChild >= 0 then
+        buildPv trees.[bestTree] bestChild sb
+
+/// Emit the two MCTS info lines for an explicit merged decision (move + score), so the periodic and final
+/// reports share one code path and the PV head always equals the decided move.
+///   leaf  = negamax leaf nodes (NodeSum) — comparable to alpha-beta nps and consistent with `go nodes N`.
+///   iters = MCTS root iterations / playouts (IterSum) — the Lc0-style tree-growth metric (secondary line).
+let private emitMctsInfo
     (control: SearchControl)
-    (tree: MctsTree)
-    (rootIdx: int)
-    (k: float32)
     (depth: int)
+    (score: int)
+    (mergedMove: Move)
+    (trees: MctsTree[])
+    (roots: int[])
     =
     let ms = control.ElapsedMs
-    let nodes = control.NodeSum()
-    let nps = if ms > 0L then nodes * 1000L / ms else nodes
-    let (_, bestEi) = bestRootMove tree rootIdx
-    let score = rootScoreCp tree rootIdx bestEi k
-    let sb = System.Text.StringBuilder(160)
+    let leaf = control.NodeSum()
+    let leafNps = if ms > 0L then leaf * 1000L / ms else leaf
+    let iters = control.IterSum()
+    let iterNps = if ms > 0L then iters * 1000L / ms else iters
+    let sb = System.Text.StringBuilder(192)
 
     sb
         .Append("info depth ")
@@ -658,16 +713,43 @@ let private reportMctsInfo
         .Append(" score ")
         .Append(scoreStr score)
         .Append(" nodes ")
-        .Append(nodes)
+        .Append(leaf)
         .Append(" nps ")
-        .Append(nps)
+        .Append(leafNps)
         .Append(" time ")
         .Append(ms)
         .Append(" pv")
     |> ignore
 
-    buildPv tree rootIdx sb
+    if mergedMove <> MoveNone then
+        buildMergedPv trees roots mergedMove sb
+
     writeLine (sb.ToString())
+
+    // Secondary line: the MCTS-native root/iteration throughput (leaf repeated for an at-a-glance pairing).
+    let sb2 = System.Text.StringBuilder(96)
+
+    sb2
+        .Append("info string root ")
+        .Append(iters)
+        .Append(" iters ")
+        .Append(iterNps)
+        .Append(" it/s | leaf ")
+        .Append(leaf)
+        .Append(" nodes ")
+        .Append(leafNps)
+        .Append(" nps")
+    |> ignore
+
+    writeLine (sb2.ToString())
+
+/// Periodic driver report: merge the live per-worker trees into one decision and emit it. The non-driver
+/// trees are still being mutated; mergeRoots/buildMergedPv tolerate that (see buildMergedPv's note).
+let private reportMctsMerged (control: SearchControl) (trees: MctsTree[]) (roots: int[]) (k: float32) (depth: int) =
+    let acc = mergeRoots trees roots
+    let (mv, bestIdx) = bestMergedMove acc
+    let score = if bestIdx >= 0 then mergedScoreCp acc.[bestIdx] k else 0
+    emitMctsInfo control depth score mv trees roots
 
 // ---------------------------------------------------------------------------
 // Driver
@@ -675,7 +757,7 @@ let private reportMctsInfo
 /// One worker's full MCTS life-cycle on its OWN tree (the per-thread body, unchanged from the v1
 /// single-thread loop). `checkSoft`/`stopOnSolved`/`report` are driver-only knobs: the parallel
 /// orchestrator passes them true for worker 0 and false for the rest, so non-driver workers exit only on
-/// the shared stop flag (or their own iteration budget) and never report. The test entries call this
+/// the shared stop flag (or the shared global iteration budget) and never report. The test entries call this
 /// directly with a single worker, preserving the deterministic exactly-`maxIters` path.
 let private runWorker
     (w: Worker)
@@ -684,6 +766,9 @@ let private runWorker
     (checkSoft: bool)
     (stopOnSolved: bool)
     (report: bool)
+    (trees: MctsTree[])
+    (roots: int[])
+    (globalIters: int64[])
     : struct (MctsTree * int * int) =
     let cfg = control.Config
     let cpuct = float32 cfg.MctsCpuct / 100.0f
@@ -691,16 +776,24 @@ let private runWorker
     let leafDepth = max 0 cfg.MctsLeafDepth
     // Overflow guard: the leaf negamax runs on w.Pos already R+D deep; keep R+D+MaxSearchPly < MaxPly.
     let safe = MaxPly - control.RootMoves.Length - MaxSearchPly - 1
-    // Pre-size the arena when the iteration budget is known (depth-limited searches),
-    // avoiding mid-search reallocations and Array.Copy pauses. Use ~40 edges per node
-    // as a chess branching-factor guess; the arena still grows if the estimate is low.
+    // GLOBAL iteration budget: maxIters is the TOTAL across all workers, not per-worker (Threads splits the
+    // depth budget instead of each worker redoing all of it). Pre-size this worker's arena for its ~share to
+    // avoid mid-search reallocations; the arena still grows if the share runs over. (~40 edges/node.)
+    let threads = max 1 cfg.Threads
+    let perWorker = if maxIters > 0 then maxIters / threads + 256 else 0
+
     let tree =
-        if maxIters > 0 then
-            MctsTree(maxIters + 1, maxIters * 40 + 1024)
+        if perWorker > 0 then
+            MctsTree(perWorker + 1, perWorker * 40 + 1024)
         else
             MctsTree()
 
     let rootIdx = tree.AllocNode(int w.Pos.SideToMove)
+    // Publish this worker's tree/root so the driver's periodic report can merge in-progress stats across all
+    // workers (runParallel's final merge reads the same slots). roots first (plain int), then the tree via
+    // Volatile (release) so any reader that observes the tree also observes its root index.
+    roots.[w.Id] <- rootIdx
+    System.Threading.Volatile.Write(&trees.[w.Id], tree)
 
     if safe < 1 then
         struct (tree, rootIdx, 0) // position already at/over the base engine's envelope: caller falls back
@@ -709,8 +802,8 @@ let private runWorker
         let pathNodes = Array.zeroCreate (maxTreeDepth + 1)
         let pathEdges = Array.zeroCreate (maxTreeDepth + 1)
         expand tree w rootIdx false // root expanded once; allowDraw=false
-        let mutable iter = 0
         let mutable maxDepthReached = 0
+        let mutable lastReportMs = 0L
         let mutable looping = true
 
         while looping do
@@ -720,8 +813,8 @@ let private runWorker
             if checkSoft then
                 control.CheckTime(control.NodeSum())
 
-            if maxIters > 0 && iter >= maxIters then
-                looping <- false
+            if maxIters > 0 && Volatile.Read(&globalIters.[0]) >= int64 maxIters then
+                looping <- false // shared global budget exhausted across all workers
             elif control.Stopped then
                 looping <- false
             elif checkSoft && control.SoftTimeUp then
@@ -729,16 +822,19 @@ let private runWorker
             elif stopOnSolved && tree.NodeProven rootIdx <> PrUnknown then
                 looping <- false
             else
-                let d =
+                let struct (d, backedUp) =
                     runIteration tree w cpuct leafDepth kf maxTreeDepth pathNodes pathEdges rootIdx
 
                 if d > maxDepthReached then
                     maxDepthReached <- d
 
-                iter <- iter + 1
+                if backedUp then
+                    w.IncIters() // count only backed-up iterations; a mid-leaf stop aborts the playout
+                    Interlocked.Increment(&globalIters.[0]) |> ignore // charge the shared global budget
 
-                if report && (iter &&& 0xFF) = 0 then
-                    reportMctsInfo w control tree rootIdx kf maxDepthReached
+                if report && control.ElapsedMs - lastReportMs >= MctsReportIntervalMs then
+                    reportMctsMerged control trees roots kf maxDepthReached
+                    lastReportMs <- control.ElapsedMs
 
         struct (tree, rootIdx, maxDepthReached)
 
@@ -756,7 +852,10 @@ let private runParallel
     let n = workers.Length
     let trees: MctsTree[] = Array.zeroCreate n
     let roots: int[] = Array.zeroCreate n
+    let globalIters = [| 0L |] // shared GLOBAL iteration budget — every worker charges it; budget splits ~N×
 
+    // Each worker publishes its own trees.[Id]/roots.[Id] slot inside runWorker, so the driver can merge
+    // in-progress stats and the slots are already settled here after the join.
     let threads =
         [| for i in 1 .. n - 1 ->
                let wi = workers.[i]
@@ -764,9 +863,8 @@ let private runParallel
                let t =
                    Thread(
                        ThreadStart(fun () ->
-                           let struct (tr, ri, _) = runWorker wi control maxIters false false false
-                           trees.[i] <- tr
-                           roots.[i] <- ri),
+                           runWorker wi control maxIters false false false trees roots globalIters
+                           |> ignore),
                        16 * 1024 * 1024
                    )
 
@@ -775,9 +873,7 @@ let private runParallel
                t |]
 
     // Driver on the calling thread: owns soft-time / stop-on-solved / reporting.
-    let struct (tr0, ri0, d0) = runWorker workers.[0] control maxIters true true true
-    trees.[0] <- tr0
-    roots.[0] <- ri0
+    let struct (_, _, d0) = runWorker workers.[0] control maxIters true true true trees roots globalIters
     control.Stop() // tell the non-driver workers to exit
 
     for t in threads do
@@ -785,10 +881,10 @@ let private runParallel
 
     struct (trees, roots, d0)
 
-/// Production entry (mirrors Search.go): N root-parallel workers, periodic info from the driver, exactly one
+/// Root-parallel MCTS body (mirrors Search.go): N workers, periodic info from the driver, exactly one
 /// bestmove from the MERGED root statistics. Parallel results are timing-nondeterministic (same as LazySMP);
 /// the deterministic test path goes through `runWorker` directly (Threads is irrelevant there).
-let mctsSearch (control: SearchControl) : Move =
+let private runMctsParallel (control: SearchControl) : Move =
     control.Reset()
     control.Tt.NewSearch()
     let n = max 1 control.Config.Threads
@@ -806,12 +902,22 @@ let mctsSearch (control: SearchControl) : Move =
                 s <- s + wk.Nodes
 
             s)
+    // Aggregate completed MCTS iterations across all workers (for UCI `info nodes`/`nps` reporting).
+    control.IterSum <-
+        (fun () ->
+            let mutable s = 0L
+
+            for wk in workers do
+                s <- s + wk.Iters
+
+            s)
 
     let stm = workers.[0].Pos.SideToMove
     let (soft, hard) = computeTimes control.Config.MoveOverhead control.Limits stm
     control.StartClock soft hard
 
-    // Per-worker budget = maxIters (each independent tree runs its own; total leaf work ~N x, like LazySMP).
+    // GLOBAL budget = maxIters across ALL workers (Threads splits a `go depth N` budget ~N×, so wall-clock
+    // latency drops with thread count instead of each worker redoing the whole N*MctsIterPerDepth).
     let maxIters =
         if control.Limits.Depth > 0 then
             control.Limits.Depth * MctsIterPerDepth
@@ -831,14 +937,57 @@ let mctsSearch (control: SearchControl) : Move =
 
     control.LastBest <- best
     control.LastScore <- (if bestIdx >= 0 then mergedScoreCp acc.[bestIdx] kf else 0)
-    // Final info + PV from worker 0's own tree (coherent single-tree PV; score from the merge so it matches
-    // the chosen move even when tree 0's own best differs slightly).
-    reportMctsInfo workers.[0] control trees.[0] roots.[0] kf depthReached
+    // Final info from the MERGED decision: PV head = the emitted bestmove, score = LastScore, so the info
+    // line, the score, and the bestmove all reference the same merged root decision.
+    emitMctsInfo control depthReached control.LastScore best trees roots
     writeLine ("bestmove " + toUci best)
     best
 
+/// Production entry (mirrors Search.go). A position so deep that a fixed-depth leaf negamax would overrun
+/// MaxPly has no room for an MCTS leaf — hand the whole search to alpha-beta (Search.go emits its own single
+/// bestmove, so we must not emit another). Otherwise run the root-parallel MCTS body.
+let mctsSearch (control: SearchControl) : Move =
+    let safe = MaxPly - control.RootMoves.Length - MaxSearchPly - 1
+
+    if safe < 1 then
+        Search.go control
+    else
+        runMctsParallel control
+
+/// White-box test entry with explicit limits: run up to `iters` iterations on a single worker and return the
+/// tree + root index + worker. With defaultLimits this is the deterministic exactly-`iters` path; with a node
+/// budget it lets a test drive a mid-leaf stop (the leaf negamax's own CheckTime fires) to exercise backup
+/// accounting (root.N stays equal to w.Iters — an aborted playout bumps neither).
+let mctsToIterationsTreeLim
+    (fen: string)
+    (rootMoves: Move[])
+    (iters: int)
+    (lim: SearchLimits)
+    (cfg: SearchConfig)
+    (net: SfNetwork option)
+    : MctsTree * int * Worker =
+    let tt = TranspositionTable(max 1 cfg.HashMb)
+
+    let control =
+        SearchControl(cfg, lim, tt, fen, rootMoves, ?net = net)
+
+    let w = Worker(0, true, control)
+    w.SetupRoot()
+    control.Reset()
+    control.Tt.NewSearch()
+    control.NodeSum <- (fun () -> w.Nodes)
+    control.IterSum <- (fun () -> w.Iters)
+    control.StartClock 0L 0L
+    // Single worker, no orchestrator, no merge: Threads-independent. Slot arrays are length 1 (Id = 0); the
+    // global budget with one worker is exactly `iters`, so root.N / w.Iters land on exactly `iters`.
+    let trees: MctsTree[] = Array.zeroCreate 1
+    let roots: int[] = Array.zeroCreate 1
+    let globalIters = [| 0L |]
+    let struct (tree, rootIdx, _) = runWorker w control iters false false false trees roots globalIters
+    (tree, rootIdx, w)
+
 /// White-box test entry: run EXACTLY `iters` iterations (no time/stop/solver early-out) and return the
-/// tree + root index + worker, so tests can assert root.N == iters and the visit distribution.
+/// tree + root index + worker, so tests can assert root.N == iters, the visit distribution, and w.Iters.
 let mctsToIterationsTree
     (fen: string)
     (rootMoves: Move[])
@@ -846,20 +995,7 @@ let mctsToIterationsTree
     (cfg: SearchConfig)
     (net: SfNetwork option)
     : MctsTree * int * Worker =
-    let tt = TranspositionTable(max 1 cfg.HashMb)
-
-    let control =
-        SearchControl(cfg, defaultLimits, tt, fen, rootMoves, ?net = net)
-
-    let w = Worker(0, true, control)
-    w.SetupRoot()
-    control.Reset()
-    control.Tt.NewSearch()
-    control.NodeSum <- (fun () -> w.Nodes)
-    control.StartClock 0L 0L
-    // Single worker, no orchestrator, no merge: the deterministic exactly-`iters` path (Threads-independent).
-    let struct (tree, rootIdx, _) = runWorker w control iters false false false
-    (tree, rootIdx, w)
+    mctsToIterationsTreeLim fen rootMoves iters defaultLimits cfg net
 
 /// Deterministic oracle (runs MCTS regardless of cfg.UseMcts): struct(rootScoreCp, nodes, bestMove).
 let mctsToIterations

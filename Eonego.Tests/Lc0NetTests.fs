@@ -1,0 +1,244 @@
+/// Lc0 hybrid tests. Structural gates first (validate the protobuf loader + BN fold against the real net).
+/// Soft-skips when nets/20x256SE-jj-9-75000000.pb is absent (it is large + gitignored).
+module Eonego.Tests.Lc0NetTests
+
+open Xunit
+open Eonego.Lc0Proto
+open Eonego.Move
+open Eonego.Bitboard
+open Eonego.Position
+
+let private tryNetPath () : string option =
+    let mutable dir = System.IO.DirectoryInfo(System.AppContext.BaseDirectory)
+    let mutable root = None
+
+    while root.IsNone && not (isNull dir) do
+        if System.IO.File.Exists(System.IO.Path.Combine(dir.FullName, "Eonego.slnx")) then
+            root <- Some dir.FullName
+
+        dir <- dir.Parent
+
+    match root with
+    | Some r ->
+        let p = System.IO.Path.Combine(r, "nets", "20x256SE-jj-9-75000000.pb")
+        if System.IO.File.Exists p then Some p else None
+    | None -> None
+
+let private finite (a: float32[]) =
+    Array.forall (fun (x: float32) -> not (System.Single.IsNaN x || System.Single.IsInfinity x)) a
+
+[<Fact>]
+let ``Lc0 net loads with the expected 20x256SE architecture`` () =
+    match tryNetPath () with
+    | None -> () // soft-skip: net not present
+    | Some p ->
+        match load p with
+        | Failed r -> Assert.Fail r
+        | Loaded net ->
+            // Body
+            Assert.Equal(256, net.Channels)
+            Assert.Equal(112, net.Input.InC)
+            Assert.Equal(256, net.Input.OutC)
+            Assert.Equal(3, net.Input.K)
+            Assert.Equal(256 * 112 * 9, net.Input.W.Length)
+            Assert.Equal(21, net.Tower.Length)
+
+            let r0 = net.Tower.[0]
+            Assert.Equal(256, r0.Conv1.OutC)
+            Assert.Equal(3, r0.Conv1.K)
+            Assert.Equal(256 * 256 * 9, r0.Conv1.W.Length)
+            Assert.Equal(256, r0.Conv2.OutC)
+            Assert.Equal(32, r0.Se.SeCh)
+            Assert.Equal(256, r0.Se.C)
+            Assert.Equal(2 * 256, r0.Se.B2.Length)
+            Assert.Equal(32 * (2 * 256), r0.Se.W2.Length)
+
+            // Policy head: conv 256->256 1x1, FC (256*64)->1858
+            Assert.Equal(256, net.PolicyConv.OutC)
+            Assert.Equal(1, net.PolicyConv.K)
+            Assert.Equal(1858, net.PolicyB.Length)
+            Assert.Equal(1858 * 256 * 64, net.PolicyW.Length)
+
+            // Value head: conv 256->64 1x1, FC (64*64)->128->1 scalar
+            Assert.Equal(64, net.ValueConv.OutC)
+            Assert.Equal(1, net.ValueConv.K)
+            Assert.Equal(128, net.Value1B.Length)
+            Assert.Equal(128 * 64 * 64, net.Value1W.Length)
+            Assert.Equal(1, net.Value2B.Length)
+            Assert.Equal(128, net.Value2W.Length)
+
+            // BN fold must not have produced NaN/Inf (the near-zero-variance eps floor).
+            Assert.True(finite net.Input.W && finite net.Input.B, "input conv NaN/Inf after BN fold")
+            Assert.True(finite r0.Conv1.W && finite r0.Conv1.B, "res0 conv1 NaN/Inf after BN fold")
+            Assert.True(finite r0.Conv2.W && finite r0.Se.W2, "res0 conv2/SE NaN/Inf")
+            Assert.True(finite net.PolicyW && finite net.Value1W, "head weights NaN/Inf")
+
+// ---------------------------------------------------------------------------
+// Phase 4 gate (net-independent): the 1858 policy map round-trips every legal move with no collisions.
+// ---------------------------------------------------------------------------
+let private psq (s: string) (o: int) = (int s.[o] - int 'a') + (int s.[o + 1] - int '1') * 8
+
+[<Fact>]
+let ``Lc0 1858 policy map round-trips legal moves with no collisions`` () =
+    let fens =
+        [ "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1" // startpos (white, no flip)
+          "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 1" // startpos (black, exercises flip)
+          "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1" // kiwipete (castling)
+          "8/PPP2k2/8/8/8/8/2K2ppp/8 w - - 0 1" // white promotions (all 4 types per pawn)
+          "8/2k2PPP/8/8/8/8/ppp2K2/8 b - - 0 1" ] // black promotions (flip + promo)
+
+    for fen in fens do
+        let pos = Position.OfFen fen
+        let stmIsBlack = (pos.SideToMove = Black)
+        let moves = Eonego.Tests.TestFixtures.collectLegal pos
+        let seen = System.Collections.Generic.HashSet<int>()
+
+        for m in moves do
+            let idx = Eonego.Lc0PolicyMap.moveToNNIndex stmIsBlack m
+            Assert.True(idx >= 0 && idx < 1858, sprintf "%s -> idx %d out of [0,1858)" (toUci m) idx)
+            Assert.True(seen.Add idx, sprintf "policy-index collision %d for move %s in %s" idx (toUci m) fen)
+
+            let flip s = if stmIsBlack then s ^^^ 56 else s
+            let uci = Eonego.Lc0PolicyMap.nnIndexToUci.[idx]
+            Assert.Equal(flip (fromSq m), psq uci 0)
+            Assert.Equal(flip (toSq m), psq uci 2)
+
+            if isPromotion m then
+                let pc = (m >>> 12) &&& 0x3 // 0=N,1=B,2=R,3=Q
+
+                if pc = 0 then
+                    Assert.Equal(4, uci.Length) // knight promo => plain queen-move slot (no suffix)
+                else
+                    Assert.Equal(5, uci.Length)
+                    let expected = (match pc with | 1 -> 'b' | 2 -> 'r' | _ -> 'q')
+                    Assert.Equal(expected, uci.[4])
+
+// ---------------------------------------------------------------------------
+// Phase 2 gate (net-independent): 112-plane encoder structure + black-to-move flip.
+// ---------------------------------------------------------------------------
+[<Fact>]
+let ``Lc0 encoder produces the expected 112-plane structure`` () =
+    let out = Array.zeroCreate<float32> (112 * 64)
+    let planeSum p = Array.sub out (p * 64) 64 |> Array.sum
+
+    // White to move, startpos: no flip.
+    let w = Position.OfFen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+    Eonego.Lc0Encoder.encodeInto w out
+    Assert.Equal(8.0f, planeSum 0) // our pawns
+    Assert.Equal(2.0f, planeSum 1) // our knights
+    Assert.Equal(1.0f, planeSum 5) // our king
+    Assert.Equal(1.0f, out.[5 * 64 + 4]) // king on e1 (sq 4)
+    Assert.Equal(8.0f, planeSum 6) // their pawns
+    Assert.Equal(1.0f, planeSum 11) // their king
+    Assert.Equal(0.0f, planeSum 12) // repetition
+    Assert.Equal(8.0f, planeSum (13 + 0)) // h=1 repeat-current = h=0
+    Assert.Equal(1.0f, planeSum (13 + 5))
+    Assert.Equal(64.0f, planeSum 104) // we_can_000
+    Assert.Equal(64.0f, planeSum 105) // we_can_00
+    Assert.Equal(64.0f, planeSum 106) // they_000
+    Assert.Equal(64.0f, planeSum 107) // they_00
+    Assert.Equal(0.0f, planeSum 108) // white to move
+    Assert.Equal(0.0f, planeSum 109) // rule50 = 0
+    Assert.Equal(0.0f, planeSum 110) // zeros
+    Assert.Equal(64.0f, planeSum 111) // all ones
+
+    // Black to move: vertical flip -> our king (black e8) maps to e1 (sq 4); stm plane all-ones.
+    let b = Position.OfFen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 5 3"
+    Eonego.Lc0Encoder.encodeInto b out
+    Assert.Equal(8.0f, planeSum 0) // our (black) pawns, flipped to rank 2
+    Assert.Equal(1.0f, planeSum 5) // our king
+    Assert.Equal(1.0f, out.[5 * 64 + 4]) // black king e8 -> flipped e1 (sq 4)
+    Assert.Equal(64.0f, planeSum 108) // black to move
+    Assert.Equal(5.0f * 64.0f, planeSum 109) // rule50 = 5, broadcast
+
+// ---------------------------------------------------------------------------
+// Phase 3/5 gate: forward pass scalar==AVX2 parity + sane policy/value (net required).
+// The "principled opening move" check is the strongest end-to-end correctness signal without an lc0 oracle:
+// a broken conv/encoder/BN/SE/policy-map would yield garbage (uniform or random) policy.
+// ---------------------------------------------------------------------------
+[<Fact>]
+let ``Lc0 forward pass: scalar==AVX2 and sane policy+value`` () =
+    match tryNetPath () with
+    | None -> ()
+    | Some p ->
+        match load p with
+        | Failed r -> Assert.Fail r
+        | Loaded net ->
+            let pos = Position.OfFen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+            let inBuf = Array.zeroCreate<float32> (112 * 64)
+            Eonego.Lc0Encoder.encodeInto pos inBuf
+            // Separate scratches: `forward` returns an alias of scratch.Logits, so reusing one scratch would
+            // make logitsS/logitsA point at the same (AVX2-overwritten) buffer and void the parity check.
+            let scratchS = Eonego.Lc0Net.Lc0Scratch(net)
+            let scratchA = Eonego.Lc0Net.Lc0Scratch(net)
+            let struct (logitsS, valS) = Eonego.Lc0Net.forward false net scratchS inBuf
+            let struct (logitsA, valA) = Eonego.Lc0Net.forward true net scratchA inBuf
+
+            // scalar vs AVX2 parity (epsilon, not bit-exact: FMA + horizontal-sum reorder).
+            Assert.True(abs (valS - valA) < 5e-3f, sprintf "value scalar %f vs avx2 %f" valS valA)
+            let mutable maxDiff = 0.0f
+            for i in 0..1857 do
+                maxDiff <- max maxDiff (abs (logitsS.[i] - logitsA.[i]))
+            Assert.True(maxDiff < 1e-1f, sprintf "policy logit scalar/avx2 max diff %f" maxDiff)
+
+            // sanity
+            Assert.True(valS >= -1.0f && valS <= 1.0f, sprintf "value %f out of [-1,1]" valS)
+            Assert.True(
+                Array.forall (fun x -> not (System.Single.IsNaN x || System.Single.IsInfinity x)) logitsS,
+                "policy logits NaN/Inf"
+            )
+
+            // priors sum to ~1 and value q in [0,1]
+            let moves = Eonego.Tests.TestFixtures.collectLegal pos
+            let priors = Array.zeroCreate<float32> moves.Length
+            let q = Eonego.Lc0Net.lc0PriorsInto true net pos moves moves.Length inBuf scratchA priors
+            Assert.True(q >= 0.0f && q <= 1.0f, sprintf "q %f" q)
+            Assert.True(abs (Array.sum priors - 1.0f) < 1e-3f, sprintf "priors sum %f" (Array.sum priors))
+
+            // top policy move from startpos must be a principled opening.
+            let mutable bi = 0
+            for i in 1 .. moves.Length - 1 do
+                if priors.[i] > priors.[bi] then bi <- i
+            let best = toUci moves.[bi]
+            let principled = [ "e2e4"; "d2d4"; "g1f3"; "c2c4"; "g2g3"; "b1c3"; "e2e3"; "d2d3"; "f2f4" ]
+            Assert.True(List.contains best principled, sprintf "startpos best policy = %s (expected principled opening)" best)
+
+// ---------------------------------------------------------------------------
+// Stage-1 gate for batched Lc0 eval: forwardBatch over B packed positions == single forward, per board.
+// Each board's cells run the identical weight/accumulation sequence as the single path, so they match tightly.
+// ---------------------------------------------------------------------------
+[<Fact>]
+let ``Lc0 forwardBatch matches single forward for every board`` () =
+    match tryNetPath () with
+    | None -> ()
+    | Some p ->
+        match load p with
+        | Failed r -> Assert.Fail r
+        | Loaded net ->
+            let pos = Position.OfFen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+            let planes = 112
+            let inBuf = Array.zeroCreate<float32> (planes * 64)
+            Eonego.Lc0Encoder.encodeInto pos inBuf
+
+            // single-position reference (AVX2).
+            let sref = Eonego.Lc0Net.Lc0Scratch(net)
+            let struct (logits1, val1) = Eonego.Lc0Net.forward true net sref inBuf
+
+            // pack B copies of the same position into the batched (channel-major, nPos boards) layout.
+            let B = 5
+            let batchIn = Array.zeroCreate<float32> (planes * B * 64)
+            for ch in 0 .. planes - 1 do
+                for b in 0 .. B - 1 do
+                    Array.blit inBuf (ch * 64) batchIn (ch * B * 64 + b * 64) 64
+
+            let bscratch = Eonego.Lc0Net.Lc0BatchScratch(net, B)
+            let outLogits = Array.zeroCreate<float32> (B * 1858)
+            let outValues = Array.zeroCreate<float32> B
+            Eonego.Lc0Net.forwardBatch true net bscratch B batchIn outLogits outValues
+
+            for b in 0 .. B - 1 do
+                Assert.True(abs (outValues.[b] - val1) < 1e-4f, sprintf "board %d value %f vs single %f" b outValues.[b] val1)
+                let mutable maxDiff = 0.0f
+                for i in 0 .. 1857 do
+                    maxDiff <- max maxDiff (abs (outLogits.[b * 1858 + i] - logits1.[i]))
+                Assert.True(maxDiff < 1e-3f, sprintf "board %d policy max diff %f" b maxDiff)

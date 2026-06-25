@@ -12,11 +12,13 @@
 /// gate against real Stockfish `eval` are the next steps (separate files).
 ///
 /// AOT/F#: pure byte parsing over a `byte[]`; no printf; fail-soft (never throws on a bad file).
+#nowarn "9"
 module Eonego.SfNnue
 
 open System
 open System.Runtime.Intrinsics
 open System.Runtime.Intrinsics.X86
+open Microsoft.FSharp.NativeInterop
 open Eonego.Bitboard
 open Eonego.Position
 
@@ -221,13 +223,14 @@ let loadBytes (buf: byte[]) : SfLoadResult =
         let version = c.I32()
 
         if version <> SfVersion then
-            Failed(sprintf "unexpected NNUE version 0x%08X (expected SF16 0x%08X)" version SfVersion)
+            // string-concat (not sprintf): F# Printf crashes under NativeAOT (MakeGenericMethod).
+            Failed("unexpected NNUE version 0x" + version.ToString("X8") + " (expected SF16 0x" + SfVersion.ToString("X8") + ")")
         else
             let hash = c.U32()
             let descLen = c.I32()
 
             if descLen < 0 || descLen > c.Remaining then
-                Failed(sprintf "bad description length %d" descLen)
+                Failed("bad description length " + string descLen)
             else
                 let desc = c.Str descLen
                 let ftHash = c.U32()
@@ -237,7 +240,7 @@ let loadBytes (buf: byte[]) : SfLoadResult =
                 let stacks = Array.init LayerStacks (fun _ -> readStack c)
 
                 if not c.AtEnd then
-                    Failed(sprintf "trailing %d bytes after parse (layout mismatch)" c.Remaining)
+                    Failed("trailing " + string c.Remaining + " bytes after parse (layout mismatch)")
                 else
                     Loaded
                         { Version = version
@@ -292,7 +295,7 @@ let accumulatorOf (net: SfNetwork) (pos: Position) (pColor: Color) : int[] * int
 /// fc_0 GEMV (1536 -> 16). AVX2: vpmaddubsw(ft_u8, w_i8) -> int16 pairs, vpmaddwd(_, ones) -> int32,
 /// accumulate over 48 chunks of 32, horizontal-sum, add bias. Bit-exact: no vpmaddubsw saturation
 /// (127*127*2 = 32258 < 32767), int32 accumulation order-independent.
-let fc0Gemv (useAvx2: bool) (ft: byte[]) (fc0w: sbyte[]) (fc0b: int[]) (fc0: int[]) =
+let fc0Gemv (useAvx2: bool) (ft: Span<byte>) (fc0w: Span<sbyte>) (fc0b: Span<int>) (fc0: Span<int>) =
     if useAvx2 && Avx2.IsSupported then
         let ones = Vector256.Create(1s)
         for o in 0 .. Fc0Out - 1 do
@@ -317,13 +320,14 @@ let fc0Gemv (useAvx2: bool) (ft: byte[]) (fc0w: sbyte[]) (fc0b: int[]) (fc0: int
 /// (us into [0..767], them into [768..1535]). AVX2 vectorizes the clamp(Min/Max)*MultiplyLow*>>7
 /// (values non-negative so >>7 == /128, product <= 16129 fits int32), then narrows the 8 int32
 /// to bytes scalar (no lane-crossing pack). Bit-exact with scalar.
-let ftProduct (useAvx2: bool) (accUs: int[]) (accThem: int[]) (ft: byte[]) =
+let ftProduct (useAvx2: bool) (accUs: Span<int>) (accThem: Span<int>) (ft: Span<byte>) =
     let half = L1 / 2
 
     if useAvx2 && Avx2.IsSupported then
         let zero = Vector256<int>.Zero
         let c127 = Vector256.Create(127)
-        let tmp = Array.zeroCreate<int> 8
+        let tmpPtr = NativePtr.stackalloc<int> 8
+        let tmp = Span<int>(NativePtr.toVoidPtr tmpPtr, 8)
 
         // us side: accUs[j] paired with accUs[j+half] -> ft[j]
         let mutable j = 0
@@ -378,20 +382,25 @@ let evalInternal (net: SfNetwork) (pos: Position) : int =
             pieceCount <- pieceCount + 1
 
     let bucket = (pieceCount - 1) / 4
-    let half = L1 / 2
 
     // Feature transformer: pairwise clamped product -> uint8 (us in [0..767], them in [768..1535]).
-    let ft = Array.zeroCreate<byte> L1
-    ftProduct SfAccumulator.UseAvx2 accUs accThem ft
+    // All working buffers are stackalloc'd — zero heap allocation on the hot path.
+    let ftPtr = NativePtr.stackalloc<byte> L1
+    let ft = Span<byte>(NativePtr.toVoidPtr ftPtr, L1)
+    ftProduct SfAccumulator.UseAvx2 (accUs.AsSpan()) (accThem.AsSpan()) ft
 
     let stack = net.Stacks.[bucket]
 
     // fc_0: 1536 -> 16 (int32)
-    let fc0 = Array.zeroCreate<int> Fc0Out
-    fc0Gemv SfAccumulator.UseAvx2 ft stack.Fc0W stack.Fc0B fc0
+    let fc0Ptr = NativePtr.stackalloc<int> Fc0Out
+    let fc0 = Span<int>(NativePtr.toVoidPtr fc0Ptr, Fc0Out)
+    fc0Gemv SfAccumulator.UseAvx2 ft (stack.Fc0W.AsSpan()) (stack.Fc0B.AsSpan()) fc0
 
     // ac_sqr_0[0..14] then ac_0[0..14] -> 30 values (padded to 32 with zeros for fc_1).
-    let conc = Array.zeroCreate<int> Fc1In
+    // Stackalloc does NOT zero-initialize; explicitly clear so slots 30..31 are 0 for fc_1.
+    let concPtr = NativePtr.stackalloc<int> Fc1In
+    let conc = Span<int>(NativePtr.toVoidPtr concPtr, Fc1In)
+    conc.Clear()
 
     for o in 0 .. 14 do // FC_0_OUTPUTS = 15
         let x = fc0.[o]
@@ -400,7 +409,8 @@ let evalInternal (net: SfNetwork) (pos: Position) : int =
         conc.[15 + o] <- max 0 (min 127 (x >>> 6))
 
     // fc_1: 32 -> 32 (the two padding inputs are 0, so they contribute nothing).
-    let fc1 = Array.zeroCreate<int> Fc1Out
+    let fc1Ptr = NativePtr.stackalloc<int> Fc1Out
+    let fc1 = Span<int>(NativePtr.toVoidPtr fc1Ptr, Fc1Out)
 
     for o in 0 .. Fc1Out - 1 do
         let mutable s = stack.Fc1B.[o]
@@ -412,7 +422,8 @@ let evalInternal (net: SfNetwork) (pos: Position) : int =
         fc1.[o] <- s
 
     // ac_1: clipped relu (32)
-    let a1 = Array.zeroCreate<int> Fc2In
+    let a1Ptr = NativePtr.stackalloc<int> Fc2In
+    let a1 = Span<int>(NativePtr.toVoidPtr a1Ptr, Fc2In)
 
     for o in 0 .. Fc2In - 1 do
         a1.[o] <- max 0 (min 127 (fc1.[o] >>> 6))

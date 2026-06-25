@@ -18,30 +18,31 @@ open Eonego.Search
 
 let private writeLine (s: string) = Console.Out.WriteLine(s)
 
+/// Hardwired transposition-table size (MB). Hash is no longer a UCI option.
+[<Literal>]
+let private HashMb = 256
+
+/// Read an embedded manifest resource (the baked-in nets) fully into a byte array; None if absent.
+let private readEmbedded (name: string) : byte[] option =
+    let asm = System.Reflection.Assembly.GetExecutingAssembly()
+
+    match asm.GetManifestResourceStream(name) with
+    | null -> None
+    | stream ->
+        use s = stream
+        use ms = new System.IO.MemoryStream()
+        s.CopyTo ms
+        Some(ms.ToArray())
+
+/// Only Threads and Move Overhead remain tunable; every other option is hardwired ON / fixed. The SF leaf
+/// net is embedded in the binary (see Eonego.fsproj); the optional Lc0 policy net loads from disk
+/// (EONEGO_LC0 / auto-discovery) — so there is no Eval/Policy file UCI option for either.
 type private UciState =
     { mutable Threads: int
-      mutable HashMb: int
-      mutable UseProbCut: bool
-      mutable UseIir: bool
-      mutable UseRazoring: bool
-      mutable UseHistoryPruning: bool
-      mutable UseDeltaPruning: bool
-      mutable UseContHist: bool
-      mutable UseSingular: bool
-      mutable UseNmpVerify: bool
-      mutable UseLmrTweaks: bool
-      mutable UseAspTweaks: bool
       mutable MoveOverhead: int
-      mutable UseMcts: bool
-      mutable MctsCpuct: int
-      mutable MctsLeafDepth: int
-      mutable MctsK: int
-      mutable UsePolicy: bool
-      mutable PolicyFile: string
-      mutable PolicyNet: MontyPolicy.PolicyNetwork option
-      mutable EvalFile: string
-      mutable Net: SfNetwork option
-      mutable Tt: TranspositionTable
+      Net: SfNetwork option
+      Lc0Net: Lc0Proto.Lc0Net option // Lc0 CNN priors (root); gated by EONEGO_LC0 env var, else history fallback
+      Tt: TranspositionTable
       mutable RootFen: string
       mutable RootMoves: Move[]
       mutable Control: SearchControl option
@@ -169,35 +170,39 @@ let private startSearch (st: UciState) (lim: SearchLimits) =
 
     match st.Net with
     | None ->
-        writeLine "info string no NNUE net loaded (set EvalFile); cannot search"
+        writeLine "info string no NNUE net embedded; cannot search"
         let p = Position()
         p.LoadFen st.RootFen
         for m in st.RootMoves do p.Make m
         writeLine ("bestmove " + toUci (Search.firstLegalMove p))
     | Some _ ->
+        // All toggles hardwired ON; HashMb fixed; MCTS is the production search (Lc0 priors when a net is
+        // found, else history fallback); only Threads/MoveOverhead come from state.
         let cfg =
             { Threads = st.Threads
-              HashMb = st.HashMb
+              HashMb = HashMb
               UseTt = true
               UsePruning = true
-              UseProbCut = st.UseProbCut
-              UseIir = st.UseIir
-              UseRazoring = st.UseRazoring
-              UseHistoryPruning = st.UseHistoryPruning
-              UseDeltaPruning = st.UseDeltaPruning
-              UseContHist = st.UseContHist
-              UseSingular = st.UseSingular
-              UseNmpVerify = st.UseNmpVerify
-              UseLmrTweaks = st.UseLmrTweaks
-              UseAspTweaks = st.UseAspTweaks
+              UseProbCut = true
+              UseIir = true
+              UseRazoring = true
+              UseHistoryPruning = true
+              UseDeltaPruning = true
+              UseContHist = true
+              UseSingular = true
+              UseNmpVerify = true
+              UseLmrTweaks = true
+              UseAspTweaks = true
               MoveOverhead = st.MoveOverhead
-              UseMcts = st.UseMcts
-              MctsCpuct = st.MctsCpuct
-              MctsLeafDepth = st.MctsLeafDepth
-              MctsK = st.MctsK
-              UsePolicy = st.UsePolicy && st.PolicyNet.IsSome }
+              UseMcts = true
+              MctsCpuct = 150
+              MctsLeafDepth = 8
+              MctsK = 200
+              // Lc0 (if loaded via EONEGO_LC0) drives priors; else the history-softmax fallback.
+              UseLc0 = st.Lc0Net.IsSome }
 
-        let control = SearchControl(cfg, lim, st.Tt, st.RootFen, st.RootMoves, ?net = st.Net, ?policyNet = st.PolicyNet)
+        let control =
+            SearchControl(cfg, lim, st.Tt, st.RootFen, st.RootMoves, ?net = st.Net, ?lc0Net = st.Lc0Net)
         st.Control <- Some control
 
         let t =
@@ -210,143 +215,63 @@ let private startSearch (st: UciState) (lim: SearchLimits) =
         t.Start()
 
 let private handleSetOption (st: UciState) (tokens: string[]) =
-    // setoption name <Name> value <Value>
+    // setoption name <Name...> value <Value> — only Threads and Move Overhead are tunable (the latter is a
+    // two-word name, so the name is the tokens between `name` and `value`); every other option is ignored.
     let nameIdx = Array.tryFindIndex ((=) "name") tokens
     let valIdx = Array.tryFindIndex ((=) "value") tokens
 
     match nameIdx, valIdx with
-    | Some ni, Some vi when ni + 1 < tokens.Length && vi + 1 < tokens.Length ->
-        let name = tokens.[ni + 1]
+    | Some ni, Some vi when ni < vi && vi + 1 < tokens.Length ->
+        let name = String.Join(" ", tokens.[ni + 1 .. vi - 1])
         let v = tryInt tokens.[vi + 1]
 
-        if String.Equals(name, "Hash", StringComparison.OrdinalIgnoreCase) then
-            stopAndJoin st
-            st.HashMb <- max 1 v
-            st.Tt.Resize st.HashMb
-        elif String.Equals(name, "Threads", StringComparison.OrdinalIgnoreCase) then
-            st.Threads <- max 1 v
-        elif String.Equals(name, "UseProbCut", StringComparison.OrdinalIgnoreCase) then
-            match Boolean.TryParse tokens.[vi + 1] with
-            | true, b -> st.UseProbCut <- b
-            | _ -> ()
-        elif String.Equals(name, "UseIir", StringComparison.OrdinalIgnoreCase) then
-            match Boolean.TryParse tokens.[vi + 1] with
-            | true, b -> st.UseIir <- b
-            | _ -> ()
-        elif String.Equals(name, "UseRazoring", StringComparison.OrdinalIgnoreCase) then
-            match Boolean.TryParse tokens.[vi + 1] with
-            | true, b -> st.UseRazoring <- b
-            | _ -> ()
-        elif String.Equals(name, "UseHistoryPruning", StringComparison.OrdinalIgnoreCase) then
-            match Boolean.TryParse tokens.[vi + 1] with
-            | true, b -> st.UseHistoryPruning <- b
-            | _ -> ()
-        elif String.Equals(name, "UseDeltaPruning", StringComparison.OrdinalIgnoreCase) then
-            match Boolean.TryParse tokens.[vi + 1] with
-            | true, b -> st.UseDeltaPruning <- b
-            | _ -> ()
-        elif String.Equals(name, "UseContHist", StringComparison.OrdinalIgnoreCase) then
-            match Boolean.TryParse tokens.[vi + 1] with
-            | true, b -> st.UseContHist <- b
-            | _ -> ()
-        elif String.Equals(name, "UseSingular", StringComparison.OrdinalIgnoreCase) then
-            match Boolean.TryParse tokens.[vi + 1] with
-            | true, b -> st.UseSingular <- b
-            | _ -> ()
-        elif String.Equals(name, "UseNmpVerify", StringComparison.OrdinalIgnoreCase) then
-            match Boolean.TryParse tokens.[vi + 1] with
-            | true, b -> st.UseNmpVerify <- b
-            | _ -> ()
-        elif String.Equals(name, "UseLmrTweaks", StringComparison.OrdinalIgnoreCase) then
-            match Boolean.TryParse tokens.[vi + 1] with
-            | true, b -> st.UseLmrTweaks <- b
-            | _ -> ()
-        elif String.Equals(name, "UseAspTweaks", StringComparison.OrdinalIgnoreCase) then
-            match Boolean.TryParse tokens.[vi + 1] with
-            | true, b -> st.UseAspTweaks <- b
-            | _ -> ()
-        elif String.Equals(name, "MoveOverhead", StringComparison.OrdinalIgnoreCase) then
+        if String.Equals(name, "Threads", StringComparison.OrdinalIgnoreCase) then
+            st.Threads <- max 1 (min 256 v)
+        elif String.Equals(name, "Move Overhead", StringComparison.OrdinalIgnoreCase) then
             st.MoveOverhead <- max 0 (min 5000 v)
-        elif String.Equals(name, "UseMcts", StringComparison.OrdinalIgnoreCase) then
-            match Boolean.TryParse tokens.[vi + 1] with
-            | true, b -> st.UseMcts <- b
-            | _ -> ()
-        elif String.Equals(name, "MctsCpuct", StringComparison.OrdinalIgnoreCase) then
-            st.MctsCpuct <- max 0 (min 1000 v)
-        elif String.Equals(name, "MctsLeafDepth", StringComparison.OrdinalIgnoreCase) then
-            st.MctsLeafDepth <- max 0 (min 20 v)
-        elif String.Equals(name, "MctsK", StringComparison.OrdinalIgnoreCase) then
-            st.MctsK <- max 1 (min 2000 v)
-        elif String.Equals(name, "UsePolicy", StringComparison.OrdinalIgnoreCase) then
-            stopAndJoin st
-
-            match Boolean.TryParse tokens.[vi + 1] with
-            | true, b -> st.UsePolicy <- b
-            | _ -> ()
-        elif String.Equals(name, "PolicyFile", StringComparison.OrdinalIgnoreCase) then
-            stopAndJoin st
-            let path = String.Join(" ", tokens.[vi + 1 ..])
-
-            match MontyPolicy.load path with
-            | MontyPolicy.Loaded net ->
-                st.PolicyNet <- Some net
-                st.PolicyFile <- path
-                writeLine ("info string policy net loaded: " + path)
-            | MontyPolicy.Failed reason ->
-                writeLine ("info string policy net load failed (" + reason + "); keeping current policy")
-        elif String.Equals(name, "EvalFile", StringComparison.OrdinalIgnoreCase) then
-            stopAndJoin st
-            let path = String.Join(" ", tokens.[vi + 1 ..])
-
-            match SfNnue.load path with
-            | Loaded net ->
-                st.Net <- Some net
-                st.EvalFile <- path
-                st.Tt.Clear()
-                writeLine ("info string NNUE loaded: " + path + " (ver " + string net.Version + ")")
-            | Failed reason ->
-                writeLine ("info string NNUE load failed (" + reason + "); keeping current eval")
+    // Any other (legacy/hardwired) option is silently ignored.
     | _ -> ()
 
 let run () =
-    let defaultNetPath = System.IO.Path.Combine(AppContext.BaseDirectory, "sf16.nnue")
+    // Nets are embedded in the binary (see Eonego.fsproj <EmbeddedResource>); load both once at startup.
+    let net =
+        match readEmbedded "sf16.nnue" with
+        | Some bytes -> (match SfNnue.loadBytes bytes with Loaded n -> Some n | Failed _ -> None)
+        | None -> None
 
-    let defaultNet =
-        match SfNnue.load defaultNetPath with
-        | Loaded n -> Some n
-        | Failed _ -> None
+    // Lc0 CNN policy (root). The net is loaded from DISK (113 MB, not embedded): use EONEGO_LC0 if set,
+    // otherwise AUTO-DISCOVER the first *.pb next to the exe or in the working dir, so the Lc0+SF hybrid
+    // works in a GUI without any env var. If no net is found, MCTS falls back to weak history priors.
+    let lc0Path =
+        match Environment.GetEnvironmentVariable "EONEGO_LC0" with
+        | null | "" ->
+            [ AppContext.BaseDirectory; Environment.CurrentDirectory ]
+            |> List.tryPick (fun d ->
+                try
+                    System.IO.Directory.GetFiles(d, "*.pb") |> Array.sort |> Array.tryHead
+                with _ -> None)
+            |> Option.defaultValue ""
+        | p -> p
 
-    let defaultPolicyPath = System.IO.Path.Combine(AppContext.BaseDirectory, "policy.network")
-
-    let defaultPolicyNet, defaultPolicyFile =
-        match MontyPolicy.load defaultPolicyPath with
-        | MontyPolicy.Loaded n -> (Some n, defaultPolicyPath)
-        | MontyPolicy.Failed _ -> (None, "")
+    let lc0Net =
+        if lc0Path = "" then
+            writeLine "info string no Lc0 .pb found (set EONEGO_LC0 or place a .pb next to the exe); using history priors"
+            None
+        else
+            match Lc0Proto.load lc0Path with
+            | Lc0Proto.Loaded n ->
+                writeLine ("info string Lc0 net loaded: " + lc0Path + " (" + string n.Tower.Length + " blocks)")
+                Some n
+            | Lc0Proto.Failed r ->
+                writeLine ("info string Lc0 net load failed (" + r + "); using history priors")
+                None
 
     let st =
         { Threads = 1
-          HashMb = 16
-          UseProbCut = true
-          UseIir = true
-          UseRazoring = true
-          UseHistoryPruning = true
-          UseDeltaPruning = true
-          UseContHist = true
-          UseSingular = true
-          UseNmpVerify = true
-          UseLmrTweaks = true
-          UseAspTweaks = true
           MoveOverhead = 10
-          UseMcts = false
-          MctsCpuct = 150
-          MctsLeafDepth = 6
-          MctsK = 200
-          UsePolicy = false
-          PolicyFile = defaultPolicyFile
-          PolicyNet = defaultPolicyNet
-          EvalFile = (if defaultNet.IsSome then defaultNetPath else "")
-          Net = defaultNet
-          Tt = TranspositionTable(16)
+          Net = net
+          Lc0Net = lc0Net
+          Tt = TranspositionTable(HashMb)
           RootFen = StartPosFen
           RootMoves = [||]
           Control = None
@@ -365,26 +290,8 @@ let run () =
                 | "uci" ->
                     writeLine "id name Eonego"
                     writeLine "id author Houijasu"
-                    writeLine "option name Hash type spin default 16 min 1 max 65536"
                     writeLine "option name Threads type spin default 1 min 1 max 256"
-                    writeLine "option name UseProbCut type check default true"
-                    writeLine "option name UseIir type check default true"
-                    writeLine "option name UseRazoring type check default true"
-                    writeLine "option name UseHistoryPruning type check default true"
-                    writeLine "option name UseDeltaPruning type check default true"
-                    writeLine "option name UseContHist type check default true"
-                    writeLine "option name UseSingular type check default true"
-                    writeLine "option name UseNmpVerify type check default true"
-                    writeLine "option name UseLmrTweaks type check default true"
-                    writeLine "option name UseAspTweaks type check default true"
-                    writeLine "option name MoveOverhead type spin default 10 min 0 max 5000"
-                    writeLine "option name UseMcts type check default false"
-                    writeLine "option name MctsCpuct type spin default 150 min 0 max 1000"
-                    writeLine "option name MctsLeafDepth type spin default 6 min 0 max 20"
-                    writeLine "option name MctsK type spin default 200 min 1 max 2000"
-                    writeLine "option name UsePolicy type check default false"
-                    writeLine ("option name PolicyFile type string default " + (if st.PolicyFile = "" then "<empty>" else st.PolicyFile))
-                    writeLine ("option name EvalFile type string default " + (if st.EvalFile = "" then "<empty>" else st.EvalFile))
+                    writeLine "option name Move Overhead type spin default 10 min 0 max 5000"
                     writeLine "uciok"
                 | "isready" ->
                     writeLine "readyok"

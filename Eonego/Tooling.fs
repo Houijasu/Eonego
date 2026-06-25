@@ -253,7 +253,7 @@ let private playOneGame
 
         if not (Double.IsNaN result) then
             for entry in pending do
-                writer.WriteLine(sprintf "%s;%d;%.1f" entry.Fen entry.CpWhite result)
+                writer.WriteLine(entry.Fen + ";" + string entry.CpWhite + ";" + result.ToString("0.0", inv))
 
             finished <- true
         else
@@ -263,7 +263,7 @@ let private playOneGame
                 let r = gameResult net pos ply maxPlies
 
                 for entry in pending do
-                    writer.WriteLine(sprintf "%s;%d;%.1f" entry.Fen entry.CpWhite r)
+                    writer.WriteLine(entry.Fen + ";" + string entry.CpWhite + ";" + r.ToString("0.0", inv))
 
                 finished <- true
             else

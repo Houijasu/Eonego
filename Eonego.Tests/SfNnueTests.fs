@@ -143,8 +143,8 @@ let ``fc0Gemv AVX2 equals scalar over random ft+weights`` () =
     let b = Array.init 16 (fun _ -> rng.Next(-100000, 100000))
     let outScalar = Array.zeroCreate<int> 16
     let outAvx2 = Array.zeroCreate<int> 16
-    fc0Gemv false ft w b outScalar
-    fc0Gemv true ft w b outAvx2
+    fc0Gemv false (ft.AsSpan()) (w.AsSpan()) (b.AsSpan()) (outScalar.AsSpan())
+    fc0Gemv true (ft.AsSpan()) (w.AsSpan()) (b.AsSpan()) (outAvx2.AsSpan())
     Assert.Equal<int[]>(outScalar, outAvx2)
 
 [<Fact>]
@@ -154,6 +154,6 @@ let ``ftProduct AVX2 equals scalar over random accumulators`` () =
     let accThem = Array.init 1536 (fun _ -> rng.Next(-300, 300))
     let ftScalar = Array.zeroCreate<byte> 1536
     let ftAvx2 = Array.zeroCreate<byte> 1536
-    ftProduct false accUs accThem ftScalar
-    ftProduct true accUs accThem ftAvx2
+    ftProduct false (accUs.AsSpan()) (accThem.AsSpan()) (ftScalar.AsSpan())
+    ftProduct true (accUs.AsSpan()) (accThem.AsSpan()) (ftAvx2.AsSpan())
     Assert.Equal<byte[]>(ftScalar, ftAvx2)

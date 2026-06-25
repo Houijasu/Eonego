@@ -498,14 +498,35 @@ type SearchBench() =
     member _.SearchDepth7() =
         negamax worker worker.Pos (-INF) INF 7 0 true false
 
-/// MCTS-root / negamax-leaf hybrid throughput. Measures end-to-end iteration cost
-/// (selection, expansion, leaf negamax, backup) on a tactically rich position.
+/// MCTS-root / negamax-leaf hybrid throughput. Measures end-to-end iteration cost (selection, expansion,
+/// leaf negamax, backup) on a tactically rich position. The SF net is loaded once in Setup for a realistic
+/// leaf eval; priors come from the history fallback (Lc0 is exercised in Lc0NetTests, not here).
 [<MemoryDiagnoser>]
 [<ShortRunJob>]
 type MctsBench() =
 
     let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -" // Kiwipete
 
+    let mutable sfNet: SfNetwork option = None
+
+    [<GlobalSetup>]
+    member _.Setup() =
+        let mutable dir = System.IO.DirectoryInfo(System.AppContext.BaseDirectory)
+        let mutable root = None
+
+        while root.IsNone && not (isNull dir) do
+            if System.IO.File.Exists(System.IO.Path.Combine(dir.FullName, "Eonego.slnx")) then
+                root <- Some dir.FullName
+
+            dir <- dir.Parent
+
+        match root with
+        | Some r ->
+            let sp = System.IO.Path.Combine(r, "nets", "sf16.nnue")
+            sfNet <- if System.IO.File.Exists sp then (match load sp with Loaded n -> Some n | _ -> None) else None
+        | None -> ()
+
+    /// Baseline: leaf depth 6, trivial eval (no SF net), history priors — pure tree + qsearch machinery.
     [<Benchmark(Baseline = true)>]
     member _.MctsDepth6_200Iters() =
         let cfg = { defaultConfig with MctsLeafDepth = 6; MctsCpuct = 150; MctsK = 200 }
@@ -517,6 +538,16 @@ type MctsBench() =
         let cfg = { defaultConfig with MctsLeafDepth = 0; MctsCpuct = 150; MctsK = 200 }
         let struct (_, _, _) = mctsToIterations fen [||] 200 cfg None
         0
+
+    /// SF-net leaf eval (realistic). Soft-skips when the SF net is absent.
+    [<Benchmark>]
+    member _.MctsDepth6_SfNet() =
+        match sfNet with
+        | Some _ ->
+            let cfg = { defaultConfig with MctsLeafDepth = 6; MctsCpuct = 150; MctsK = 200 }
+            let struct (_, _, _) = mctsToIterations fen [||] 200 cfg sfNet
+            0
+        | None -> 0
 
 [<EntryPoint>]
 let main argv =

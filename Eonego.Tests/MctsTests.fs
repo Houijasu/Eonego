@@ -10,6 +10,7 @@ open Xunit
 open Eonego.Bitboard
 open Eonego.Move
 open Eonego.Position
+open Eonego.Transposition
 open Eonego.Search
 open Eonego.Mcts
 open Eonego.Tests.TestFixtures
@@ -160,3 +161,96 @@ let ``single-thread fixed-iteration MCTS is deterministic`` () =
     let struct (s2, _, m2) = mctsToIterations fen [||] 250 defaultConfig None
     Assert.Equal(toUci m1, toUci m2)
     Assert.Equal(s1, s2)
+
+[<Fact>]
+let ``mctsToIterationsTree runs exactly the requested iterations (Worker.Iters)`` () =
+    let (_, _, w) = mctsToIterationsTree StartPosFen [||] 50 defaultConfig None
+    Assert.Equal(50L, w.Iters)
+
+// ---------------------------------------------------------------------------
+// Phase 1: mid-leaf-stop accounting, safe-envelope fallback, merged decision
+// ---------------------------------------------------------------------------
+[<Fact>]
+let ``a mid-leaf node-limit stop never over-counts iterations (Iters == backed-up root visits)`` () =
+    match tryLoadSfNet () with
+    | None -> () // soft-skip: needs the SF leaf eval to generate leaf nodes
+    | Some net ->
+        // A tiny node budget trips the leaf negamax's own CheckTime mid-playout; the aborted iteration must
+        // bump neither root visits nor the iteration counter, so the two stay exactly equal.
+        let lim = { defaultLimits with Nodes = 500L }
+        let (tree, root, w) = mctsToIterationsTreeLim StartPosFen [||] 1000 lim defaultConfig (Some net)
+        Assert.Equal(int64 (tree.NodeN root), w.Iters)
+
+/// Build n plies of reversible knight shuffles (g1f3/f3g1, g8f6/f6g8) from startpos as a legal move list —
+/// used to push the root past the MCTS safe envelope (safe = MaxPly - rootMoves - MaxSearchPly - 1 < 1).
+let private knightShuffle (n: int) : Move[] =
+    let pos = Position()
+    pos.LoadFen StartPosFen
+    let g1, f3 = mkSquare 6 0, mkSquare 5 2
+    let g8, f6 = mkSquare 6 7, mkSquare 5 5
+    let result = ResizeArray<Move>(n)
+
+    for i in 0 .. n - 1 do
+        let (frm, dst) =
+            if i % 2 = 0 then (if (i / 2) % 2 = 0 then (g1, f3) else (f3, g1))
+            else (if (i / 2) % 2 = 0 then (g8, f6) else (f6, g8))
+
+        let m = collectLegal pos |> Array.find (fun mv -> fromSq mv = frm && toSq mv = dst)
+        result.Add m
+        pos.Make m
+
+    result.ToArray()
+
+[<Fact>]
+let ``a root past the safe envelope falls back to alpha-beta (same move as Search.go)`` () =
+    match tryLoadSfNet () with
+    | None -> () // soft-skip: the fallback runs Search.go, which needs the SF eval
+    | Some net ->
+        let moves = knightShuffle 780 // safe = 777 - 780 < 1 => MCTS hands the whole search to alpha-beta
+        let cfg = { defaultConfig with Threads = 1 }
+        let lim = { defaultLimits with Depth = 4 }
+
+        let runWith (search: SearchControl -> Move) =
+            let tt = TranspositionTable(max 1 cfg.HashMb)
+            search (SearchControl(cfg, lim, tt, StartPosFen, moves, ?net = Some net))
+
+        Assert.Equal(toUci (runWith Eonego.Search.go), toUci (runWith mctsSearch))
+
+[<Fact>]
+let ``parallel mctsSearch returns a legal, coherent merged decision`` () =
+    match tryLoadSfNet () with
+    | None -> () // soft-skip: needs the SF leaf eval to see the won queen
+    | Some net ->
+        let fen = "4k3/8/8/3q4/4P3/8/8/3RK3 w - - 0 1" // exd5 wins the queen
+        let cfg = { defaultConfig with Threads = 4 }
+        let lim = { defaultLimits with Depth = 1 } // 1000 iters/worker; the αβ leaf supplies the value
+        let tt = TranspositionTable(max 1 cfg.HashMb)
+        let control = SearchControl(cfg, lim, tt, fen, [||], ?net = Some net)
+        let m = mctsSearch control
+        let p = Position()
+        p.LoadFen fen
+        let legal = collectLegal p |> Array.map toUci
+        Assert.Contains(toUci m, legal) // the merged bestmove is legal
+        Assert.Equal(toUci control.LastBest, toUci m) // bestmove == the published merged decision
+        Assert.Equal(mkSquare 3 4, toSq m) // exd5: destination d5
+        Assert.True(control.LastScore > 300, "merged score should reflect the won queen, got " + string control.LastScore)
+
+[<Fact>]
+let ``go depth iteration budget is global across threads, not multiplied per worker`` () =
+    match tryLoadSfNet () with
+    | None -> () // soft-skip: the leaf eval needs the SF net
+    | Some net ->
+        // `go depth 2` => 2000 total iterations. With a GLOBAL budget that total holds regardless of thread
+        // count (Threads splits it), instead of the old per-worker budget where Threads=4 did 4×2000=8000.
+        let run threads =
+            let cfg = { defaultConfig with Threads = threads; MctsLeafDepth = 0 } // qsearch leaf => fast
+            let lim = { defaultLimits with Depth = 2 }
+            let tt = TranspositionTable(max 1 cfg.HashMb)
+            let control = SearchControl(cfg, lim, tt, StartPosFen, [||], ?net = Some net)
+            mctsSearch control |> ignore
+            control.IterSum()
+
+        Assert.Equal(2000L, run 1) // single worker: exactly the budget
+        let t4 = run 4
+        // ~2000 (a few extra from workers passing the check before the last increments land), NOT 4×2000.
+        Assert.True(t4 >= 2000L && t4 < 4000L, "Threads=4 total iters should be ~2000 (global), got " + string t4)

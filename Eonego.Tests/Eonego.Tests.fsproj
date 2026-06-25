@@ -9,7 +9,7 @@
     <Compile Include="TestFixtures.fs" />
     <Compile Include="SfAccumulatorTests.fs" />
     <Compile Include="SfNnueTests.fs" />
-    <Compile Include="MontyPolicyTests.fs" />
+    <Compile Include="Lc0NetTests.fs" />
     <Compile Include="BitboardTests.fs" />
     <Compile Include="MoveTests.fs" />
     <Compile Include="ZobristTests.fs" />

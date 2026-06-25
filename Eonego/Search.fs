@@ -97,7 +97,7 @@ type SearchConfig =
       MctsCpuct: int // PUCT exploration constant, fixed-point ×100 (150 => 1.5)
       MctsLeafDepth: int // fixed negamax depth at each MCTS leaf (0 => qsearch-only leaf)
       MctsK: int // logistic cp->winprob scale (centipawns); match the training K
-      UsePolicy: bool } // use policy network for MCTS priors (MontyPolicy.fs); requires a loaded policy net
+      UseLc0: bool } // use the Lc0 CNN (Lc0Net.fs) for MCTS priors; requires a loaded Lc0 net (else history fallback)
 
 type SearchLimits =
     { MoveTime: int
@@ -131,7 +131,7 @@ let defaultConfig =
       MctsCpuct = 150
       MctsLeafDepth = 6
       MctsK = 200
-      UsePolicy = false }
+      UseLc0 = false }
 
 let defaultLimits =
     { MoveTime = 0
@@ -246,7 +246,7 @@ let isLegalRoot (pos: Position) (m: Move) : bool =
 // ---------------------------------------------------------------------------
 [<Sealed>]
 type SearchControl
-    (config: SearchConfig, limits: SearchLimits, tt: TranspositionTable, rootFen: string, rootMoves: Move[], ?net: SfNetwork, ?policyNet: MontyPolicy.PolicyNetwork) =
+    (config: SearchConfig, limits: SearchLimits, tt: TranspositionTable, rootFen: string, rootMoves: Move[], ?net: SfNetwork, ?lc0Net: Lc0Proto.Lc0Net) =
     let mutable stopFlag = 0
     let sw = System.Diagnostics.Stopwatch()
     let mutable softMs = 0L
@@ -258,11 +258,14 @@ type SearchControl
     member _.RootFen = rootFen
     member _.RootMoves = rootMoves
     member _.Net: SfNetwork option = net
-    member _.PolicyNet: MontyPolicy.PolicyNetwork option = policyNet
+    member _.Lc0Net: Lc0Proto.Lc0Net option = lc0Net
     member val LastBest: Move = MoveNone with get, set // result of the most recent go()
     member val LastScore: int = 0 with get, set
     /// Aggregate live node count across all workers (relaxed reads — reporting only, set by go()).
     member val NodeSum: unit -> int64 = (fun () -> 0L) with get, set
+    /// Aggregate completed MCTS iteration count across all workers (reporting only, set by mctsSearch()).
+    /// UCI `info nodes`/`nps` reports this for MCTS; `go nodes N` limits still use NodeSum (leaf nodes).
+    member val IterSum: unit -> int64 = (fun () -> 0L) with get, set
     member _.Stopped: bool = Volatile.Read(&stopFlag) <> 0
     member _.Stop() = Volatile.Write(&stopFlag, 1)
     member _.Reset() = Volatile.Write(&stopFlag, 0)
@@ -305,7 +308,18 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     let exclScoreBuf: int[] = Array.zeroCreate (MaxSearchPly * MaxMoves)
     let exclQuietsBuf: Move[] = Array.zeroCreate (MaxSearchPly * MaxMoves)
     let pv: Move[] = Array.zeroCreate (MaxSearchPly * MaxSearchPly)
+    // Lc0 prior-output buffer (one per Worker, reused every MCTS expand).
+    let lc0Priors: float32[]     = Array.zeroCreate 256
+    // Lc0 CNN input-plane scratch (112*64); the forward pass uses the per-Worker Lc0Scratch below.
+    let lc0InBuf: float32[]      = Array.zeroCreate (Lc0Encoder.Planes * 64)
+    // Lc0 forward-pass scratch — ONE allocation per Worker, reused every expand (was per-call before). Built
+    // only when an Lc0 net is loaded; null otherwise (the Lc0 expand branch is gated on the net's presence).
+    let lc0Scratch: Lc0Net.Lc0Scratch =
+        match control.Lc0Net with
+        | Some n when control.Config.UseLc0 -> Lc0Net.Lc0Scratch(n)
+        | _ -> Unchecked.defaultof<Lc0Net.Lc0Scratch>
     let mutable nodes = 0L
+    let mutable iters = 0L
     let mutable selDepth = 0
     let mutable rootBest = MoveNone
     let mutable rootScore = 0
@@ -324,10 +338,17 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     member _.ExclScoreBuf = exclScoreBuf
     member _.ExclQuietsBuf = exclQuietsBuf
     member _.Pv = pv
+    member _.Lc0Priors       = lc0Priors
+    member _.Lc0InBuf        = lc0InBuf
+    member _.Lc0Scratch      = lc0Scratch
 
     member _.Nodes
         with get () = nodes
         and set v = nodes <- v
+
+    /// Completed MCTS iteration count for this worker. Incremented after each backed-up iteration.
+    member _.Iters = iters
+    member _.IncIters() = iters <- iters + 1L
 
     member _.SelDepth
         with get () = selDepth
@@ -362,6 +383,7 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
 
         tables.Clear()
         nodes <- 0L
+        iters <- 0L
         selDepth <- 0
         rootBest <- MoveNone
         rootScore <- 0
