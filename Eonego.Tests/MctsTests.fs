@@ -395,3 +395,40 @@ let ``mctsSearch reuses the same tree object for a played move`` () =
         // search 2 extends by e2e4: worker 0 should lazily promote that subtree, i.e. keep the SAME tree object.
         mctsSearch (mk StartPosFen [| e2e4 |]) reuse |> ignore
         Assert.True(obj.ReferenceEquals(reuse.Tree, treeAfter1), "expected the e2e4 subtree to be reused")
+
+[<Fact>]
+let ``Compact preserves the live subtree and drops garbage`` () =
+    let tree = MctsTree()
+    let root = tree.AllocNode 0
+    let pos = Position()
+    pos.LoadFen StartPosFen
+    let legal = collectLegal pos
+    let eb = tree.AllocEdges 2
+    tree.SetEdge(eb, legal.[0], 0.5f)
+    tree.SetEdge(eb + 1, legal.[1], 0.5f)
+    tree.SetNodeEdges(root, eb, 2)
+    // child0 with a grandchild — the live subtree to keep.
+    let c0 = tree.AllocNode 1
+    tree.SetEdgeChild(eb, c0)
+    tree.AddVisit(c0, 0.7f)
+    let geb = tree.AllocEdges 1
+    tree.SetEdge(geb, legal.[2], 1.0f)
+    let gc = tree.AllocNode 0
+    tree.SetEdgeChild(geb, gc)
+    tree.AddVisit(gc, 0.3f)
+    tree.SetNodeEdges(c0, geb, 1)
+    // child1 — becomes unreachable garbage when we compact around c0.
+    let c1 = tree.AllocNode 1
+    tree.SetEdgeChild(eb + 1, c1)
+    tree.AddVisit(c1, 0.4f)
+    Assert.Equal(4, tree.NodeCount) // root, c0, gc, c1
+    // compact the subtree rooted at c0: keeps c0 + gc (2 nodes), drops root + c1.
+    let (compacted, newRoot) = tree.Compact c0
+    Assert.Equal(2, compacted.NodeCount)
+    Assert.Equal(1, compacted.NodeN newRoot)
+    Assert.True(abs (compacted.NodeW newRoot - 0.7f) < 1e-6f)
+    Assert.Equal(1, compacted.NodeNumEdges newRoot)
+    let ngc = compacted.EdgeChild(compacted.NodeFirstEdge newRoot)
+    Assert.True(ngc >= 0) // the grandchild survived with its stats
+    Assert.Equal(1, compacted.NodeN ngc)
+    Assert.True(abs (compacted.NodeW ngc - 0.3f) < 1e-6f)

@@ -204,6 +204,59 @@ type MctsTree(nodeCap: int, edgeCap: int) =
 
         result
 
+    /// Overwrite a node's accumulated stats (used by Compact when copying a live subtree).
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+    member _.SetNodeStats(i, n, w, proven, proofPly) =
+        nodes.[i].N <- n
+        nodes.[i].W <- w
+        nodes.[i].Proven <- proven
+        nodes.[i].ProofPly <- proofPly
+
+    /// Compaction for tree reuse: copy the live subtree reachable from `rootIdx` into a fresh tree, dropping
+    /// the unreachable garbage that lazy root promotion leaves behind. Returns the new tree + its root index.
+    /// Iterative BFS (no recursion) with an old->new index map; children are allocated when first seen.
+    member this.Compact(rootIdx: int) : MctsTree * int =
+        let dst = MctsTree(max 1 nodeCount, max 1 edgeCount)
+        let map = Array.create nodeCount -1
+        let queue = System.Collections.Generic.Queue<int>()
+        let newRoot = dst.AllocNode(nodes.[rootIdx].Stm)
+        map.[rootIdx] <- newRoot
+        queue.Enqueue rootIdx
+
+        while queue.Count > 0 do
+            let oldN = queue.Dequeue()
+            let newN = map.[oldN]
+            dst.SetNodeStats(newN, nodes.[oldN].N, nodes.[oldN].W, nodes.[oldN].Proven, nodes.[oldN].ProofPly)
+            let ne = nodes.[oldN].NumEdges
+
+            if ne > 0 then
+                let oldFe = nodes.[oldN].FirstEdge
+                let newFe = dst.AllocEdges ne
+
+                for k in 0 .. ne - 1 do
+                    let oldEdge = oldFe + k
+                    let oldChild = edges.[oldEdge].Child
+
+                    let newChild =
+                        if oldChild < 0 then
+                            -1
+                        elif map.[oldChild] >= 0 then
+                            map.[oldChild]
+                        else
+                            let c = dst.AllocNode(nodes.[oldChild].Stm)
+                            map.[oldChild] <- c
+                            queue.Enqueue oldChild
+                            c
+
+                    dst.SetEdge(newFe + k, edges.[oldEdge].Move, edges.[oldEdge].Prior)
+
+                    if newChild >= 0 then
+                        dst.SetEdgeChild(newFe + k, newChild)
+
+                dst.SetNodeEdges(newN, newFe, ne)
+
+        (dst, newRoot)
+
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member _.SetEdge(i, m, prior) =
         edges.[i].Move <- m
@@ -1267,6 +1320,9 @@ let private runParallel
 [<Literal>]
 let private ReuseNodeCap = 6_000_000 // discard a reuse tree past this many nodes (lazy promotion leaks garbage)
 
+[<Literal>]
+let private CompactThreshold = 2_000_000 // compact the live subtree (drop garbage) once the reuse tree exceeds this
+
 /// Persistent single-tree reuse across `go` commands (worker 0 only): the last search's worker-0 tree plus
 /// the position (FEN + applied moves) it corresponds to. Null Tree = nothing to reuse (first go / ucinewgame).
 [<Sealed>]
@@ -1320,7 +1376,16 @@ let private tryPromoteReuse (control: SearchControl) (reuse: MctsReuse) : int =
 
                     j <- j + 1
 
-                if ok then r else -1
+                if not ok then
+                    -1
+                elif reuse.Tree.NodeCount > CompactThreshold then
+                    // the tree has grown large with promotion garbage; compact the live subtree (preserves reuse).
+                    let (compacted, newRoot) = reuse.Tree.Compact(r)
+                    reuse.Tree <- compacted
+                    reuse.Root <- newRoot
+                    newRoot
+                else
+                    r
 
 /// Root-parallel MCTS body (mirrors Search.go): N workers, periodic info from the driver, exactly one
 /// bestmove from the MERGED root statistics. Parallel results are timing-nondeterministic (same as LazySMP);
