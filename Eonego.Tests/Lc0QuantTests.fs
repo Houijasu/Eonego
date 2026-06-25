@@ -76,3 +76,61 @@ let ``Lc0Quant i8Matvec tracks fp32 reference within int8 tolerance`` () =
         maxd <- max maxd (abs (refOut.[r] - i8Out.[r]))
 
     Assert.True(maxd < 0.5f, sprintf "i8Matvec max abs error %f vs fp32" maxd)
+
+[<Fact>]
+let ``Lc0Quant i8Conv is bit-exact AVX2==scalar and tracks fp32`` () =
+    // (inC, outC, k, nPos): exercises k=1 & k=3, single & batched boards, and a non-32-multiple kk tail (inC=10 -> kk=90).
+    for struct (inC, outC, k, nPos) in
+        [ struct (32, 16, 3, 1)
+          struct (10, 8, 3, 2)
+          struct (64, 8, 1, 1)
+          struct (48, 12, 1, 2) ] do
+        let sp = nPos * 64
+        let kk = inC * k * k
+        let half = k / 2
+        let rng = mkRng (inC * 100 + outC * 7 + k * 3 + nPos)
+        let unit () = float32 (rng () % 100000u) / 100000.0f
+
+        let input = Array.init (inC * sp) (fun _ -> unit () * 3.0f) // post-ReLU >= 0
+        let wF = Array.init (outC * kk) (fun _ -> unit () - 0.5f)
+        let bias = Array.init outC (fun _ -> unit () - 0.5f)
+
+        let struct (wI8, wScale) = quantizeRowsI8 wF outC kk
+
+        let outA = Array.zeroCreate<float32> (outC * sp)
+        let outS = Array.zeroCreate<float32> (outC * sp)
+        i8Conv true input inC outC k nPos wI8 wScale bias (Array.zeroCreate<byte> (inC * sp)) (Array.zeroCreate<byte> (sp * kk)) outA
+        i8Conv false input inC outC k nPos wI8 wScale bias (Array.zeroCreate<byte> (inC * sp)) (Array.zeroCreate<byte> (sp * kk)) outS
+
+        // (1) AVX2 == scalar bit-exact (identical int dot + identical float dequant).
+        for i in 0 .. outC * sp - 1 do
+            Assert.Equal(outS.[i], outA.[i])
+
+        // (2) fp32 broadcast-weight reference conv (same padding), within int8 tolerance.
+        let mutable maxd = 0.0f
+
+        for o in 0 .. outC - 1 do
+            for b in 0 .. nPos - 1 do
+                let boardBase = b * 64
+
+                for sy in 0..7 do
+                    for sx in 0..7 do
+                        let s = boardBase + sy * 8 + sx
+                        let mutable acc = bias.[o]
+
+                        for c in 0 .. inC - 1 do
+                            for ky in 0 .. k - 1 do
+                                let iy = sy + ky - half
+
+                                for kx in 0 .. k - 1 do
+                                    let ix = sx + kx - half
+
+                                    if iy >= 0 && iy < 8 && ix >= 0 && ix < 8 then
+                                        acc <-
+                                            acc
+                                            + wF.[o * kk + c * k * k + ky * k + kx]
+                                              * input.[c * sp + boardBase + iy * 8 + ix]
+
+                        maxd <- max maxd (abs (acc - outA.[o * sp + s]))
+
+        Assert.True(maxd < 0.6f, sprintf "i8Conv(inC=%d,k=%d,nPos=%d) max abs error %f vs fp32" inC k nPos maxd)
