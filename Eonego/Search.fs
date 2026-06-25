@@ -491,12 +491,14 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
         let mutable alpha = alphaIn
         let beta = betaIn
         let mutable ttMove = MoveNone
+        let mutable ttEval = VALUE_NONE
 
         if useTt then
-            let struct (hit, m, _, _, _, _, _) = w.Control.Tt.Probe pos.Key
+            let struct (hit, m, _, ev, _, _, _) = w.Control.Tt.Probe pos.Key
 
             if hit then
                 ttMove <- m
+                ttEval <- ev
 
         let mutable best = -INF
         let mutable bestMove = MoveNone
@@ -504,7 +506,10 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
         let mutable cutoff = false
 
         if not inCheck then
-            let sp = evalPos w pos
+            // Stand-pat: reuse the TT-stored static eval when present (it is the same deterministic
+            // evalPos value qsearch would recompute and store), mirroring negamax. Bit-exact, skips the
+            // NNUE forward on a TT hit.
+            let sp = if ttEval <> VALUE_NONE then ttEval else evalPos w pos
             rawEval <- sp
             best <- sp
 
