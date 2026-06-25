@@ -294,3 +294,89 @@ let ``Lc0 int8 quantization of PolicyW keeps the policy (top move + logits)`` ()
 
             Assert.Equal(af, aq) // the top policy move must survive int8
             Assert.True(maxd < 1.0f, sprintf "int8 PolicyW max logit diff %f (logits are O(1..10))" maxd)
+
+// ---------------------------------------------------------------------------
+// Decisive int8 go/no-go gate (whole-net WEIGHT quant). The PolicyW gate above proves the single biggest
+// matrix survives int8; this proves the *entire* forward does: per-output-channel symmetric int8
+// quant+dequant of EVERY weight stream (input conv, all 21 residual blocks' conv1/conv2 + SE FCs, the
+// policy conv + FC, and the value conv + 2 FCs), then run the full AVX2 forward and require the top policy
+// move to be unchanged and the value to barely move. Error compounds across ~45 quantized layers, so this
+// is a far stronger statement than the one-matrix gate. Layout is uniformly [outDim][inDim] row-major
+// (verified against fcMatvec/conv call sites), so per-output-channel == per-row here.
+//   NB: this validates WEIGHT quant only. A real int8 kernel also quantizes ACTIVATIONS to int8 (int32
+//   accumulate); activation quant is the separate, harder gate that must pass before any kernel work.
+// ---------------------------------------------------------------------------
+
+/// Per-row (per-output-channel) symmetric int8 quant+dequant of a [rows][rowLen] weight matrix.
+let private q8 (w: float32[]) (rowLen: int) : float32[] =
+    let rows = w.Length / rowLen
+    let dq = Array.zeroCreate<float32> w.Length
+
+    for r in 0 .. rows - 1 do
+        let b = r * rowLen
+        let mutable mx = 0.0f
+
+        for c in 0 .. rowLen - 1 do
+            mx <- max mx (abs w.[b + c])
+
+        let scale = if mx > 0.0f then mx / 127.0f else 1.0f
+
+        for c in 0 .. rowLen - 1 do
+            let qc = max -127.0f (min 127.0f (System.MathF.Round(w.[b + c] / scale)))
+            dq.[b + c] <- qc * scale
+
+    dq
+
+let private q8conv (cb: Eonego.Lc0Proto.Lc0ConvBlock) =
+    { cb with W = q8 cb.W (cb.W.Length / cb.OutC) }
+
+let private q8se (se: Eonego.Lc0Proto.Lc0SE) =
+    { se with
+        W1 = q8 se.W1 (se.W1.Length / se.SeCh) // [seCh][C]
+        W2 = q8 se.W2 (se.W2.Length / (2 * se.C)) } // [2C][seCh]
+
+[<Fact>]
+let ``Lc0 int8 quantization of the whole net keeps top move and value`` () =
+    match tryNetPath () with
+    | None -> ()
+    | Some p ->
+        match load p with
+        | Failed r -> Assert.Fail r
+        | Loaded net ->
+            let pos = Position.OfFen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+            let inBuf = Array.zeroCreate<float32> (112 * 64)
+            Eonego.Lc0Encoder.encodeInto pos inBuf
+
+            let netQ =
+                { net with
+                    Input = q8conv net.Input
+                    Tower =
+                        net.Tower
+                        |> Array.map (fun r ->
+                            { r with
+                                Conv1 = q8conv r.Conv1
+                                Conv2 = q8conv r.Conv2
+                                Se = q8se r.Se })
+                    PolicyConv = q8conv net.PolicyConv
+                    PolicyW = q8 net.PolicyW (net.PolicyW.Length / Eonego.Lc0PolicyMap.NumPolicy)
+                    ValueConv = q8conv net.ValueConv
+                    Value1W = q8 net.Value1W (net.Value1W.Length / net.Value1B.Length)
+                    Value2W = q8 net.Value2W net.Value2W.Length }
+
+            let struct (lf, vf) = Eonego.Lc0Net.forward true net (Eonego.Lc0Net.Lc0Scratch(net)) inBuf
+            let struct (lq, vq) = Eonego.Lc0Net.forward true netQ (Eonego.Lc0Net.Lc0Scratch(netQ)) inBuf
+
+            let mutable maxd = 0.0f
+            let mutable af = 0
+            let mutable aq = 0
+
+            for i in 0 .. 1857 do
+                maxd <- max maxd (abs (lf.[i] - lq.[i]))
+                if lf.[i] > lf.[af] then af <- i
+                if lq.[i] > lq.[aq] then aq <- i
+
+            // The critical property: the move MCTS would prioritise must not change under int8 weights.
+            Assert.Equal(af, aq)
+            // Value drives leaf Q in a pure-Lc0 design; require it to barely move (eval is in [-1,1]).
+            Assert.True(abs (vf - vq) < 0.05f, sprintf "whole-net int8 value %f vs %f (diff %f)" vf vq (abs (vf - vq)))
+            Assert.True(maxd < 2.0f, sprintf "whole-net int8 max logit diff %f (logits are O(1..10))" maxd)
