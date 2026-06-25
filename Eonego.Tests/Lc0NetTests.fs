@@ -242,3 +242,55 @@ let ``Lc0 forwardBatch matches single forward for every board`` () =
                 for i in 0 .. 1857 do
                     maxDiff <- max maxDiff (abs (outLogits.[b * 1858 + i] - logits1.[i]))
                 Assert.True(maxDiff < 1e-3f, sprintf "board %d policy max diff %f" b maxDiff)
+
+// ---------------------------------------------------------------------------
+// int8 viability analysis (gates a future int8-weights effort): per-channel symmetric int8 quant+dequant of
+// the dominant weight matrix (PolicyW, 1858 x 256*64 = the biggest weight stream) must barely move the policy
+// logits and must NOT change the top move. If this holds, int8 weights are accuracy-safe; if not, finer
+// quantization is needed before any kernel work.
+// ---------------------------------------------------------------------------
+[<Fact>]
+let ``Lc0 int8 quantization of PolicyW keeps the policy (top move + logits)`` () =
+    match tryNetPath () with
+    | None -> ()
+    | Some p ->
+        match load p with
+        | Failed r -> Assert.Fail r
+        | Loaded net ->
+            let pos = Position.OfFen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+            let inBuf = Array.zeroCreate<float32> (112 * 64)
+            Eonego.Lc0Encoder.encodeInto pos inBuf
+
+            // per-row (per-output-channel) symmetric int8 quant+dequant of PolicyW.
+            let cols = 256 * 64
+            let rows = 1858
+            let pw = net.PolicyW
+            let dq = Array.zeroCreate<float32> pw.Length
+
+            for r in 0 .. rows - 1 do
+                let mutable mx = 0.0f
+                for c in 0 .. cols - 1 do
+                    mx <- max mx (abs pw.[r * cols + c])
+
+                let scale = if mx > 0.0f then mx / 127.0f else 1.0f
+
+                for c in 0 .. cols - 1 do
+                    let q = System.MathF.Round(pw.[r * cols + c] / scale)
+                    let qc = max -127.0f (min 127.0f q)
+                    dq.[r * cols + c] <- qc * scale
+
+            let netQ = { net with PolicyW = dq }
+            let struct (lf, _) = Eonego.Lc0Net.forward true net (Eonego.Lc0Net.Lc0Scratch(net)) inBuf
+            let struct (lq, _) = Eonego.Lc0Net.forward true netQ (Eonego.Lc0Net.Lc0Scratch(netQ)) inBuf
+
+            let mutable maxd = 0.0f
+            let mutable af = 0
+            let mutable aq = 0
+
+            for i in 0 .. 1857 do
+                maxd <- max maxd (abs (lf.[i] - lq.[i]))
+                if lf.[i] > lf.[af] then af <- i
+                if lq.[i] > lq.[aq] then aq <- i
+
+            Assert.Equal(af, aq) // the top policy move must survive int8
+            Assert.True(maxd < 1.0f, sprintf "int8 PolicyW max logit diff %f (logits are O(1..10))" maxd)
