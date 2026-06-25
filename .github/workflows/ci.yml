@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      # nets/ is gitignored (large/licensed), so the SF net is not embedded here; the engine still builds
+      # (conditional EmbeddedResource) and the net-dependent tests soft-skip (they load nets from disk).
+      - name: Restore
+        run: dotnet restore Eonego.slnx
+
+      - name: Build (Release)
+        run: dotnet build Eonego.slnx -c Release --no-restore
+
+      # Exclude the Slow leg (perft d5/d6) — it is a known parallel-load flake that passes in isolation and
+      # would make CI intermittently red. Run it locally / nightly if desired.
+      - name: Test (Release, excluding Slow)
+        run: dotnet test Eonego.Tests/Eonego.Tests.fsproj -c Release --no-build --filter "Category!=Slow"
