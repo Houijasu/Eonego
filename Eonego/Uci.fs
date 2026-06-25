@@ -230,7 +230,15 @@ let private startSearch (st: UciState) (lim: SearchLimits) =
                           | true, v when v >= 1 -> v
                           | _ -> 1
                   else
-                      1 }
+                      1
+              // No-Lc0 fallback only: EONEGO_EVAL_PRIORS uses SF-NNUE static-eval priors instead of history
+              // (principled-but-tactically-blind, experimental, SPRT-gated). Ignored when Lc0 drives priors.
+              UseEvalPriors =
+                  (not st.Lc0Net.IsSome)
+                  && (match System.Environment.GetEnvironmentVariable "EONEGO_EVAL_PRIORS" with
+                      | null
+                      | "" -> false
+                      | _ -> true) }
 
         let control =
             SearchControl(cfg, lim, st.Tt, st.RootFen, st.RootMoves, ?net = st.Net, ?lc0Net = st.Lc0Net, ?lc0Int8 = st.Lc0Int8)

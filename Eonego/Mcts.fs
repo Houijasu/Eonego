@@ -48,7 +48,8 @@ let MctsIterPerDepth = 1000 // `go depth N` (no time stop) => N * this many iter
 
 let private CpuctBase = 19652.0f // cpuct grows ~ln((parentN+base)/base) with visits (Lc0-style exploration)
 let private FpuReduction = 0.20f // FPU = clamp(parentQ - this*sqrt(explored prior mass), 0.05, 0.95)
-let private MctsPriorTemp = 1000.0f // softmax temperature over move-ordering scores
+let private MctsPriorTemp = 1000.0f // softmax temperature over move-ordering scores (history fallback)
+let private MctsEvalPriorTemp = 200.0f // softmax temperature over child static evals (cp) for eval-based priors
 // Periodic UCI info cadence: WALL-CLOCK, not iteration count. With Lc0 priors the driver runs a few it/s, so
 // an iteration-count trigger (e.g. every 256) would emit nothing for a minute+ and analysis looks frozen.
 let private MctsReportIntervalMs = 500L
@@ -455,12 +456,26 @@ let private expand (tree: MctsTree) (w: Worker) (nodeIdx: int) (allowDraw: bool)
 
                 tree.SetNodeEdges(nodeIdx, edgeBase, cnt)
             else
-                // History fallback: softmax over move-ordering scores.
+                // No-Lc0 fallback priors. Default = softmax over history move-ordering scores. With
+                // cfg.UseEvalPriors (EONEGO_EVAL_PRIORS, experimental): softmax over each child's SF-NNUE
+                // static eval — principled (prefers materially/positionally good moves over history junk like
+                // a2a3) but tactically blind; gated for SPRT. Eval costs one make/eval/unmake per child, tiny
+                // next to the leaf negamax. Both write int cp-scale scores into w.ScoreBuf, then share softmax.
                 let scores = w.ScoreBuf
+                let evalPriors = w.Control.Config.UseEvalPriors
+                let temp = if evalPriors then MctsEvalPriorTemp else MctsPriorTemp
                 let mutable maxScore = System.Int32.MinValue
 
                 for i in 0 .. cnt - 1 do
-                    let s = scoreMove pos tables stm moves.[i]
+                    let s =
+                        if evalPriors then
+                            pos.Make moves.[i]
+                            let e = evalPos w pos // opponent-POV static eval after our move
+                            pos.Unmake moves.[i]
+                            -e // our POV: a good move leaves the opponent with a low eval
+                        else
+                            scoreMove pos tables stm moves.[i]
+
                     scores.[i] <- s
 
                     if s > maxScore then
@@ -470,7 +485,7 @@ let private expand (tree: MctsTree) (w: Worker) (nodeIdx: int) (allowDraw: bool)
                 let mutable sum = 0.0f
 
                 for i in 0 .. cnt - 1 do
-                    let wgt = MathF.Exp(float32 (scores.[i] - maxScore) / MctsPriorTemp)
+                    let wgt = MathF.Exp(float32 (scores.[i] - maxScore) / temp)
                     tree.SetEdge(edgeBase + i, moves.[i], wgt) // store the raw weight; normalize below
                     sum <- sum + wgt
 

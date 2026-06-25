@@ -195,6 +195,23 @@ let ``leaf search makes the hybrid win a hanging queen`` () =
         Assert.True(score > 300, "expected a decisive material win, got " + string score)
 
 [<Fact>]
+let ``eval-based priors steer the no-Lc0 fallback to a principled opening`` () =
+    // The history-softmax fallback can prioritise junk (a2a3); UseEvalPriors softmaxes each child's SF-NNUE
+    // static eval, which prefers central/developing moves. A shallow leaf keeps the PRIOR (not a deep leaf
+    // search) the dominant influence on the visit distribution, so this exercises the prior itself.
+    match tryLoadSfNet () with
+    | None -> () // soft-skip: eval priors need the SF net
+    | Some net ->
+        let cfg = { defaultConfig with UseMcts = true; MctsLeafDepth = 2; MctsK = 200; UseEvalPriors = true }
+        let struct (_, _, m) = mctsToIterations StartPosFen [||] 200 cfg (Some net)
+        let best = toUci m
+
+        let principled =
+            [ "e2e4"; "d2d4"; "g1f3"; "c2c4"; "b1c3"; "e2e3"; "d2d3"; "g2g3"; "f2f4"; "c2c3"; "b2b3"; "g1e2" ]
+
+        Assert.True(List.contains best principled, "eval-prior startpos best = " + best + " (expected a principled opening, not history junk)")
+
+[<Fact>]
 let ``single-thread fixed-iteration MCTS is deterministic`` () =
     let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1" // Kiwipete
     let struct (s1, _, m1) = mctsToIterations fen [||] 250 defaultConfig None

@@ -98,7 +98,8 @@ type SearchConfig =
       MctsLeafDepth: int // fixed negamax depth at each MCTS leaf (0 => qsearch-only leaf)
       MctsK: int // logistic cp->winprob scale (centipawns); match the training K
       UseLc0: bool // use the Lc0 CNN (Lc0Net.fs) for MCTS priors; requires a loaded Lc0 net (else history fallback)
-      MctsBatchSize: int } // >1: batch B leaves/worker through one Lc0 forward (virtual-loss gather); 1: single eval
+      MctsBatchSize: int // >1: batch B leaves/worker through one Lc0 forward (virtual-loss gather); 1: single eval
+      UseEvalPriors: bool } // no-Lc0 fallback: softmax over each child's SF-NNUE static eval instead of history scores
 
 type SearchLimits =
     { MoveTime: int
@@ -134,7 +135,8 @@ let defaultConfig =
       MctsLeafDepth = 6
       MctsK = 200
       UseLc0 = false
-      MctsBatchSize = 1 }
+      MctsBatchSize = 1
+      UseEvalPriors = false }
 
 let defaultLimits =
     { MoveTime = 0
