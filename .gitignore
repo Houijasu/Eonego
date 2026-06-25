@@ -90,9 +90,5 @@ trainer/*_state*.json
 nets/
 *.nnue
 *.network
-
-# Trainer scratch artifacts
-policy_data.bin
-
 # Downloaded Stockfish binary used only as a local parity oracle (GPL — never commit)
 tmp_sf/

@@ -905,7 +905,9 @@ type private MergedMove =
       mutable N: int // summed child visit counts across trees
       mutable W: float32 // summed child W (child POV) across trees
       mutable Proven: int // unioned proven tag (see combineProven)
-      mutable ProofPly: int } // mate distance for the unioned tag: shortest PrLoss / longest PrWin across trees
+      mutable ProofPly: int // mate distance for the unioned tag: shortest PrLoss / longest PrWin across trees
+      mutable Prior: float32 } // root-edge policy prior (tree 0); final tie-break so a 0-visit search still
+      // returns the policy's best move (the net's pick) instead of the first legal move.
 
 /// Union proven tags across trees. Order-independent / idempotent. A single worker's αβ-leaf mate proof is
 /// exact, so any PrLoss child (proven win for us) wins; any PrWin child (proven loss for us) is next; any
@@ -935,7 +937,8 @@ let private mergeRoots (trees: MctsTree[]) (roots: int[]) : MergedMove[] =
                   N = 0
                   W = 0.0f
                   Proven = PrUnknown
-                  ProofPly = 0 })
+                  ProofPly = 0
+                  Prior = t0.EdgePrior(fe0 + k) })
 
         for ti in 0 .. trees.Length - 1 do
             let t = trees.[ti]
@@ -988,6 +991,7 @@ let private bestMergedMove (acc: MergedMove[]) : Move * int =
         let mutable bestPly = 0
         let mutable bestN = System.Int32.MinValue
         let mutable bestQ = System.Single.NegativeInfinity
+        let mutable bestPrior = System.Single.NegativeInfinity
 
         for i in 0 .. acc.Length - 1 do
             let a = acc.[i]
@@ -1000,27 +1004,36 @@ let private bestMergedMove (acc: MergedMove[]) : Move * int =
             let qv = if a.N > 0 then 1.0f - a.W / float32 a.N else 0.0f
 
             // Mirror bestRootMove: shortest mate when winning, longest defence when losing, else visits then Q.
+            // Final tie-break = the policy prior, so a search that completed 0 iterations (all N=0 — e.g. a
+            // very short / cold-start time budget where root expansion alone ate the clock) still returns the
+            // net's highest-prior move instead of the first legal move. For visited nodes this only resolves
+            // exact N+Q ties, so normal search decisions are unchanged.
             let better =
                 if cat <> bestCat then
                     cat > bestCat
                 elif cat = 2 then
                     if a.ProofPly <> bestPly then a.ProofPly < bestPly
                     elif a.N <> bestN then a.N > bestN
-                    else qv > bestQ
+                    elif qv <> bestQ then qv > bestQ
+                    else a.Prior > bestPrior
                 elif cat = 0 then
                     if a.ProofPly <> bestPly then a.ProofPly > bestPly
                     elif a.N <> bestN then a.N > bestN
-                    else qv > bestQ
+                    elif qv <> bestQ then qv > bestQ
+                    else a.Prior > bestPrior
                 elif a.N <> bestN then
                     a.N > bestN
-                else
+                elif qv <> bestQ then
                     qv > bestQ
+                else
+                    a.Prior > bestPrior
 
             if better then
                 bestCat <- cat
                 bestPly <- a.ProofPly
                 bestN <- a.N
                 bestQ <- qv
+                bestPrior <- a.Prior
                 best <- i
 
         (acc.[best].Move, best)
@@ -1556,3 +1569,10 @@ let mctsToIterations
 
     let score = rootScoreCp tree rootIdx bestEi (float32 (max 1 cfg.MctsK))
     struct (score, w.Nodes, best)
+
+/// Test-only: the production merged root decision (mergeRoots |> bestMergedMove) over the given per-worker
+/// trees/roots. Exposed so a test can verify a 0-visit root returns the highest-prior move (the 0-iteration
+/// fallback) rather than the first edge.
+let mergedBestMoveForTest (trees: MctsTree[]) (roots: int[]) : Move =
+    let (mv, _) = bestMergedMove (mergeRoots trees roots)
+    mv

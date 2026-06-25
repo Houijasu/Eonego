@@ -195,6 +195,30 @@ let ``leaf search makes the hybrid win a hanging queen`` () =
         Assert.True(score > 300, "expected a decisive material win, got " + string score)
 
 [<Fact>]
+let ``a 0-visit root returns the highest-prior move, not the first legal move`` () =
+    // Regression: under a very short / cold-start time budget the MCTS can complete ZERO iterations (root
+    // expansion alone ate the clock). The bestmove then came from all-zero-visit edges, which fell to edge 0
+    // (the first legal move) — so the engine ignored the policy and played junk (it played b6b5 in a position
+    // where Qxg3+ was a forced mate with prior 0.79). Now the final tie-break is the prior, so a 0-visit root
+    // returns the net's best move. Build an expanded root with priors but no visits and verify.
+    let pos = Position.OfFen "r2r2k1/p1q2pb1/Qp4p1/3p4/3Np2p/2PnP1PP/PP3RK1/RNB5 b - - 0 22"
+    let moves = collectLegal pos
+    let tree = MctsTree(8, moves.Length + 4)
+    let root = tree.AllocNode(int pos.SideToMove)
+    let eb = tree.AllocEdges moves.Length
+
+    for i in 0 .. moves.Length - 1 do
+        tree.SetEdge(eb + i, moves.[i], 0.01f)
+
+    let target = moves.Length - 1 // a NON-first edge gets the dominant prior
+    tree.SetEdgePrior(eb + target, 0.9f)
+    tree.SetNodeEdges(root, eb, moves.Length)
+    // No children expanded => every edge has N = 0 (a 0-iteration search).
+    let best = mergedBestMoveForTest [| tree |] [| root |]
+    Assert.Equal(moves.[target], best) // the highest-prior move
+    Assert.NotEqual(moves.[0], best) // NOT the first legal move
+
+[<Fact>]
 let ``eval-based priors steer the no-Lc0 fallback to a principled opening`` () =
     // The history-softmax fallback can prioritise junk (a2a3); UseEvalPriors softmaxes each child's SF-NNUE
     // static eval, which prefers central/developing moves. A shallow leaf keeps the PRIOR (not a deep leaf
