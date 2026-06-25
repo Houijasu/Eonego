@@ -1,6 +1,6 @@
 # Eonego
 
-A from-scratch chess engine written in **F#** (.NET 10), built for speed and verified for correctness. Eonego implements a complete UCI-compatible search stack on top of a hand-tuned bitboard board representation: PEXT/magic sliders, a Stockfish-style staged move picker, alpha-beta / PVS search with LazySMP and aggressive forward pruning (ProbCut, log-based LMR, null-move, futility/SEE), and a lock-free transposition table — all allocation-free on the hot path and validated against published perft node counts and an in-test minimax oracle. Evaluation is a quantized **NNUE** (region-piececount net with an incrementally-updated, bit-exact int8 accumulator) with a material-only fallback, plus a self-contained Python **training pipeline** (`trainer/`).
+A from-scratch chess engine written in **F#** (.NET 10), built for speed and verified for correctness. Eonego runs a **Monte-Carlo Tree Search at the root with a fixed-depth alpha-beta / NNUE leaf** — a true MCTS + αβ hybrid — on top of a hand-tuned bitboard representation: PEXT/magic sliders, a Stockfish-style staged move picker, alpha-beta / PVS with LazySMP and aggressive forward pruning (ProbCut, log-based LMR, null-move, futility/SEE), and a lock-free transposition table — all allocation-free on the hot path and validated against published perft node counts and an in-test minimax oracle. The leaf eval is a from-scratch port of **Stockfish-16 NNUE** (embedded, incrementally-updated, AVX2); MCTS priors come from a from-scratch **Lc0 `20x256SE` CNN** (or a history-softmax fallback when no Lc0 net is present).
 
 - **Author:** Houijasu
 - **Language:** F# on `net10.0`
@@ -191,28 +191,26 @@ The material table `pieceValue {100, 320, 330, 500, 900, 0}` (Pawn..King) is the
 
 ## Evaluation
 
-Eonego has two evaluators behind one negamax-signed seam.
+The evaluation is **Stockfish-16 NNUE** (HalfKAv2_hm), ported from scratch and the **sole, mandatory** evaluator — there is no PeSTO/material fallback and no custom net.
 
-### Material eval (`Evaluation.fs`)
+### NNUE (`SfAccumulator.fs` → `SfNnue.fs`)
 
-A deliberately minimal **material-only** static eval — piece values summed white-relative — used when NNUE is off and as the cold fallback when no net loads. No PST / king safety / taper. 0 B/op, thread-safe, and it doubles as the bootstrap teacher for early self-play data. Checkmate / stalemate / repetition / 50-move / insufficient material remain the **search's** concern, never eval's.
-
-### NNUE (`NnueRegions.fs` → `NnueNetwork.fs` → `Nnue.fs`)
-
-A custom *region-piececount* network, fully quantized for int8/int16 inference:
-
-- **Features (2577):** 2448 region piece-counts (204 axis-aligned k×k sub-squares × 12 piece channels) + 1 side-to-move bit + a 128-entry king one-hot. The region accumulator is maintained incrementally on every `Make`/`Unmake`.
-- **Network:** `2577 → 64 → 32 → 16 → 16 → 1`, int8 weights (int16 output), int32 accumulate, per-layer right-shift + ClippedReLU(127), divided by `quantScale` to centipawns. The `EONGNNUE` v2 file format carries the header, per-layer shifts, and unpadded weights.
-- **Incremental first-layer accumulator:** the 64-wide L1 pre-activation is maintained across `Make`/`Unmake`/`MakeNull` by adding/subtracting precomputed folded weight columns (`PieceColSum` / `AuxCol`), so `evaluate` skips the wide GEMV and just reads the accumulator. This is **bit-exact** with the from-scratch recompute (the small L1 inputs never saturate the int16 path) and is what makes NNUE ~5–10× faster than recomputing.
-- **Kernels:** AVX2 (`vpmaddubsw` + `vpmaddwd`) with a bit-identical scalar fallback (`EONEGO_FORCE_SCALAR=1`), gated by `NnueL1AccumulatorTests` and the loader/forward parity suites.
-
-`Nnue.evaluate` reads the maintained accumulator, runs L2→L5, clamps to ±`EvalMax`, and applies the negamax sign. The engine **auto-loads `eonego.nnue` from beside the executable** with NNUE on by default; `setoption name UseNnue` / `NnueFile` override at runtime.
+`SfNnue.evalCp` runs the SF feature transformer + layer stack behind the one negamax-signed seam. The perspective accumulator is maintained **incrementally** across `Make`/`Unmake` (per-ply snapshot, dirty-piece deltas, king-move full refresh), so eval reads the maintained accumulator instead of recomputing. Kernels are AVX2 (`vpmaddubsw`/`vpmaddwd`) with a bit-identical scalar fallback (`EONEGO_FORCE_SCALAR=1`). The `sf16.nnue` net is **embedded in the binary** (self-contained exe); the engine refuses to search without it. Checkmate / stalemate / repetition / 50-move / insufficient material remain the **search's** concern, never eval's.
 
 ---
 
-## Search
+## Search — MCTS root + alpha-beta leaf
 
-`Search.fs` is a fail-soft **alpha-beta / PVS** search with **LazySMP** orchestration.
+The production search is a **true hybrid**: a Monte-Carlo Tree Search at the root (`Mcts.fs`, Baier–Winands MCTS-MB) whose every leaf is evaluated by the fixed-depth **alpha-beta / SF-NNUE** search described below (reused unchanged).
+
+- **Priors** come from a from-scratch **Lc0 `20x256SE` CNN** (`Lc0Net.fs` / `Lc0Proto.fs` / `Lc0Encoder.fs`) when a `.pb` net sits beside the exe or `EONEGO_LC0` points at one; otherwise a history-softmax fallback.
+- **MCTS-Solver** proves win/loss/draw **with mate distance** — it prefers the shortest forced mate and the longest defence, and reports the true `mate <n>`.
+- **Selection** is PUCT with **adaptive cpuct** (grows with parent visits) and a **parent-Q FPU** for unvisited children.
+- **Root-parallel** across `Threads` (N independent trees sharing only the lock-free TT + atomic stop flag, merged into one decision); `go depth N` is a **global** `N × 1000`-iteration budget split across the workers. A root too deep for a fixed-depth leaf falls back to plain alpha-beta.
+
+### Alpha-beta leaf (`Search.fs`)
+
+`Search.fs` is a fail-soft **alpha-beta / PVS** search with **LazySMP** orchestration — it is both the MCTS leaf evaluator and the standalone fallback engine.
 
 ### Workers and shared state
 
@@ -287,34 +285,23 @@ Stat updates use SF's "gravity" formula `entry += clamp(bonus,-D,D) - entry*|cla
 
 ## UCI interface
 
-`Uci.fs` is a minimal UCI driver. The search runs on its own master thread so the read loop stays responsive to `stop`/`quit`. All output goes through `Console.Out` — never `printfn` (the documented AOT crash). `go`, `quit`, `ucinewgame`, `setoption Hash`, and `position` all stop + join any active search first, so the TT is never resized/cleared under a live probe and exactly one `bestmove` is emitted per `go`.
+`Uci.fs` is a minimal UCI driver. The search runs on its own master thread so the read loop stays responsive to `stop`/`quit`. All output goes through `Console.Out` — never `printfn` (the documented AOT crash). `go`, `quit`, `ucinewgame`, `setoption`, and `position` all stop + join any active search first, so the TT is never cleared under a live probe and exactly one `bestmove` is emitted per `go`.
 
 ### Supported commands
 
 | Command | Behavior |
 |---|---|
-| `uci` | Emit `id name Eonego` / `id author Houijasu`, the `Hash` / `Threads` / pruning toggles / `UseNnue` / `NnueFile` options, and `uciok` |
+| `uci` | Emit `id name Eonego` / `id author Houijasu`, the `Threads` and `Move Overhead` options, and `uciok` |
 | `isready` | Reply `readyok` |
 | `ucinewgame` | Stop any search, clear the TT, reset to startpos |
 | `position [startpos \| fen <fields>] moves m1 m2 ...` | Set the root; UCI moves are re-stamped against legal generation (recovers EP/castling flags, disambiguates under-promotions) |
-| `go [depth \| nodes \| movetime \| wtime winc btime binc movestogo \| infinite \| mate]` | Start a search on the master thread; emit `info` lines and one `bestmove` |
+| `go [depth \| nodes \| movetime \| wtime winc btime binc movestogo \| infinite \| mate]` | Start the search on the master thread; emit `info` lines and one `bestmove` |
 | `stop` | Signal the atomic stop flag; the search exits at its next check point |
-| `setoption name Hash value <MB>` | Resize the TT (1..65536 MiB) after stopping any search |
-| `setoption name Threads value <N>` | Set LazySMP worker count (1..256) |
-| `setoption name UseProbCut value <true\|false>` | Toggle ProbCut forward pruning (default on) |
-| `setoption name UseIir value <true\|false>` | Toggle internal iterative reductions (default on) |
-| `setoption name UseRazoring value <true\|false>` | Toggle razoring at shallow depths (default on) |
-| `setoption name UseHistoryPruning value <true\|false>` | Toggle history-based quiet pruning (default on) |
-| `setoption name UseDeltaPruning value <true\|false>` | Toggle qsearch delta pruning (default on) |
-| `setoption name UseContHist value <true\|false>` | Toggle continuation-history ordering/updates (default on) |
-| `setoption name UseSingular value <true\|false>` | Toggle singular / double extensions (default on) |
-| `setoption name UseNmpVerify value <true\|false>` | Toggle null-move zugzwang verification (default on) |
-| `setoption name UseLmrTweaks value <true\|false>` | Toggle the richer LMR adjustments (default on) |
-| `setoption name UseAspTweaks value <true\|false>` | Toggle the aspiration-window refinements (default on) |
-| `setoption name MoveOverhead value <ms>` | Reserve I/O time per move, 0..5000 ms (default 10) |
-| `setoption name UseNnue value <true\|false>` | Toggle NNUE evaluation (default off; requires a loaded net via `NnueFile`) |
-| `setoption name NnueFile value <path>` | Load an NNUE network from disk; clears the TT on success |
+| `setoption name Threads value <N>` | Worker / root-parallel count (1..256) |
+| `setoption name Move Overhead value <ms>` | Reserve I/O time per move, 0..5000 ms (default 10) |
 | `quit` | Stop + join, then exit |
+
+Only `Threads` and `Move Overhead` are tunable; **everything else is hardwired ON for release** — MCTS, the full pruning stack, the fixed leaf depth, and a 256 MiB `Hash`. The SF leaf net is embedded in the binary; the optional Lc0 policy net loads from disk (`EONEGO_LC0`, or a `.pb` placed beside the exe).
 
 ### Defaults
 
