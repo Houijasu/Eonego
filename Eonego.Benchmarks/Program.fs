@@ -549,6 +549,61 @@ type MctsBench() =
             0
         | None -> 0
 
+/// Lc0 CNN forward throughput: fp32 `forward` vs int8 `forwardI8` (tower + heads on the saturation-safe
+/// u8xi8 kernels). The CNN is the MCTS-policy bottleneck, so this is the binding speed measurement for the
+/// int8 effort. Soft-skips (returns 0) if the Lc0 .pb is absent.
+[<MemoryDiagnoser>]
+[<ShortRunJob>]
+type Lc0ForwardBench() =
+    let mutable net: Eonego.Lc0Proto.Lc0Net option = None
+    let mutable q = Unchecked.defaultof<Eonego.Lc0Net.Lc0Int8>
+    let mutable scratch = Unchecked.defaultof<Eonego.Lc0Net.Lc0Scratch>
+    let mutable qs = Unchecked.defaultof<Eonego.Lc0Net.Lc0Int8Scratch>
+    let mutable input: float32[] = [||]
+
+    [<GlobalSetup>]
+    member _.Setup() =
+        let mutable dir = System.IO.DirectoryInfo(System.AppContext.BaseDirectory)
+        let mutable root = None
+
+        while root.IsNone && not (isNull dir) do
+            if System.IO.File.Exists(System.IO.Path.Combine(dir.FullName, "Eonego.slnx")) then
+                root <- Some dir.FullName
+
+            dir <- dir.Parent
+
+        match root with
+        | Some r ->
+            let p = System.IO.Path.Combine(r, "nets", "20x256SE-jj-9-75000000.pb")
+
+            if System.IO.File.Exists p then
+                match Eonego.Lc0Proto.load p with
+                | Eonego.Lc0Proto.Loaded n ->
+                    net <- Some n
+                    q <- Eonego.Lc0Net.quantize n
+                    scratch <- Eonego.Lc0Net.Lc0Scratch(n)
+                    qs <- Eonego.Lc0Net.Lc0Int8Scratch(n)
+                    input <- Array.zeroCreate (112 * 64)
+                    Eonego.Lc0Encoder.encodeInto (Position.OfFen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1") input
+                | _ -> ()
+        | None -> ()
+
+    [<Benchmark(Baseline = true)>]
+    member _.Fp32Forward() =
+        match net with
+        | Some n ->
+            let struct (_, v) = Eonego.Lc0Net.forward true n scratch input
+            v
+        | None -> 0.0f
+
+    [<Benchmark>]
+    member _.Int8Forward() =
+        match net with
+        | Some n ->
+            let struct (_, v) = Eonego.Lc0Net.forwardI8 true n q scratch qs input
+            v
+        | None -> 0.0f
+
 [<EntryPoint>]
 let main argv =
     // `--filter *` runs every benchmark non-interactively when no args are given.
@@ -563,7 +618,8 @@ let main argv =
                typeof<MovePickBench>
                typeof<EvalBench>
                typeof<SearchBench>
-               typeof<MctsBench> |]
+               typeof<MctsBench>
+               typeof<Lc0ForwardBench> |]
         )
         .Run(args)
     |> ignore
