@@ -360,10 +360,10 @@ type Lc0Int8Scratch(net: Lc0Net) =
     member val ActBuf: byte[] = Array.zeroCreate (net.PolicyConv.OutC * 64) // >= max FC k
     member val RawBuf: int[] = Array.zeroCreate Lc0PolicyMap.NumPolicy // >= max FC rows
 
-/// int8 forward: fp32 input conv + ReLU, then the SE-residual tower and policy/value heads through the int8
-/// conv/FC kernels (SE gate stays fp32). Returns (logits aliasing scratch.Logits, value). Mirrors `forward`
-/// buffer-for-buffer; `qs` byte buffers are reused across every conv/FC (each call fully overwrites its region).
-let forwardI8
+/// int8 forward up to the policy CONV + value head, but WITHOUT the 1858-row policy FC. Returns (polConv
+/// aliasing scratch.PolConv [polC*64], value). The production prior path computes only the ~30 legal logits
+/// from polConv (lc0PriorsFromPolConvI8), so it streams ~0.5 MB of PolicyW instead of the full ~30 MB.
+let forwardI8PolConv
     (useAvx2: bool)
     (net: Lc0Net)
     (q: Lc0Int8)
@@ -395,13 +395,11 @@ let forwardI8
         Lc0Quant.i8Conv useAvx2 tmp c2.InC c2.OutC c2.K 1 c2.W c2.Scale c2.B inU8 colT cur
         applySE useAvx2 net.Tower.[i].Se 1 cur resSave z s1 s2
 
-    // Policy head: int8 conv 256->256 (1x1) + ReLU -> int8 FC -> 1858 logits.
+    // Policy head conv 256->256 (1x1) + ReLU -> polConv (the 1858-row FC is done sparsely by the caller).
     let polC = net.PolicyConv.OutC
     let polConv = scratch.PolConv
     Lc0Quant.i8Conv useAvx2 cur q.PolicyConv.InC polC q.PolicyConv.K 1 q.PolicyConv.W q.PolicyConv.Scale q.PolicyConv.B inU8 colT polConv
     reluInPlace useAvx2 polConv 0 (polC * 64)
-    let logits = scratch.Logits
-    Lc0Quant.i8Matvec useAvx2 polConv 0 (polC * 64) q.PolicyW q.PolicyScale net.PolicyB Lc0PolicyMap.NumPolicy qs.ActBuf qs.RawBuf logits
 
     // Value head: int8 conv 256->64 (1x1) + ReLU -> int8 FC 4096->128 + ReLU -> int8 FC 128->1 -> tanh.
     let valC = net.ValueConv.OutC
@@ -414,7 +412,70 @@ let forwardI8
     let vout = scratch.Vout
     Lc0Quant.i8Matvec useAvx2 vh 0 net.Value1B.Length q.Value2W q.Value2Scale net.Value2B 1 qs.ActBuf qs.RawBuf vout
 
-    struct (logits, MathF.Tanh vout.[0])
+    struct (polConv, MathF.Tanh vout.[0])
+
+/// int8 forward with the FULL 1858-row policy FC. Returns (logits aliasing scratch.Logits, value). Used by the
+/// parity gate; production priors use the sparse forwardI8PolConv + lc0PriorsFromPolConvI8 path.
+let forwardI8
+    (useAvx2: bool)
+    (net: Lc0Net)
+    (q: Lc0Int8)
+    (scratch: Lc0Scratch)
+    (qs: Lc0Int8Scratch)
+    (input: float32[])
+    : struct (float32[] * float32) =
+    let struct (polConv, value) = forwardI8PolConv useAvx2 net q scratch qs input
+    let polC = net.PolicyConv.OutC
+    let logits = scratch.Logits
+    Lc0Quant.i8Matvec useAvx2 polConv 0 (polC * 64) q.PolicyW q.PolicyScale net.PolicyB Lc0PolicyMap.NumPolicy qs.ActBuf qs.RawBuf logits
+    struct (logits, value)
+
+/// Sparse policy: compute ONLY the legal moves' logits from polConv (one int8 i8Dot per legal row, bit-exact
+/// with the corresponding rows of the full i8Matvec) and softmax into outPriors. Streams ~30 PolicyW rows
+/// instead of all 1858. `actBuf` (>= polK) is caller scratch.
+let lc0PriorsFromPolConvI8
+    (useAvx2: bool)
+    (net: Lc0Net)
+    (q: Lc0Int8)
+    (polConv: float32[])
+    (polK: int)
+    (pos: Position)
+    (moves: Move[])
+    (count: int)
+    (actBuf: byte[])
+    (outPriors: float32[])
+    : unit =
+    if count = 1 then
+        outPriors.[0] <- 1.0f
+    else
+        let actScale = Lc0Quant.quantizeActsU8 polConv 0 polK actBuf
+        let stmIsBlack = (pos.SideToMove = Black)
+        let mutable mx = System.Single.NegativeInfinity
+
+        for i in 0 .. count - 1 do
+            let idx = Lc0PolicyMap.moveToNNIndex stmIsBlack moves.[i]
+
+            let l =
+                if idx >= 0 then
+                    let raw = Lc0Quant.i8Dot useAvx2 actBuf 0 q.PolicyW (idx * polK) polK
+                    float32 raw * actScale * q.PolicyScale.[idx] + net.PolicyB.[idx]
+                else
+                    -1e9f
+
+            outPriors.[i] <- l
+            if l > mx then mx <- l
+
+        let mutable sum = 0.0f
+
+        for i in 0 .. count - 1 do
+            let e = MathF.Exp(outPriors.[i] - mx)
+            outPriors.[i] <- e
+            sum <- sum + e
+
+        let inv = if sum > 0.0f then 1.0f / sum else 1.0f
+
+        for i in 0 .. count - 1 do
+            outPriors.[i] <- outPriors.[i] * inv
 
 /// Per-Worker BATCHED forward scratch, sized for up to `maxBatch` positions (maxBatch*64 spatial columns).
 /// Same role as Lc0Scratch but batched; `HeadTmp` repacks one board's strided conv output into the
@@ -568,6 +629,8 @@ let lc0PriorsIntoI8
     (outPriors: float32[])
     : float32 =
     Lc0Encoder.encodeInto pos inBuf
-    let struct (logits, value) = forwardI8 useAvx2 net q scratch qs inBuf
-    lc0PriorsFromLogits logits 0 pos moves count outPriors
+    // Sparse policy: skip the full 1858-row FC; compute only the legal moves' logits from polConv.
+    let struct (polConv, value) = forwardI8PolConv useAvx2 net q scratch qs inBuf
+    let polK = net.PolicyConv.OutC * 64
+    lc0PriorsFromPolConvI8 useAvx2 net q polConv polK pos moves count qs.ActBuf outPriors
     (value + 1.0f) * 0.5f

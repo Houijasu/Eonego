@@ -522,6 +522,41 @@ let ``Lc0 int8 activation quantization keeps a near-best move and value`` () =
 // using the actual i8Conv / i8Matvec kernels and per-channel scales (not the FakeQuantActs simulation). It
 // must track the fp32 forward on diverse positions: the move it prioritises is near-best under fp32 (regret
 // bound), and its value barely moves. This is the production-shaped path, so it is the binding accuracy test.
+// Sparse policy FC: lc0PriorsIntoI8 computes only the legal moves' logits from polConv, which must be
+// BIT-EXACT with softmaxing the legal rows of the full 1858-row i8Matvec (same i8Dot per row).
+[<Fact>]
+let ``Lc0 sparse policy priors are bit-exact with the full int8 forward`` () =
+    match tryNetPath () with
+    | None -> ()
+    | Some p ->
+        match load p with
+        | Failed r -> Assert.Fail r
+        | Loaded net ->
+            let q = Eonego.Lc0Net.quantize net
+            let scratch = Eonego.Lc0Net.Lc0Scratch(net)
+            let qs = Eonego.Lc0Net.Lc0Int8Scratch(net)
+
+            for fen in
+                [ "r1bqkb1r/pppp1ppp/2n2n2/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 0 4"
+                  "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1" ] do
+                let pos = Position.OfFen fen
+                let moves = Eonego.Tests.TestFixtures.collectLegal pos
+                let n = moves.Length
+                let inBuf = Array.zeroCreate<float32> (112 * 64)
+                Eonego.Lc0Encoder.encodeInto pos inBuf
+
+                // full 1858-row FC path
+                let struct (logits, _) = Eonego.Lc0Net.forwardI8 true net q scratch qs inBuf
+                let full = Array.zeroCreate<float32> n
+                Eonego.Lc0Net.lc0PriorsFromLogits logits 0 pos moves n full
+
+                // sparse path (production)
+                let sparse = Array.zeroCreate<float32> n
+                Eonego.Lc0Net.lc0PriorsIntoI8 true net q pos moves n inBuf scratch qs sparse |> ignore
+
+                for i in 0 .. n - 1 do
+                    Assert.Equal(full.[i], sparse.[i])
+
 // ---------------------------------------------------------------------------
 [<Fact>]
 let ``Lc0 forwardI8 tracks the fp32 forward (near-best move + value)`` () =
