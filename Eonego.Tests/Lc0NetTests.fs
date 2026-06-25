@@ -195,6 +195,23 @@ let ``Lc0 gives castling its main-line prior (king-to-rook encoding)`` () =
                 "O-O prior = " + priors.[ci].ToString("0.000") + " (expected the net's main-line castling prior; was ~0.005 before the king-to-rook fix)"
             )
 
+// Net-free lock on the king-captures-rook remap for ALL FOUR castling moves (white/black x king/queenside).
+// The prior regression above only exercises white O-O; this proves the flip + queenside path index correctly.
+[<Fact>]
+let ``Lc0 policy index maps every castling move to the rook square`` () =
+    let idxOf (u: string) = System.Array.IndexOf(Eonego.Lc0PolicyMap.nnIndexToUci, u)
+    let h1 = idxOf "e1h1" // kingside rook square, mover perspective
+    let a1 = idxOf "e1a1" // queenside rook square, mover perspective
+    let e1, g1, c1 = mkSquare 4 0, mkSquare 6 0, mkSquare 2 0
+    let e8, g8, c8 = mkSquare 4 7, mkSquare 6 7, mkSquare 2 7
+    Assert.True(h1 >= 0 && a1 >= 0, "e1h1/e1a1 must exist in the map")
+    // White (stm=white): e1g1->e1h1, e1c1->e1a1.
+    Assert.Equal(h1, Eonego.Lc0PolicyMap.moveToNNIndex false (mkCastling e1 g1))
+    Assert.Equal(a1, Eonego.Lc0PolicyMap.moveToNNIndex false (mkCastling e1 c1))
+    // Black (stm=black): e8g8/e8c8 flip into the mover frame -> the SAME e1h1/e1a1 slots.
+    Assert.Equal(h1, Eonego.Lc0PolicyMap.moveToNNIndex true (mkCastling e8 g8))
+    Assert.Equal(a1, Eonego.Lc0PolicyMap.moveToNNIndex true (mkCastling e8 c8))
+
 [<Fact>]
 let ``Lc0 forward pass: scalar==AVX2 and sane policy+value`` () =
     match tryNetPath () with
