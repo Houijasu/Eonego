@@ -73,6 +73,7 @@ type MctsNode =
       mutable Stm: int } // side-to-move at this node (debug/aux)
 
 [<Sealed>]
+[<AllowNullLiteral>] // a null MctsTree means "no reuse" on the tree-reuse path (worker 0)
 type MctsTree(nodeCap: int, edgeCap: int) =
     let mutable nodes: MctsNode[] = Array.zeroCreate nodeCap
     let mutable edges: MctsEdge[] = Array.zeroCreate edgeCap
@@ -185,6 +186,23 @@ type MctsTree(nodeCap: int, edgeCap: int) =
         let mutable n = &nodes.[i]
         n.N <- n.N - vl
         n.W <- n.W - float32 vl
+
+    /// Tree reuse (lazy root promotion): the EXPANDED child node reached by playing `move` from `rootIdx`,
+    /// or -1 if no root edge matches or its child is unexpanded. Lazy — the old root/siblings become
+    /// unreachable arena garbage (the caller compacts or discards; nothing is reindexed here).
+    member _.PromoteToChild(rootIdx: int, move: Move) : int =
+        let fe = nodes.[rootIdx].FirstEdge
+        let ne = nodes.[rootIdx].NumEdges
+        let mutable result = -1
+        let mutable k = 0
+
+        while result < 0 && k < ne do
+            if edges.[fe + k].Move = move then
+                result <- edges.[fe + k].Child // -1 if the edge exists but its child was never expanded
+
+            k <- k + 1
+
+        result
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member _.SetEdge(i, m, prior) =
@@ -1098,6 +1116,8 @@ let private runWorker
     (trees: MctsTree[])
     (roots: int[])
     (globalIters: int64[])
+    (reuseTree: MctsTree)
+    (reuseRoot: int)
     : struct (MctsTree * int * int) =
     let cfg = control.Config
     let cpuct = float32 cfg.MctsCpuct / 100.0f
@@ -1110,14 +1130,16 @@ let private runWorker
     // avoid mid-search reallocations; the arena still grows if the share runs over. (~40 edges/node.)
     let threads = max 1 cfg.Threads
     let perWorker = if maxIters > 0 then maxIters / threads + 256 else 0
+    // Tree reuse (worker 0 only): a non-null reuseTree is a prior search's tree already promoted to the
+    // current position's (expanded) root, so skip the fresh alloc + root expand and keep its accumulated stats.
+    let reusing = not (obj.ReferenceEquals(reuseTree, null))
 
     let tree =
-        if perWorker > 0 then
-            MctsTree(perWorker + 1, perWorker * 40 + 1024)
-        else
-            MctsTree()
+        if reusing then reuseTree
+        elif perWorker > 0 then MctsTree(perWorker + 1, perWorker * 40 + 1024)
+        else MctsTree()
 
-    let rootIdx = tree.AllocNode(int w.Pos.SideToMove)
+    let rootIdx = if reusing then reuseRoot else tree.AllocNode(int w.Pos.SideToMove)
     // Publish this worker's tree/root so the driver's periodic report can merge in-progress stats across all
     // workers (runParallel's final merge reads the same slots). roots first (plain int), then the tree via
     // Volatile (release) so any reader that observes the tree also observes its root index.
@@ -1130,7 +1152,8 @@ let private runWorker
         let maxTreeDepth = min 256 safe
         let pathNodes = Array.zeroCreate (maxTreeDepth + 1)
         let pathEdges = Array.zeroCreate (maxTreeDepth + 1)
-        expand tree w rootIdx false // root expanded once; allowDraw=false
+        if not reusing then
+            expand tree w rootIdx false // fresh root expanded once; a reused root is already expanded
         // Batched Lc0 eval: gather B leaves through ONE forwardBatch when Lc0 is active (amortizes weight RAM
         // bandwidth). Off (single-leaf runIteration) for history priors and batch size 1 — all current paths.
         let useBatch = cfg.UseLc0 && cfg.MctsBatchSize > 1 && control.Lc0Net.IsSome
@@ -1203,6 +1226,8 @@ let private runParallel
     (workers: Worker[])
     (control: SearchControl)
     (maxIters: int)
+    (reuseTree: MctsTree)
+    (reuseRoot: int)
     : struct (MctsTree[] * int[] * int) =
     let n = workers.Length
     let trees: MctsTree[] = Array.zeroCreate n
@@ -1210,7 +1235,8 @@ let private runParallel
     let globalIters = [| 0L |] // shared GLOBAL iteration budget — every worker charges it; budget splits ~N×
 
     // Each worker publishes its own trees.[Id]/roots.[Id] slot inside runWorker, so the driver can merge
-    // in-progress stats and the slots are already settled here after the join.
+    // in-progress stats and the slots are already settled here after the join. Only worker 0 reuses a prior
+    // tree (single persistent tree); the rest start fresh (null reuse).
     let threads =
         [| for i in 1 .. n - 1 ->
                let wi = workers.[i]
@@ -1218,7 +1244,7 @@ let private runParallel
                let t =
                    Thread(
                        ThreadStart(fun () ->
-                           runWorker wi control maxIters false false false trees roots globalIters
+                           runWorker wi control maxIters false false false trees roots globalIters null -1
                            |> ignore),
                        16 * 1024 * 1024
                    )
@@ -1227,8 +1253,10 @@ let private runParallel
                t.Start()
                t |]
 
-    // Driver on the calling thread: owns soft-time / stop-on-solved / reporting.
-    let struct (_, _, d0) = runWorker workers.[0] control maxIters true true true trees roots globalIters
+    // Driver on the calling thread: owns soft-time / stop-on-solved / reporting; reuses worker 0's prior tree.
+    let struct (_, _, d0) =
+        runWorker workers.[0] control maxIters true true true trees roots globalIters reuseTree reuseRoot
+
     control.Stop() // tell the non-driver workers to exit
 
     for t in threads do
@@ -1236,12 +1264,73 @@ let private runParallel
 
     struct (trees, roots, d0)
 
+[<Literal>]
+let private ReuseNodeCap = 6_000_000 // discard a reuse tree past this many nodes (lazy promotion leaks garbage)
+
+/// Persistent single-tree reuse across `go` commands (worker 0 only): the last search's worker-0 tree plus
+/// the position (FEN + applied moves) it corresponds to. Null Tree = nothing to reuse (first go / ucinewgame).
+[<Sealed>]
+type MctsReuse() =
+    member val Tree: MctsTree = null with get, set
+    member val Root: int = -1 with get, set
+    member val Fen: string = "" with get, set
+    member val Moves: Move[] = [||] with get, set
+
+    member this.Clear() =
+        this.Tree <- null
+        this.Root <- -1
+        this.Fen <- ""
+        this.Moves <- [||]
+
+/// Try to lazily promote `reuse`'s tree to `control`'s current position: the FEN must match and the reuse
+/// moves must be a prefix of the current moves; promote through the appended moves (each needs an expanded
+/// child). Returns the new root index (>= 0) on success, else -1 (the caller starts fresh).
+let private tryPromoteReuse (control: SearchControl) (reuse: MctsReuse) : int =
+    if obj.ReferenceEquals(reuse.Tree, null) then -1
+    elif reuse.Tree.NodeCount > ReuseNodeCap then -1
+    elif reuse.Fen <> control.RootFen then -1
+    else
+        let prev = reuse.Moves
+        let cur = control.RootMoves
+
+        if cur.Length < prev.Length then
+            -1
+        else
+            let mutable isPrefix = true
+            let mutable i = 0
+
+            while isPrefix && i < prev.Length do
+                if cur.[i] <> prev.[i] then isPrefix <- false
+                i <- i + 1
+
+            if not isPrefix then
+                -1
+            else
+                let mutable r = reuse.Root
+                let mutable ok = r >= 0
+                let mutable j = prev.Length
+
+                while ok && j < cur.Length do
+                    let c = reuse.Tree.PromoteToChild(r, cur.[j])
+
+                    if c >= 0 && reuse.Tree.NodeNumEdges c > 0 then
+                        r <- c
+                    else
+                        ok <- false
+
+                    j <- j + 1
+
+                if ok then r else -1
+
 /// Root-parallel MCTS body (mirrors Search.go): N workers, periodic info from the driver, exactly one
 /// bestmove from the MERGED root statistics. Parallel results are timing-nondeterministic (same as LazySMP);
 /// the deterministic test path goes through `runWorker` directly (Threads is irrelevant there).
-let private runMctsParallel (control: SearchControl) : Move =
+let private runMctsParallel (control: SearchControl) (reuse: MctsReuse) : Move =
     control.Reset()
     control.Tt.NewSearch()
+    // Worker 0 reuses the prior tree's subtree for the moves played since; the rest start fresh.
+    let promotedRoot = tryPromoteReuse control reuse
+    let reuseTree = if promotedRoot >= 0 then reuse.Tree else null
     let n = max 1 control.Config.Threads
     let workers = Array.init n (fun i -> Worker(i, (i = 0), control))
 
@@ -1279,7 +1368,7 @@ let private runMctsParallel (control: SearchControl) : Move =
         else
             0 // unbounded: governed by time / nodes / stop
 
-    let struct (trees, roots, depthReached) = runParallel workers control maxIters
+    let struct (trees, roots, depthReached) = runParallel workers control maxIters reuseTree promotedRoot
     let kf = float32 (max 1 control.Config.MctsK)
     let acc = mergeRoots trees roots
     let (mv, bestIdx) = bestMergedMove acc
@@ -1292,6 +1381,11 @@ let private runMctsParallel (control: SearchControl) : Move =
 
     control.LastBest <- best
     control.LastScore <- (if bestIdx >= 0 then mergedScoreCp acc.[bestIdx] kf else 0)
+    // Persist worker 0's tree (reused or fresh) so the next `go` can promote its subtree.
+    reuse.Tree <- trees.[0]
+    reuse.Root <- roots.[0]
+    reuse.Fen <- control.RootFen
+    reuse.Moves <- control.RootMoves
     // Final info from the MERGED decision: PV head = the emitted bestmove, score = LastScore, so the info
     // line, the score, and the bestmove all reference the same merged root decision.
     emitMctsInfo control depthReached control.LastScore best trees roots
@@ -1301,13 +1395,14 @@ let private runMctsParallel (control: SearchControl) : Move =
 /// Production entry (mirrors Search.go). A position so deep that a fixed-depth leaf negamax would overrun
 /// MaxPly has no room for an MCTS leaf — hand the whole search to alpha-beta (Search.go emits its own single
 /// bestmove, so we must not emit another). Otherwise run the root-parallel MCTS body.
-let mctsSearch (control: SearchControl) : Move =
+let mctsSearch (control: SearchControl) (reuse: MctsReuse) : Move =
     let safe = MaxPly - control.RootMoves.Length - MaxSearchPly - 1
 
     if safe < 1 then
+        reuse.Clear() // no MCTS tree corresponds to an alpha-beta fallback move
         Search.go control
     else
-        runMctsParallel control
+        runMctsParallel control reuse
 
 /// White-box test entry with explicit limits: run up to `iters` iterations on a single worker and return the
 /// tree + root index + worker. With defaultLimits this is the deterministic exactly-`iters` path; with a node
@@ -1339,7 +1434,7 @@ let mctsToIterationsTreeLim
     let trees: MctsTree[] = Array.zeroCreate 1
     let roots: int[] = Array.zeroCreate 1
     let globalIters = [| 0L |]
-    let struct (tree, rootIdx, _) = runWorker w control iters false false false trees roots globalIters
+    let struct (tree, rootIdx, _) = runWorker w control iters false false false trees roots globalIters null -1
     (tree, rootIdx, w)
 
 /// White-box test entry: run EXACTLY `iters` iterations (no time/stop/solver early-out) and return the

@@ -46,7 +46,8 @@ type private UciState =
       mutable RootFen: string
       mutable RootMoves: Move[]
       mutable Control: SearchControl option
-      mutable SearchThread: Thread option }
+      mutable SearchThread: Thread option
+      Reuse: Mcts.MctsReuse } // MCTS tree-reuse state, persisted across `go` (cleared on ucinewgame)
 
 let private tryInt (s: string) : int =
     match Int32.TryParse s with
@@ -221,7 +222,7 @@ let private startSearch (st: UciState) (lim: SearchLimits) =
 
         let t =
             Thread(
-                ThreadStart(fun () -> (if cfg.UseMcts then Mcts.mctsSearch control else Search.go control) |> ignore),
+                ThreadStart(fun () -> (if cfg.UseMcts then Mcts.mctsSearch control st.Reuse else Search.go control) |> ignore),
                 16 * 1024 * 1024
             )
         t.IsBackground <- true
@@ -289,7 +290,8 @@ let run () =
           RootFen = StartPosFen
           RootMoves = [||]
           Control = None
-          SearchThread = None }
+          SearchThread = None
+          Reuse = Mcts.MctsReuse() }
 
     let mutable running = true
 
@@ -312,6 +314,7 @@ let run () =
                 | "ucinewgame" ->
                     stopAndJoin st
                     st.Tt.Clear()
+                    st.Reuse.Clear()
                     st.RootFen <- StartPosFen
                     st.RootMoves <- [||]
                 | "position" ->

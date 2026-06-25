@@ -254,7 +254,7 @@ let ``a root past the safe envelope falls back to alpha-beta (same move as Searc
             let tt = TranspositionTable(max 1 cfg.HashMb)
             search (SearchControl(cfg, lim, tt, StartPosFen, moves, ?net = Some net))
 
-        Assert.Equal(toUci (runWith Eonego.Search.go), toUci (runWith mctsSearch))
+        Assert.Equal(toUci (runWith Eonego.Search.go), toUci (runWith (fun c -> mctsSearch c (MctsReuse()))))
 
 [<Fact>]
 let ``parallel mctsSearch returns a legal, coherent merged decision`` () =
@@ -266,7 +266,7 @@ let ``parallel mctsSearch returns a legal, coherent merged decision`` () =
         let lim = { defaultLimits with Depth = 1 } // 1000 iters/worker; the αβ leaf supplies the value
         let tt = TranspositionTable(max 1 cfg.HashMb)
         let control = SearchControl(cfg, lim, tt, fen, [||], ?net = Some net)
-        let m = mctsSearch control
+        let m = mctsSearch control (MctsReuse())
         let p = Position()
         p.LoadFen fen
         let legal = collectLegal p |> Array.map toUci
@@ -287,7 +287,7 @@ let ``go depth iteration budget is global across threads, not multiplied per wor
             let lim = { defaultLimits with Depth = 2 }
             let tt = TranspositionTable(max 1 cfg.HashMb)
             let control = SearchControl(cfg, lim, tt, StartPosFen, [||], ?net = Some net)
-            mctsSearch control |> ignore
+            mctsSearch control (MctsReuse()) |> ignore
             control.IterSum()
 
         Assert.Equal(2000L, run 1) // single worker: exactly the budget
@@ -328,3 +328,70 @@ let ``WAC: hybrid finds the winning tactic`` (fen: string) (expected: string) =
     | Some net ->
         let struct (_, _, m) = mctsToIterations fen [||] 400 defaultConfig (Some net)
         Assert.Equal(expected, toUci m)
+
+// ---------------------------------------------------------------------------
+// Tree reuse: lazy root promotion to a played move's subtree
+// ---------------------------------------------------------------------------
+[<Fact>]
+let ``PromoteToChild returns the expanded child subtree for a played move`` () =
+    let pos = Position()
+    pos.LoadFen StartPosFen
+    let legal = collectLegal pos
+    let mv0 = legal.[0]
+    let mv1 = legal.[1]
+    let tree = MctsTree()
+    let root = tree.AllocNode 0
+    let eb = tree.AllocEdges 2
+    tree.SetEdge(eb, mv0, 0.6f)
+    tree.SetEdge(eb + 1, mv1, 0.4f)
+    tree.SetNodeEdges(root, eb, 2)
+    // mv0 gets an expanded child carrying accumulated stats; mv1 stays unexpanded.
+    let child0 = tree.AllocNode 1
+    tree.SetEdgeChild(eb, child0)
+    tree.AddVisit(child0, 0.7f)
+    Assert.Equal(child0, tree.PromoteToChild(root, mv0)) // reuse the visited subtree
+    Assert.Equal(-1, tree.PromoteToChild(root, mv1)) // edge exists but child unexpanded => not reusable
+    Assert.Equal(-1, tree.PromoteToChild(root, MoveNone)) // no matching edge
+    // the promoted child keeps its prior search stats (the point of reuse).
+    Assert.Equal(1, tree.NodeN child0)
+    Assert.True(abs (tree.NodeW child0 - 0.7f) < 1e-6f)
+
+[<Fact>]
+let ``mctsSearch populates the reuse state for the next search`` () =
+    match tryLoadSfNet () with
+    | None -> () // soft-skip: needs the SF leaf
+    | Some net ->
+        let cfg = { defaultConfig with Threads = 1 }
+        let lim = { defaultLimits with Depth = 1 }
+        let tt = TranspositionTable(max 1 cfg.HashMb)
+        let control = SearchControl(cfg, lim, tt, StartPosFen, [||], ?net = Some net)
+        let reuse = MctsReuse()
+        mctsSearch control reuse |> ignore
+        Assert.False(obj.ReferenceEquals(reuse.Tree, null)) // worker 0's tree was saved
+        Assert.Equal(StartPosFen, reuse.Fen)
+        Assert.Equal(0, reuse.Moves.Length)
+        Assert.True(reuse.Root >= 0)
+        Assert.True(reuse.Tree.NodeN reuse.Root > 0) // the saved root carries accumulated visits
+
+[<Fact>]
+let ``mctsSearch reuses the same tree object for a played move`` () =
+    match tryLoadSfNet () with
+    | None -> () // soft-skip: needs the SF leaf
+    | Some net ->
+        let cfg = { defaultConfig with Threads = 1 }
+        let lim = { defaultLimits with Depth = 2 } // enough iterations to expand e2e4's child
+
+        let mk fen moves =
+            let tt = TranspositionTable(max 1 cfg.HashMb)
+            SearchControl(cfg, lim, tt, fen, moves, ?net = Some net)
+
+        let p = Position()
+        p.LoadFen StartPosFen
+        let e2e4 = collectLegal p |> Array.find (fun m -> toUci m = "e2e4")
+
+        let reuse = MctsReuse()
+        mctsSearch (mk StartPosFen [||]) reuse |> ignore
+        let treeAfter1 = reuse.Tree
+        // search 2 extends by e2e4: worker 0 should lazily promote that subtree, i.e. keep the SAME tree object.
+        mctsSearch (mk StartPosFen [| e2e4 |]) reuse |> ignore
+        Assert.True(obj.ReferenceEquals(reuse.Tree, treeAfter1), "expected the e2e4 subtree to be reused")
