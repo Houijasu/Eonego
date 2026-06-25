@@ -180,12 +180,77 @@ let i8Conv
                                         0uy
 
     // GEMM: out[o][s] = bias[o] + actScale*wScale[o] * dot(W_i8[o], colT[s]).
-    for o in 0 .. outC - 1 do
-        let ob = o * sp
-        let wb = o * kk
-        let deq = aScale * wScale.[o]
-        let bo = bias.[o]
+    // AVX2 path tiles 4 output channels per spatial cell so each colT[s] 32-byte load + the loop setup and
+    // horizontal-sum are amortized across 4 weight rows (i8Dot otherwise re-streams colT and re-pays the
+    // hsum once per (o,s)). Bit-exact vs the scalar per-output dot: each output's int32 sum is identical
+    // (same products, increasing i), only computed in parallel — so the parity test stays green.
+    if useAvx2 && Avx2.IsSupported then
+        let ones = Vector256.Create(1s)
+        let k32 = kk &&& ~~~31
+        let mutable o = 0
 
-        for s in 0 .. sp - 1 do
-            let raw = i8Dot useAvx2 colT (s * kk) wI8 wb kk
-            out.[ob + s] <- bo + deq * float32 raw
+        while o + 4 <= outC do
+            let wb0 = o * kk
+            let wb1 = wb0 + kk
+            let wb2 = wb1 + kk
+            let wb3 = wb2 + kk
+            let d0 = aScale * wScale.[o]
+            let d1 = aScale * wScale.[o + 1]
+            let d2 = aScale * wScale.[o + 2]
+            let d3 = aScale * wScale.[o + 3]
+
+            for s in 0 .. sp - 1 do
+                let cb = s * kk
+                let mutable a0 = Vector256<int>.Zero
+                let mutable a1 = Vector256<int>.Zero
+                let mutable a2 = Vector256<int>.Zero
+                let mutable a3 = Vector256<int>.Zero
+                let mutable i = 0
+
+                while i < k32 do
+                    let u = (Vector256.LoadUnsafe(&colT.[cb + i]) : Vector256<byte>)
+                    a0 <- Avx2.Add(a0, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u, (Vector256.LoadUnsafe(&wI8.[wb0 + i]) : Vector256<sbyte>)), ones))
+                    a1 <- Avx2.Add(a1, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u, (Vector256.LoadUnsafe(&wI8.[wb1 + i]) : Vector256<sbyte>)), ones))
+                    a2 <- Avx2.Add(a2, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u, (Vector256.LoadUnsafe(&wI8.[wb2 + i]) : Vector256<sbyte>)), ones))
+                    a3 <- Avx2.Add(a3, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u, (Vector256.LoadUnsafe(&wI8.[wb3 + i]) : Vector256<sbyte>)), ones))
+                    i <- i + 32
+
+                let mutable s0 = Vector256.Sum a0
+                let mutable s1 = Vector256.Sum a1
+                let mutable s2 = Vector256.Sum a2
+                let mutable s3 = Vector256.Sum a3
+
+                while i < kk do
+                    let cv = int colT.[cb + i]
+                    s0 <- s0 + int wI8.[wb0 + i] * cv
+                    s1 <- s1 + int wI8.[wb1 + i] * cv
+                    s2 <- s2 + int wI8.[wb2 + i] * cv
+                    s3 <- s3 + int wI8.[wb3 + i] * cv
+                    i <- i + 1
+
+                out.[o * sp + s] <- bias.[o] + d0 * float32 s0
+                out.[(o + 1) * sp + s] <- bias.[o + 1] + d1 * float32 s1
+                out.[(o + 2) * sp + s] <- bias.[o + 2] + d2 * float32 s2
+                out.[(o + 3) * sp + s] <- bias.[o + 3] + d3 * float32 s3
+
+            o <- o + 4
+
+        // remainder output channels (outC not a multiple of 4)
+        while o < outC do
+            let wb = o * kk
+            let deq = aScale * wScale.[o]
+            let bo = bias.[o]
+
+            for s in 0 .. sp - 1 do
+                out.[o * sp + s] <- bo + deq * float32 (i8Dot true colT (s * kk) wI8 wb kk)
+
+            o <- o + 1
+    else
+        for o in 0 .. outC - 1 do
+            let ob = o * sp
+            let wb = o * kk
+            let deq = aScale * wScale.[o]
+            let bo = bias.[o]
+
+            for s in 0 .. sp - 1 do
+                out.[ob + s] <- bo + deq * float32 (i8Dot false colT (s * kk) wI8 wb kk)
