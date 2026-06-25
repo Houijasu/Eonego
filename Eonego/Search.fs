@@ -259,6 +259,7 @@ type SearchControl
     let mutable ponderSoft = 0L // real budget remembered during a ponder search; armed by PonderHit
     let mutable ponderHard = 0L
     let mutable ponderHitPending = false // ponderhit that arrived before the search stored its budget
+    let mutable mctsNodeBudget = false // MCTS treats `go nodes N` as an ITERATION budget => CheckTime ignores Nodes
     member _.Config = config
     member _.Limits = limits
     member _.Tt = tt
@@ -311,11 +312,15 @@ type SearchControl
             if ponderSoft > 0L || ponderHard > 0L then
                 this.StartClock ponderSoft ponderHard
 
+    /// MCTS uses `go nodes N` as an iteration budget (Lc0 convention) and counts iterations itself, so its
+    /// driver disables the leaf-node stop here; alpha-beta leaves it on (the `go nodes N` = leaf nodes).
+    member _.SetMctsNodeBudget(v: bool) = mctsNodeBudget <- v
+
     /// Main worker only: convert a time/node budget overrun into the shared stop flag.
     member _.CheckTime(nodes: int64) =
         if
             (hardMs > 0L && sw.ElapsedMilliseconds >= hardMs)
-            || (limits.Nodes > 0L && nodes >= limits.Nodes)
+            || (not mctsNodeBudget && limits.Nodes > 0L && nodes >= limits.Nodes)
         then
             Volatile.Write(&stopFlag, 1)
 

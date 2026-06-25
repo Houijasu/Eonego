@@ -463,3 +463,18 @@ let ``ponder clock stays unbounded until ponderhit arms the budget`` () =
     Assert.Equal(100L, c3.BaseSoftMs)
     c3.PonderHit()
     Assert.Equal(100L, c3.BaseSoftMs)
+
+[<Fact>]
+let ``go nodes is an MCTS iteration budget, not a leaf-node limit`` () =
+    match tryLoadSfNet () with
+    | None -> () // soft-skip: the leaf eval generates the nodes that the old semantics tripped on
+    | Some net ->
+        let cfg = { defaultConfig with Threads = 1 }
+        let lim = { defaultLimits with Nodes = 300L }
+        let tt = TranspositionTable(max 1 cfg.HashMb)
+        let control = SearchControl(cfg, lim, tt, StartPosFen, [||], ?net = Some net)
+        mctsSearch control (MctsReuse()) |> ignore
+        // ~300 backed-up iterations (the old leaf-node semantics stopped at ~0 because the first depth-6 leaf
+        // already exceeds 300 nodes, returning an unsearched move).
+        Assert.True(control.IterSum() >= 300L, "iters " + string (control.IterSum()))
+        Assert.True(control.IterSum() <= 302L, "iters " + string (control.IterSum()))

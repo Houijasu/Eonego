@@ -1426,13 +1426,17 @@ let private runMctsParallel (control: SearchControl) (reuse: MctsReuse) : Move =
     let (soft, hard) = computeTimes control.Config.MoveOverhead control.Limits stm
     control.StartClockPonder soft hard control.Limits.Ponder
 
-    // GLOBAL budget = maxIters across ALL workers (Threads splits a `go depth N` budget ~N×, so wall-clock
-    // latency drops with thread count instead of each worker redoing the whole N*MctsIterPerDepth).
+    // GLOBAL budget = maxIters across ALL workers. `go depth N` => N*MctsIterPerDepth; `go nodes N` => N MCTS
+    // iterations (Lc0 convention — counted here, with the leaf-node stop disabled so the first deep leaf can't
+    // end the search with zero playouts). Threads splits the budget, so wall-clock drops with thread count.
     let maxIters =
         if control.Limits.Depth > 0 then
             control.Limits.Depth * MctsIterPerDepth
+        elif control.Limits.Nodes > 0L then
+            control.SetMctsNodeBudget true
+            int (min control.Limits.Nodes (int64 System.Int32.MaxValue))
         else
-            0 // unbounded: governed by time / nodes / stop
+            0 // unbounded: governed by time / stop
 
     let struct (trees, roots, depthReached) = runParallel workers control maxIters reuseTree promotedRoot
     let kf = float32 (max 1 control.Config.MctsK)
