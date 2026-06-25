@@ -435,18 +435,18 @@ let private expand (tree: MctsTree) (w: Worker) (nodeIdx: int) (allowDraw: bool)
             let stm = pos.SideToMove
 
             if w.Control.Config.UseLc0 && w.Control.Lc0Net.IsSome then
-                // Lc0 CNN priors (true hybrid: Lc0 policy + SF-NNUE alpha-beta leaf). v1 ignores the Lc0
-                // value head; the leaf eval stays the negamax+SF path below. Runs once per node-expansion.
+                // Lc0 CNN priors (true hybrid: Lc0 policy + SF-NNUE alpha-beta leaf). The Lc0 value head is
+                // stashed on the Worker and (only when MctsValueBlend > 0) blended into the leaf q by the
+                // immediately-following evalLeaf; default blend 0 keeps the leaf the pure negamax+SF value.
                 let net = w.Control.Lc0Net.Value
 
-                match w.Control.Lc0Int8 with
-                | Some q ->
-                    // int8 forward (~2.77x faster); accuracy green-lit by the forwardI8 parity gate.
-                    Lc0Net.lc0PriorsIntoI8 SfAccumulator.UseAvx2 net q pos moves cnt w.Lc0InBuf w.Lc0Scratch w.Lc0Int8Scratch w.Lc0Priors
-                    |> ignore
-                | None ->
-                    Lc0Net.lc0PriorsInto SfAccumulator.UseAvx2 net pos moves cnt w.Lc0InBuf w.Lc0Scratch w.Lc0Priors
-                    |> ignore
+                w.Lc0Value <-
+                    match w.Control.Lc0Int8 with
+                    | Some q ->
+                        // int8 forward (~2.77x faster); accuracy green-lit by the forwardI8 parity gate.
+                        Lc0Net.lc0PriorsIntoI8 SfAccumulator.UseAvx2 net q pos moves cnt w.Lc0InBuf w.Lc0Scratch w.Lc0Int8Scratch w.Lc0Priors
+                    | None ->
+                        Lc0Net.lc0PriorsInto SfAccumulator.UseAvx2 net pos moves cnt w.Lc0InBuf w.Lc0Scratch w.Lc0Priors
 
                 let priors = w.Lc0Priors
                 let edgeBase = tree.AllocEdges cnt
@@ -508,7 +508,18 @@ let private evalLeaf (tree: MctsTree) (w: Worker) (leafDepth: int) (k: float32) 
     if cp >= MATE_IN_MAX_PLY then tree.SetProvenPly(leafIdx, PrWin, MATE - cp)
     elif cp <= -MATE_IN_MAX_PLY then tree.SetProvenPly(leafIdx, PrLoss, MATE + cp)
 
-    cpToWinProb cp k
+    let qNeg = cpToWinProb cp k
+    let blend = w.Control.Config.MctsValueBlend
+
+    // Optionally blend the Lc0 value head (stashed by this node's expand) into the leaf q: both are STM-relative
+    // win-probs in [0,1]. Default blend 0 => q = the pure negamax+SF value (identical to before). Proven mates
+    // above are untouched (the value head never overrides an exact mate). Only the fresh-expand path stashes a
+    // value; re-evals at the (effectively-never-hit) maxTreeDepth keep their last stash, harmless at blend 0.
+    if blend > 0 && w.Control.Config.UseLc0 then
+        let lambda = float32 blend / 100.0f
+        (1.0f - lambda) * qNeg + lambda * w.Lc0Value
+    else
+        qNeg
 
 // ---------------------------------------------------------------------------
 // One MCTS iteration: SELECT (Make down) -> EXPAND/EVAL leaf -> BACKUP (flip up) -> Unmake back.

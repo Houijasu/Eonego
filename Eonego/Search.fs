@@ -99,7 +99,8 @@ type SearchConfig =
       MctsK: int // logistic cp->winprob scale (centipawns); match the training K
       UseLc0: bool // use the Lc0 CNN (Lc0Net.fs) for MCTS priors; requires a loaded Lc0 net (else history fallback)
       MctsBatchSize: int // >1: batch B leaves/worker through one Lc0 forward (virtual-loss gather); 1: single eval
-      UseEvalPriors: bool } // no-Lc0 fallback: softmax over each child's SF-NNUE static eval instead of history scores
+      UseEvalPriors: bool // no-Lc0 fallback: softmax over each child's SF-NNUE static eval instead of history scores
+      MctsValueBlend: int } // ×100: blend the Lc0 value head into the leaf q, (1-λ)*negamax + λ*lc0value; 0 = pure negamax
 
 type SearchLimits =
     { MoveTime: int
@@ -136,7 +137,8 @@ let defaultConfig =
       MctsK = 200
       UseLc0 = false
       MctsBatchSize = 1
-      UseEvalPriors = false }
+      UseEvalPriors = false
+      MctsValueBlend = 0 }
 
 let defaultLimits =
     { MoveTime = 0
@@ -392,6 +394,9 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     member _.Lc0InBuf        = lc0InBuf
     member _.Lc0Scratch      = lc0Scratch
     member _.Lc0Int8Scratch  = lc0Int8Scratch
+    /// Lc0 value head (STM-relative win-prob in [0,1]) stashed by the most recent Lc0 expand, consumed by the
+    /// immediately-following evalLeaf when MctsValueBlend > 0. 0.5 = neutral (no Lc0 / history priors).
+    member val Lc0Value : float32 = 0.5f with get, set
 
     member _.Nodes
         with get () = nodes

@@ -217,6 +217,9 @@ let private startSearch (st: UciState) (lim: SearchLimits) =
               MctsCpuct = envInt "EONEGO_CPUCT" 150
               MctsLeafDepth = envInt "EONEGO_LEAFDEPTH" 8
               MctsK = envInt "EONEGO_K" 200
+              // Blend the Lc0 value head into the leaf q (x100): 0 = pure negamax+SF leaf (default/today),
+              // 100 = pure Lc0 value. Experimental strength lever; SPRT-gate it. Only meaningful with Lc0.
+              MctsValueBlend = envInt "EONEGO_VALUE_BLEND" 0
               // Lc0 (if loaded via EONEGO_LC0) drives priors; else the history-softmax fallback.
               UseLc0 = st.Lc0Net.IsSome
               // Batched Lc0 forwards per worker (EXPERIMENTAL, default OFF=1): on this hardware the larger
