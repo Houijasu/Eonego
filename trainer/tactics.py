@@ -1,10 +1,19 @@
-"""Score a player (net path or 'material') on the Stockfish-verified KGA tactical suite.
+"""Score an Eonego configuration on the Stockfish-verified KGA tactical suite.
 
-The headline metric: fraction of suite positions where the engine, at a fixed node budget,
+The headline metric: fraction of suite positions where the engine, at a fixed budget,
 plays the verified best move. Reported overall and split by tag (mate / win).
 
-    python tactics.py --net nets/net0.eongnnue --suite suites/kga_tactics.tsv --nodes 50000
-    python tactics.py --net material --suite suites/kga_tactics.tsv --nodes 50000
+The engine is configured by PER-PROCESS ENVIRONMENT VARIABLES, not UCI setoptions (the
+release engine only accepts Threads + Move Overhead via setoption; everything else is an
+EONEGO_* env var). `--env` is comma-separated NAME=VALUE overrides. Budget is `go movetime`
+by default (the fair axis once searches differ); `--nodes` is available for same-search runs.
+
+    # Production Lc0 path:
+    python tactics.py --env "EONEGO_LC0=<path>.pb" --movetime 500
+    # History-prior fallback (no Lc0):
+    python tactics.py --env "EONEGO_LC0=none" --movetime 500
+    # Plain alpha-beta:
+    python tactics.py --env "EONEGO_MCTS=0,EONEGO_LC0=<path>.pb" --movetime 500
 """
 
 import argparse
@@ -15,7 +24,20 @@ import chess.engine
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
-EXE = os.path.join(REPO, "Eonego", "bin", "Release", "net10.0", "Eonego.exe")
+DEFAULT_EXE = os.path.join(REPO, "Eonego", "bin", "Release", "net10.0", "win-x64", "publish", "Eonego.exe")
+
+
+def parse_env(spec):
+    out = {}
+    for part in (spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise ValueError(f"bad env override '{part}' (expected NAME=VALUE)")
+        k, v = part.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
 
 
 def load_suite(path):
@@ -32,19 +54,17 @@ def load_suite(path):
     return out
 
 
-def score_player(cfg, suite, nodes):
-    opts = {"Threads": 1}
-    if cfg != "material":
-        opts["NnueFile"] = cfg   # before UseNnue: the engine needs the net loaded first
-        opts["UseNnue"] = True
-    eng = chess.engine.SimpleEngine.popen_uci(EXE)
-    eng.configure(opts)
+def score_player(exe, env_overrides, suite, limit):
+    env = dict(os.environ)
+    env.update(env_overrides)
+    eng = chess.engine.SimpleEngine.popen_uci(exe, env=env)
+    eng.configure({"Threads": 1})
     solved = 0
     by = {}
     try:
         for fen, bm, tag in suite:
             board = chess.Board(fen)
-            res = eng.play(board, chess.engine.Limit(nodes=nodes))
+            res = eng.play(board, limit)
             ok = res.move is not None and res.move.uci() == bm
             solved += int(ok)
             t = by.setdefault(tag, [0, 0])
@@ -57,16 +77,23 @@ def score_player(cfg, suite, nodes):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--net", required=True, help="net path or 'material'")
+    ap.add_argument("--env", default="", help="env overrides, e.g. 'EONEGO_LC0=<path>.pb'")
+    ap.add_argument("--exe", default=DEFAULT_EXE)
     ap.add_argument("--suite", default=os.path.join(HERE, "suites", "kga_tactics.tsv"))
-    ap.add_argument("--nodes", type=int, default=50000)
+    ap.add_argument("--movetime", type=int, default=500, help="ms per position")
+    ap.add_argument("--nodes", type=int, default=0, help="alt budget: go nodes N")
     args = ap.parse_args()
 
+    if not os.path.exists(args.exe):
+        raise SystemExit(f"engine not found: {args.exe}\n(build it, or pass --exe)")
+
+    limit = chess.engine.Limit(nodes=args.nodes) if args.nodes > 0 else chess.engine.Limit(time=args.movetime / 1000.0)
     suite = load_suite(args.suite)
-    solved, total, by = score_player(args.net, suite, args.nodes)
+    solved, total, by = score_player(args.exe, parse_env(args.env), suite, limit)
     pct = 100.0 * solved / max(1, total)
     tagstr = "  ".join(f"{k}:{v[0]}/{v[1]}" for k, v in sorted(by.items()))
-    print(f"TACTICS {args.net}  nodes={args.nodes}  solved {solved}/{total} ({pct:.1f}%)  [{tagstr}]")
+    budget = f"nodes={args.nodes}" if args.nodes > 0 else f"movetime={args.movetime}"
+    print(f"TACTICS env=[{args.env}]  {budget}  solved {solved}/{total} ({pct:.1f}%)  [{tagstr}]")
     return 0
 
 

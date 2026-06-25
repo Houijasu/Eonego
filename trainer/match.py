@@ -1,37 +1,50 @@
-"""Self-contained UCI match driver + SPRT for Eonego nets, anchored at the KGA root.
+"""Self-contained UCI match driver + SPRT for Eonego configurations.
 
-Plays each diversified opening from both colors at a fixed node budget, deterministically
-(Threads=1). Reports W/D/L from player A's view, an Elo estimate, and a GSPRT LLR with
-elo0/elo1 bounds. A player config is either a net path or "material" (UseNnue off).
+The two players are differentiated by PER-SUBPROCESS ENVIRONMENT VARIABLES, not UCI
+setoptions: the release engine accepts only `Threads` and `Move Overhead` via setoption,
+and every behavioural knob (MCTS on/off, Lc0 net, cpuct, leaf depth, value blend, ...) is
+an EONEGO_* env var. So `--a`/`--b` are comma-separated NAME=VALUE env overrides applied
+to that player's process.
 
-    python match.py --a nets/net1.eongnnue --b nets/net0.eongnnue --nodes 20000 --openings 80
-    python match.py --a nets/net0.eongnnue --b material --nodes 20000 --openings 80
+Budgets MUST be equalized on `go movetime` when the two players use different searches:
+`go nodes N` means MCTS iterations in MCTS mode but leaf-negamax nodes in alpha-beta mode,
+which are not comparable. movetime is the only fair axis across searches.
+
+    # Does the MCTS+Lc0 hybrid beat plain alpha-beta at equal time?
+    python match.py --a "EONEGO_MCTS=1" --b "EONEGO_MCTS=0" --movetime 200 --openings 200 --sprt \
+        --shared "EONEGO_LC0=<path-to>.pb"
+
+    # Lc0 CNN priors vs history-softmax priors (leaf eval stays SF NNUE either way):
+    python match.py --a "EONEGO_LC0=<path>.pb" --b "EONEGO_LC0=none" --movetime 200 --openings 200 --sprt
+
+    # cpuct sweep point:
+    python match.py --a "EONEGO_CPUCT=180" --b "EONEGO_CPUCT=150" --movetime 200 --openings 200 --sprt \
+        --shared "EONEGO_LC0=<path>.pb"
 """
 
 import argparse
 import math
 import os
 import subprocess
-import sys
 
 import chess
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
-EXE = os.path.join(REPO, "Eonego", "bin", "Release", "net10.0", "Eonego.exe")
-KGA_FEN = "rnbqkbnr/pppp1ppp/8/8/4Pp2/8/PPPP2PP/RNBQKBNR w KQkq - 0 3"
+DEFAULT_EXE = os.path.join(REPO, "Eonego", "bin", "Release", "net10.0", "win-x64", "publish", "Eonego.exe")
+START_FEN = chess.STARTING_FEN
 
 
 class UciEngine:
-    def __init__(self, cfg_name, options):
-        self.proc = subprocess.Popen([EXE], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     text=True, bufsize=1)
-        self.name = cfg_name
+    def __init__(self, name, exe, env_overrides):
+        env = dict(os.environ)
+        env.update(env_overrides)
+        self.proc = subprocess.Popen([exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     text=True, bufsize=1, env=env)
+        self.name = name
         self._send("uci")
         self._wait("uciok")
         self._send("setoption name Threads value 1")
-        for k, v in options.items():
-            self._send(f"setoption name {k} value {v}")
         self._send("isready")
         self._wait("readyok")
 
@@ -52,11 +65,11 @@ class UciEngine:
         self._send("isready")
         self._wait("readyok")
 
-    def bestmove(self, start_fen, moves, nodes):
+    def bestmove(self, root_fen, moves, go_cmd):
         mv = " ".join(moves)
-        pos = f"position fen {start_fen}" + (f" moves {mv}" if moves else "")
+        pos = f"position fen {root_fen}" + (f" moves {mv}" if moves else "")
         self._send(pos)
-        self._send(f"go nodes {nodes}")
+        self._send(go_cmd)
         while True:
             line = self.proc.stdout.readline()
             if line == "":
@@ -72,21 +85,31 @@ class UciEngine:
             self.proc.kill()
 
 
-def make_options(cfg):
-    if cfg == "material":
-        return {}
-    return {"NnueFile": cfg, "UseNnue": "true"}
+def parse_env(spec):
+    """'NAME=VAL,NAME2=VAL2' -> {'NAME': 'VAL', ...}. Empty/None -> {}."""
+    out = {}
+    if not spec:
+        return out
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise ValueError(f"bad env override '{part}' (expected NAME=VALUE)")
+        k, v = part.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
 
 
-def gen_openings(n, plies, seed):
-    """n distinct opening move-lists from the KGA root: `plies` random legal moves each."""
+def gen_openings(root_fen, n, plies, seed):
+    """n distinct opening move-lists from the root: `plies` random legal moves each."""
     import random
     rng = random.Random(seed)
     seen, out = set(), []
     tries = 0
     while len(out) < n and tries < n * 50:
         tries += 1
-        b = chess.Board(KGA_FEN)
+        b = chess.Board(root_fen)
         ok = True
         for _ in range(plies):
             legal = list(b.legal_moves)
@@ -104,14 +127,14 @@ def gen_openings(n, plies, seed):
     return out
 
 
-def play_game(eng_white, eng_black, opening, nodes, max_plies=300):
-    board = chess.Board(KGA_FEN)
+def play_game(root_fen, eng_white, eng_black, opening, go_cmd, max_plies=300):
+    board = chess.Board(root_fen)
     for u in opening:
         board.push_uci(u)
     moves = list(opening)
     while not board.is_game_over(claim_draw=True) and len(moves) < max_plies:
         eng = eng_white if board.turn == chess.WHITE else eng_black
-        u = eng.bestmove(KGA_FEN, moves, nodes)
+        u = eng.bestmove(root_fen, moves, go_cmd)
         try:
             mv = chess.Move.from_uci(u)
         except ValueError:
@@ -134,7 +157,6 @@ def sprt_llr(W, D, L, elo0, elo1):
     def escore(elo):
         return 1.0 / (1.0 + 10 ** (-elo / 400.0))
     s0, s1 = escore(elo0), escore(elo1)
-    # add-0.5 smoothing of the trinomial -> nonzero variance even on a single game
     den = n + 1.5
     w, d, ll = (W + 0.5) / den, (D + 0.5) / den, (L + 0.5) / den
     mu = w + 0.5 * d
@@ -149,7 +171,6 @@ def elo_estimate(W, D, L):
     score = (W + 0.5 * D) / n
     score = min(max(score, 1e-6), 1 - 1e-6)
     elo = -400.0 * math.log10(1.0 / score - 1.0)
-    # crude 95% CI from score stderr
     var = (W * (1 - score) ** 2 + D * (0.5 - score) ** 2 + L * score ** 2) / (n * n)
     se = math.sqrt(max(var, 1e-12))
     s_hi = min(1 - 1e-6, score + 1.96 * se)
@@ -161,9 +182,13 @@ def elo_estimate(W, D, L):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--a", required=True, help="net path or 'material'")
-    ap.add_argument("--b", required=True, help="net path or 'material'")
-    ap.add_argument("--nodes", type=int, default=20000)
+    ap.add_argument("--a", required=True, help="env overrides for player A, e.g. 'EONEGO_MCTS=1'")
+    ap.add_argument("--b", required=True, help="env overrides for player B, e.g. 'EONEGO_MCTS=0'")
+    ap.add_argument("--shared", default="", help="env overrides applied to BOTH players, e.g. 'EONEGO_LC0=...pb'")
+    ap.add_argument("--exe", default=DEFAULT_EXE, help="path to Eonego.exe (default: AOT publish build)")
+    ap.add_argument("--root", default=START_FEN, help="opening root FEN (default: startpos)")
+    ap.add_argument("--movetime", type=int, default=200, help="ms per move (the fair budget across searches)")
+    ap.add_argument("--nodes", type=int, default=0, help="alt budget: go nodes N (only fair for same-search A/B)")
     ap.add_argument("--openings", type=int, default=80)
     ap.add_argument("--opening-plies", type=int, default=6)
     ap.add_argument("--seed", type=int, default=12345)
@@ -175,12 +200,21 @@ def main():
     ap.add_argument("--min-games", type=int, default=40)
     args = ap.parse_args()
 
+    if not os.path.exists(args.exe):
+        raise SystemExit(f"engine not found: {args.exe}\n(build it, or pass --exe)")
+
+    go_cmd = f"go nodes {args.nodes}" if args.nodes > 0 else f"go movetime {args.movetime}"
+
+    shared = parse_env(args.shared)
+    env_a = {**shared, **parse_env(args.a)}
+    env_b = {**shared, **parse_env(args.b)}
+
     lower = math.log(args.beta / (1 - args.alpha))
     upper = math.log((1 - args.beta) / args.alpha)
 
-    engA = UciEngine("A", make_options(args.a))
-    engB = UciEngine("B", make_options(args.b))
-    openings = gen_openings(args.openings, args.opening_plies, args.seed)
+    engA = UciEngine("A", args.exe, env_a)
+    engB = UciEngine("B", args.exe, env_b)
+    openings = gen_openings(args.root, args.openings, args.opening_plies, args.seed)
 
     W = D = L = 0  # from A's perspective
     games = 0
@@ -190,7 +224,7 @@ def main():
                 engA.newgame()
                 engB.newgame()
                 ew, eb = (engA, engB) if a_is_white else (engB, engA)
-                res = play_game(ew, eb, op, args.nodes)
+                res = play_game(args.root, ew, eb, op, go_cmd)
                 if res == "1/2-1/2":
                     D += 1
                 elif (res == "1-0") == a_is_white:
@@ -215,7 +249,7 @@ def main():
     llr = sprt_llr(W, D, L, args.elo0, args.elo1)
     elo, err = elo_estimate(W, D, L)
     verdict = "H1 (A stronger)" if llr >= upper else "H0 (not stronger)" if llr <= lower else "inconclusive"
-    print(f"\nFINAL  A={args.a}  B={args.b}  nodes={args.nodes}")
+    print(f"\nFINAL  A=[{args.a}]  B=[{args.b}]  budget={go_cmd}")
     print(f"  games {games}  W{W} D{D} L{L}  score {(W+0.5*D)/max(1,games):.3f}")
     print(f"  Elo(A-B) {elo:+.1f} +- {err:.1f}   LLR {llr:+.2f}  -> {verdict}")
     return 0
