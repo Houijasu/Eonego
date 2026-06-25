@@ -160,6 +160,20 @@ type MctsTree(nodeCap: int, edgeCap: int) =
         n.N <- n.N + 1
         n.W <- n.W + q
 
+    // Virtual loss for batched gather: a virtual child-WIN (W += vl) is a LOSS for the parent, so a node
+    // pulled into the current batch looks more-visited and worse, steering the next gather elsewhere.
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+    member _.AddVirtualLoss(i, vl: int) =
+        let mutable n = &nodes.[i]
+        n.N <- n.N + vl
+        n.W <- n.W + float32 vl
+
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+    member _.UndoVirtualLoss(i, vl: int) =
+        let mutable n = &nodes.[i]
+        n.N <- n.N - vl
+        n.W <- n.W - float32 vl
+
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member _.SetEdge(i, m, prior) =
         edges.[i].Move <- m
@@ -445,6 +459,225 @@ let private runIteration
         pos.Unmake(tree.EdgeMove(pathEdges.[d]))
 
     struct (pathLen, backedUp)
+
+// ---------------------------------------------------------------------------
+// Batched Lc0 evaluation (per-worker, virtual-loss gather). Gather B leaves, run ONE Lc0 forwardBatch for
+// all B prior-sets (one weight stream => RAM bandwidth amortized B-fold), then per leaf set priors + negamax
+// value + backup (reverting virtual loss). Used only when UseLc0 && MctsBatchSize>1 (history/single paths
+// are untouched). The leaf VALUE is still the SF negamax (the Lc0 value head is ignored, as elsewhere).
+// ---------------------------------------------------------------------------
+[<Sealed>]
+type private MctsBatch(net: Lc0Proto.Lc0Net, maxBatch: int, maxTreeDepth: int) =
+    let planes = Lc0Encoder.Planes
+    let stride = maxTreeDepth + 1
+    member val Scratch = Lc0Net.Lc0BatchScratch(net, maxBatch)
+    member val LeafInputs: float32[] = Array.zeroCreate (maxBatch * planes * 64) // per-leaf single-board encoding
+    member val BatchInput: float32[] = Array.zeroCreate (maxBatch * planes * 64) // packed channel-major batched layout
+    member val Logits: float32[] = Array.zeroCreate (maxBatch * Lc0PolicyMap.NumPolicy)
+    member val Values: float32[] = Array.zeroCreate maxBatch
+    member val Priors: float32[] = Array.zeroCreate MaxMoves
+    member val LeafNodes: int[] = Array.zeroCreate maxBatch
+    member val PathLens: int[] = Array.zeroCreate maxBatch
+    member val Paths: int[] = Array.zeroCreate (maxBatch * stride) // leaf i's edges at i*stride
+    member _.Stride = stride
+
+[<Literal>]
+let private VirtualLoss = 1
+
+/// One batch: gather up to maxBatch leaves (virtual loss; terminals/proven backed up inline; stop on collision
+/// or stop), ONE forwardBatch for all priors, then per leaf set priors + negamax value + backup (revert VL).
+/// Returns struct(maxDepthReached, completedBackups); completedBackups drives the iteration/budget counters.
+let private runBatch
+    (tree: MctsTree)
+    (w: Worker)
+    (cpuct: float32)
+    (leafDepth: int)
+    (k: float32)
+    (maxTreeDepth: int)
+    (rootIdx: int)
+    (batch: MctsBatch)
+    (maxBatch: int)
+    : struct (int * int) =
+    let pos = w.Pos
+    let net = w.Control.Lc0Net.Value
+    let planes = Lc0Encoder.Planes
+    let stride = batch.Stride
+    let mutable nLeaves = 0
+    let mutable completed = 0
+    let mutable maxDepthReached = 0
+
+    // ---- GATHER (at most maxBatch attempts: bounds the loop even if every selection hits a terminal) ----
+    let mutable attempts = 0
+    let mutable gathering = true
+
+    while gathering && attempts < maxBatch && not w.Control.Stopped do
+        attempts <- attempts + 1
+        let pathBase = nLeaves * stride
+        let mutable node = rootIdx
+        let mutable pathLen = 0
+        let mutable outcome = 0 // 1 = batch leaf, 2 = terminal (inline backup), 3 = collision
+        let mutable termQ = 0.0f
+        let mutable leafNode = -1
+        let mutable walking = true
+
+        while walking do
+            if tree.NodeProven node <> PrUnknown then
+                outcome <- 2
+                termQ <- provenQ tree node
+                leafNode <- node
+                walking <- false
+            elif tree.NodeNumEdges node = 0 then
+                outcome <- 3 // unexpanded node reached by selection = a pending batch leaf => collision
+                walking <- false
+            elif pathLen >= maxTreeDepth then
+                outcome <- 2
+                termQ <- evalLeaf tree w leafDepth k node
+                leafNode <- node
+                walking <- false
+            else
+                let e = selectEdge tree node cpuct
+
+                if e < 0 then
+                    outcome <- 2 // every child is a proven win for them => we are lost
+                    termQ <- 0.0f
+                    leafNode <- node
+                    walking <- false
+                else
+                    pos.Make(tree.EdgeMove e)
+                    batch.Paths.[pathBase + pathLen] <- e
+                    pathLen <- pathLen + 1
+                    let ci = tree.EdgeChild e
+
+                    if ci < 0 then
+                        let c = tree.AllocNode(int pos.SideToMove)
+                        tree.SetEdgeChild(e, c)
+                        let moves = w.MoveBuf
+                        let span = System.Span<Move>(moves, 0, MaxMoves)
+                        let cnt = generateLegal pos span
+
+                        if cnt = 0 then
+                            tree.SetProven(c, (if pos.InCheck then PrLoss else PrDraw))
+                            outcome <- 2
+                            termQ <- provenQ tree c
+                            leafNode <- c
+                        elif isImmediateDraw pos then
+                            tree.SetProven(c, PrDraw)
+                            outcome <- 2
+                            termQ <- provenQ tree c
+                            leafNode <- c
+                        else
+                            // batch leaf: encode the position now (board is at the leaf), priors come later.
+                            Lc0Encoder.encodeInto pos w.Lc0InBuf
+                            Array.blit w.Lc0InBuf 0 batch.LeafInputs (nLeaves * planes * 64) (planes * 64)
+                            outcome <- 1
+                            leafNode <- c
+
+                        walking <- false
+                    else
+                        node <- ci
+
+        if pathLen > maxDepthReached then
+            maxDepthReached <- pathLen
+
+        if outcome = 1 then
+            // batch leaf: record path/leaf, apply virtual loss to every stepped child (incl. the leaf), unmake.
+            batch.LeafNodes.[nLeaves] <- leafNode
+            batch.PathLens.[nLeaves] <- pathLen
+
+            for d in 0 .. pathLen - 1 do
+                let ci = tree.EdgeChild(batch.Paths.[pathBase + d])
+                if ci >= 0 then tree.AddVirtualLoss(ci, VirtualLoss)
+
+            nLeaves <- nLeaves + 1
+
+            for d in pathLen - 1 .. -1 .. 0 do
+                pos.Unmake(tree.EdgeMove(batch.Paths.[pathBase + d]))
+        elif outcome = 2 then
+            // terminal/proven: real backup inline (no virtual loss applied on this path), unmake.
+            tree.AddVisit(leafNode, termQ)
+            solverUpdate tree leafNode
+            let mutable qq = termQ
+
+            for d in pathLen - 1 .. -1 .. 0 do
+                qq <- 1.0f - qq
+                let nodeD = if d = 0 then rootIdx else tree.EdgeChild(batch.Paths.[pathBase + d - 1])
+                tree.AddVisit(nodeD, qq)
+
+                if tree.NodeProven nodeD = PrUnknown then
+                    solverUpdate tree nodeD
+
+            completed <- completed + 1
+
+            for d in pathLen - 1 .. -1 .. 0 do
+                pos.Unmake(tree.EdgeMove(batch.Paths.[pathBase + d]))
+        else
+            // collision: discard this partial gather and stop (process what we have).
+            for d in pathLen - 1 .. -1 .. 0 do
+                pos.Unmake(tree.EdgeMove(batch.Paths.[pathBase + d]))
+
+            gathering <- false
+
+    // ---- EVALUATE: one batched forward over all gathered leaves ----
+    if nLeaves > 0 then
+        // pack per-leaf single-board encodings into the channel-major batched layout (ch, then board).
+        for ch in 0 .. planes - 1 do
+            for b in 0 .. nLeaves - 1 do
+                Array.blit batch.LeafInputs (b * planes * 64 + ch * 64) batch.BatchInput (ch * nLeaves * 64 + b * 64) 64
+
+        Lc0Net.forwardBatch SfAccumulator.UseAvx2 net batch.Scratch nLeaves batch.BatchInput batch.Logits batch.Values
+
+        // ---- PROCESS each leaf: re-walk, set priors, negamax value, revert VL, real backup, unmake ----
+        for i in 0 .. nLeaves - 1 do
+            let pb = i * stride
+            let plen = batch.PathLens.[i]
+            let leaf = batch.LeafNodes.[i]
+
+            if w.Control.Stopped then
+                // bail: still revert this leaf's virtual loss (tree-only) so the tree isn't left distorted.
+                for d in 0 .. plen - 1 do
+                    let ci = tree.EdgeChild(batch.Paths.[pb + d])
+                    if ci >= 0 then tree.UndoVirtualLoss(ci, VirtualLoss)
+            else
+                for d in 0 .. plen - 1 do
+                    pos.Make(tree.EdgeMove(batch.Paths.[pb + d]))
+
+                // priors from the batched logits (softmax over the leaf's legal moves).
+                let moves = w.MoveBuf
+                let span = System.Span<Move>(moves, 0, MaxMoves)
+                let cnt = generateLegal pos span
+                Lc0Net.lc0PriorsFromLogits batch.Logits (i * Lc0PolicyMap.NumPolicy) pos moves cnt batch.Priors
+                let edgeBase = tree.AllocEdges cnt
+
+                for j in 0 .. cnt - 1 do
+                    tree.SetEdge(edgeBase + j, moves.[j], batch.Priors.[j])
+
+                tree.SetNodeEdges(leaf, edgeBase, cnt)
+
+                // value = the SF negamax leaf (sets Proven on a mate, like the single path).
+                let q = evalLeaf tree w leafDepth k leaf
+
+                for d in 0 .. plen - 1 do
+                    let ci = tree.EdgeChild(batch.Paths.[pb + d])
+                    if ci >= 0 then tree.UndoVirtualLoss(ci, VirtualLoss)
+
+                tree.AddVisit(leaf, q)
+                solverUpdate tree leaf
+                let mutable qq = q
+
+                for d in plen - 1 .. -1 .. 0 do
+                    qq <- 1.0f - qq
+                    let nodeD = if d = 0 then rootIdx else tree.EdgeChild(batch.Paths.[pb + d - 1])
+                    tree.AddVisit(nodeD, qq)
+
+                    if tree.NodeProven nodeD = PrUnknown then
+                        solverUpdate tree nodeD
+
+                completed <- completed + 1
+
+                for d in plen - 1 .. -1 .. 0 do
+                    pos.Unmake(tree.EdgeMove(batch.Paths.[pb + d]))
+
+    struct (maxDepthReached, completed)
 
 // ---------------------------------------------------------------------------
 // Root selection / reporting
@@ -802,6 +1035,16 @@ let private runWorker
         let pathNodes = Array.zeroCreate (maxTreeDepth + 1)
         let pathEdges = Array.zeroCreate (maxTreeDepth + 1)
         expand tree w rootIdx false // root expanded once; allowDraw=false
+        // Batched Lc0 eval: gather B leaves through ONE forwardBatch when Lc0 is active (amortizes weight RAM
+        // bandwidth). Off (single-leaf runIteration) for history priors and batch size 1 — all current paths.
+        let useBatch = cfg.UseLc0 && cfg.MctsBatchSize > 1 && control.Lc0Net.IsSome
+
+        let batch =
+            if useBatch then
+                MctsBatch(control.Lc0Net.Value, cfg.MctsBatchSize, maxTreeDepth)
+            else
+                Unchecked.defaultof<MctsBatch>
+
         let mutable maxDepthReached = 0
         let mutable lastReportMs = 0L
         let mutable looping = true
@@ -821,6 +1064,22 @@ let private runWorker
                 looping <- false
             elif stopOnSolved && tree.NodeProven rootIdx <> PrUnknown then
                 looping <- false
+            elif useBatch then
+                let struct (d, completed) =
+                    runBatch tree w cpuct leafDepth kf maxTreeDepth rootIdx batch cfg.MctsBatchSize
+
+                if d > maxDepthReached then
+                    maxDepthReached <- d
+
+                if completed > 0 then
+                    for _ in 1 .. completed do
+                        w.IncIters() // each backed-up leaf is one completed iteration
+
+                    Interlocked.Add(&globalIters.[0], int64 completed) |> ignore // charge the global budget
+
+                if report && control.ElapsedMs - lastReportMs >= MctsReportIntervalMs then
+                    reportMctsMerged control trees roots kf maxDepthReached
+                    lastReportMs <- control.ElapsedMs
             else
                 let struct (d, backedUp) =
                     runIteration tree w cpuct leafDepth kf maxTreeDepth pathNodes pathEdges rootIdx
@@ -965,11 +1224,12 @@ let mctsToIterationsTreeLim
     (lim: SearchLimits)
     (cfg: SearchConfig)
     (net: SfNetwork option)
+    (lc0: Lc0Proto.Lc0Net option)
     : MctsTree * int * Worker =
     let tt = TranspositionTable(max 1 cfg.HashMb)
 
     let control =
-        SearchControl(cfg, lim, tt, fen, rootMoves, ?net = net)
+        SearchControl(cfg, lim, tt, fen, rootMoves, ?net = net, ?lc0Net = lc0)
 
     let w = Worker(0, true, control)
     w.SetupRoot()
@@ -995,7 +1255,7 @@ let mctsToIterationsTree
     (cfg: SearchConfig)
     (net: SfNetwork option)
     : MctsTree * int * Worker =
-    mctsToIterationsTreeLim fen rootMoves iters defaultLimits cfg net
+    mctsToIterationsTreeLim fen rootMoves iters defaultLimits cfg net None
 
 /// Deterministic oracle (runs MCTS regardless of cfg.UseMcts): struct(rootScoreCp, nodes, bestMove).
 let mctsToIterations

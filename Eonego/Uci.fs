@@ -199,7 +199,21 @@ let private startSearch (st: UciState) (lim: SearchLimits) =
               MctsLeafDepth = 8
               MctsK = 200
               // Lc0 (if loaded via EONEGO_LC0) drives priors; else the history-softmax fallback.
-              UseLc0 = st.Lc0Net.IsSome }
+              UseLc0 = st.Lc0Net.IsSome
+              // Batched Lc0 forwards per worker (EXPERIMENTAL, default OFF=1): on this hardware the larger
+              // batched activations spill cache and it runs SLOWER than single eval, so it is opt-in via the
+              // EONEGO_BATCH env var (for other hardware/nets). Only meaningful when Lc0 is active.
+              MctsBatchSize =
+                  if st.Lc0Net.IsSome then
+                      match System.Environment.GetEnvironmentVariable "EONEGO_BATCH" with
+                      | null
+                      | "" -> 1
+                      | s ->
+                          match System.Int32.TryParse s with
+                          | true, v when v >= 1 -> v
+                          | _ -> 1
+                  else
+                      1 }
 
         let control =
             SearchControl(cfg, lim, st.Tt, st.RootFen, st.RootMoves, ?net = st.Net, ?lc0Net = st.Lc0Net)

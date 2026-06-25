@@ -63,6 +63,29 @@ let tryLoadSfNet () : SfNetwork option =
         if System.IO.File.Exists p then (match Eonego.SfNnue.load p with Loaded n -> Some n | _ -> None) else None
     | None -> None
 
+/// Load the first nets/*.pb Lc0 net for batched-eval tests; None when absent (soft-skip).
+let tryLoadLc0 () : Eonego.Lc0Proto.Lc0Net option =
+    let mutable dir = System.IO.DirectoryInfo(System.AppContext.BaseDirectory)
+    let mutable root = None
+
+    while root.IsNone && not (isNull dir) do
+        if System.IO.File.Exists(System.IO.Path.Combine(dir.FullName, "Eonego.slnx")) then
+            root <- Some dir.FullName
+
+        dir <- dir.Parent
+
+    match root with
+    | Some r ->
+        let netsDir = System.IO.Path.Combine(r, "nets")
+
+        if System.IO.Directory.Exists netsDir then
+            match System.IO.Directory.GetFiles(netsDir, "*.pb") |> Array.sort |> Array.tryHead with
+            | Some p -> (match Eonego.Lc0Proto.load p with Eonego.Lc0Proto.Loaded n -> Some n | _ -> None)
+            | None -> None
+        else
+            None
+    | None -> None
+
 /// Make then Unmake must restore every byte; and after Make incremental key == from-scratch.
 let assertRoundTrips (p: Position) (m: Move) =
     let before = snap p

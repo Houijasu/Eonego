@@ -97,7 +97,8 @@ type SearchConfig =
       MctsCpuct: int // PUCT exploration constant, fixed-point ×100 (150 => 1.5)
       MctsLeafDepth: int // fixed negamax depth at each MCTS leaf (0 => qsearch-only leaf)
       MctsK: int // logistic cp->winprob scale (centipawns); match the training K
-      UseLc0: bool } // use the Lc0 CNN (Lc0Net.fs) for MCTS priors; requires a loaded Lc0 net (else history fallback)
+      UseLc0: bool // use the Lc0 CNN (Lc0Net.fs) for MCTS priors; requires a loaded Lc0 net (else history fallback)
+      MctsBatchSize: int } // >1: batch B leaves/worker through one Lc0 forward (virtual-loss gather); 1: single eval
 
 type SearchLimits =
     { MoveTime: int
@@ -131,7 +132,8 @@ let defaultConfig =
       MctsCpuct = 150
       MctsLeafDepth = 6
       MctsK = 200
-      UseLc0 = false }
+      UseLc0 = false
+      MctsBatchSize = 1 }
 
 let defaultLimits =
     { MoveTime = 0

@@ -364,21 +364,16 @@ let forwardBatch
         fcMatvec useAvx2 net.Value2W net.Value2B 1 v1n vh (b * v1n) scratch.Vout b
         outValues.[b] <- MathF.Tanh scratch.Vout.[b]
 
-/// Encode `pos`, run the net, gather the legal moves' policy logits, softmax into `outPriors[0..count-1]`.
-/// Returns the value as a win-probability q in [0,1] (STM-relative). `inBuf` is a caller-owned 112*64 buffer.
-let lc0PriorsInto
-    (useAvx2: bool)
-    (net: Lc0Net)
+/// Softmax the legal moves' policy logits (from a forward/forwardBatch output; board b's logits start at
+/// `logitsOff`) into outPriors[0..count-1]. Shared by the single (lc0PriorsInto) and batched (runBatch) paths.
+let lc0PriorsFromLogits
+    (logits: float32[])
+    (logitsOff: int)
     (pos: Position)
     (moves: Move[])
     (count: int)
-    (inBuf: float32[])
-    (scratch: Lc0Scratch)
     (outPriors: float32[])
-    : float32 =
-    Lc0Encoder.encodeInto pos inBuf
-    let struct (logits, value) = forward useAvx2 net scratch inBuf
-
+    : unit =
     if count = 1 then
         outPriors.[0] <- 1.0f
     else
@@ -387,7 +382,7 @@ let lc0PriorsInto
 
         for i in 0 .. count - 1 do
             let idx = Lc0PolicyMap.moveToNNIndex stmIsBlack moves.[i]
-            let l = if idx >= 0 then logits.[idx] else -1e9f
+            let l = if idx >= 0 then logits.[logitsOff + idx] else -1e9f
             outPriors.[i] <- l
             if l > mx then mx <- l
 
@@ -403,4 +398,19 @@ let lc0PriorsInto
         for i in 0 .. count - 1 do
             outPriors.[i] <- outPriors.[i] * inv
 
+/// Encode `pos`, run the net, gather the legal moves' policy logits, softmax into `outPriors[0..count-1]`.
+/// Returns the value as a win-probability q in [0,1] (STM-relative). `inBuf` is a caller-owned 112*64 buffer.
+let lc0PriorsInto
+    (useAvx2: bool)
+    (net: Lc0Net)
+    (pos: Position)
+    (moves: Move[])
+    (count: int)
+    (inBuf: float32[])
+    (scratch: Lc0Scratch)
+    (outPriors: float32[])
+    : float32 =
+    Lc0Encoder.encodeInto pos inBuf
+    let struct (logits, value) = forward useAvx2 net scratch inBuf
+    lc0PriorsFromLogits logits 0 pos moves count outPriors
     (value + 1.0f) * 0.5f

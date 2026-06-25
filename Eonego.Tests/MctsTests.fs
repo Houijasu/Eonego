@@ -178,7 +178,7 @@ let ``a mid-leaf node-limit stop never over-counts iterations (Iters == backed-u
         // A tiny node budget trips the leaf negamax's own CheckTime mid-playout; the aborted iteration must
         // bump neither root visits nor the iteration counter, so the two stay exactly equal.
         let lim = { defaultLimits with Nodes = 500L }
-        let (tree, root, w) = mctsToIterationsTreeLim StartPosFen [||] 1000 lim defaultConfig (Some net)
+        let (tree, root, w) = mctsToIterationsTreeLim StartPosFen [||] 1000 lim defaultConfig (Some net) None
         Assert.Equal(int64 (tree.NodeN root), w.Iters)
 
 /// Build n plies of reversible knight shuffles (g1f3/f3g1, g8f6/f6g8) from startpos as a legal move list —
@@ -254,3 +254,21 @@ let ``go depth iteration budget is global across threads, not multiplied per wor
         let t4 = run 4
         // ~2000 (a few extra from workers passing the check before the last increments land), NOT 4×2000.
         Assert.True(t4 >= 2000L && t4 < 4000L, "Threads=4 total iters should be ~2000 (global), got " + string t4)
+
+[<Fact>]
+let ``batched Lc0 MCTS gather produces a legal, principled move with consistent counts`` () =
+    match tryLoadSfNet (), tryLoadLc0 () with
+    | Some sf, Some lc0 ->
+        // UseLc0 + MctsBatchSize>1 routes runWorker through the virtual-loss batched gather (runBatch):
+        // gather B leaves -> ONE forwardBatch for priors -> per-leaf negamax value + backup (revert VL).
+        let cfg = { defaultConfig with UseLc0 = true; MctsBatchSize = 4 }
+        let (tree, root, w) = mctsToIterationsTreeLim StartPosFen [||] 100 defaultLimits cfg (Some sf) (Some lc0)
+        // root visits == iteration count (both count backed-up leaves); budget met (batch may overshoot by <B).
+        Assert.Equal(int64 (tree.NodeN root), w.Iters)
+        Assert.True(tree.NodeN root >= 100, "root visits " + string (tree.NodeN root))
+        // the Lc0 priors + gather + backup must still concentrate visits on a principled opening.
+        let (mv, _) = bestRootMove tree root
+        let best = toUci mv
+        let principled = [ "e2e4"; "d2d4"; "g1f3"; "c2c4"; "g2g3"; "b1c3" ]
+        Assert.True(List.contains best principled, "batched startpos best = " + best)
+    | _ -> () // soft-skip: needs both the SF and Lc0 nets
