@@ -1391,7 +1391,8 @@ let private tryPromoteReuse (control: SearchControl) (reuse: MctsReuse) : int =
 /// bestmove from the MERGED root statistics. Parallel results are timing-nondeterministic (same as LazySMP);
 /// the deterministic test path goes through `runWorker` directly (Threads is irrelevant there).
 let private runMctsParallel (control: SearchControl) (reuse: MctsReuse) : Move =
-    control.Reset()
+    // No control.Reset() here: the control is fresh per `go` (stopFlag already 0), and resetting would clear a
+    // stop / ponderhit that raced in before the search started — which must be honored (esp. unbounded ponder).
     control.Tt.NewSearch()
     // Worker 0 reuses the prior tree's subtree for the moves played since; the rest start fresh.
     let promotedRoot = tryPromoteReuse control reuse
@@ -1423,7 +1424,7 @@ let private runMctsParallel (control: SearchControl) (reuse: MctsReuse) : Move =
 
     let stm = workers.[0].Pos.SideToMove
     let (soft, hard) = computeTimes control.Config.MoveOverhead control.Limits stm
-    control.StartClock soft hard
+    control.StartClockPonder soft hard control.Limits.Ponder
 
     // GLOBAL budget = maxIters across ALL workers (Threads splits a `go depth N` budget ~N×, so wall-clock
     // latency drops with thread count instead of each worker redoing the whole N*MctsIterPerDepth).

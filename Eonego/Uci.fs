@@ -162,6 +162,9 @@ let private parseGo (tokens: string[]) : SearchLimits =
         | "infinite" ->
             lim <- { lim with Infinite = true }
             i <- i + 1
+        | "ponder" ->
+            lim <- { lim with Ponder = true }
+            i <- i + 1
         | _ -> i <- i + 1
 
     lim
@@ -324,6 +327,11 @@ let run () =
                 | "stop" ->
                     (match st.Control with
                      | Some c -> c.Stop()
+                     | None -> ())
+                | "ponderhit" ->
+                    // the opponent played the predicted move: arm the running ponder search's clock now.
+                    (match st.Control with
+                     | Some c -> c.PonderHit()
                      | None -> ())
                 | "setoption" -> handleSetOption st tokens
                 | "quit" ->

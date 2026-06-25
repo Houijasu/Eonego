@@ -110,7 +110,8 @@ type SearchLimits =
       Depth: int
       Nodes: int64
       Infinite: bool
-      Mate: int }
+      Mate: int
+      Ponder: bool }
 
 let defaultConfig =
     { Threads = 1
@@ -145,7 +146,8 @@ let defaultLimits =
       Depth = 0
       Nodes = 0L
       Infinite = false
-      Mate = 0 }
+      Mate = 0
+      Ponder = false }
 
 [<Struct>]
 type StackEntry =
@@ -254,6 +256,9 @@ type SearchControl
     let mutable softMs = 0L
     let mutable hardMs = 0L
     let mutable baseSoftMs = 0L // the un-scaled optimum; the per-iteration manager rescales softMs from it
+    let mutable ponderSoft = 0L // real budget remembered during a ponder search; armed by PonderHit
+    let mutable ponderHard = 0L
+    let mutable ponderHitPending = false // ponderhit that arrived before the search stored its budget
     member _.Config = config
     member _.Limits = limits
     member _.Tt = tt
@@ -281,6 +286,30 @@ type SearchControl
         baseSoftMs <- soft
         hardMs <- hard
         sw.Restart()
+
+    /// Ponder: search unbounded now and remember the real budget; PonderHit arms it (the clock starts then,
+    /// so the time used while pondering on the opponent's clock is free). If a ponderhit already raced ahead
+    /// (arrived before this stored the budget), arm immediately here.
+    member this.StartClockPonder (soft: int64) (hard: int64) (ponder: bool) =
+        if ponder then
+            ponderSoft <- soft
+            ponderHard <- hard
+
+            if ponderHitPending then
+                this.StartClock soft hard
+            else
+                this.StartClock 0L 0L
+        else
+            this.StartClock soft hard
+
+    /// The opponent played the predicted move: arm the remembered ponder budget. No-op for a non-ponder
+    /// search (spurious ponderhit); if the budget is not stored yet, StartClockPonder arms it when it runs.
+    member this.PonderHit() =
+        if limits.Ponder then
+            ponderHitPending <- true
+
+            if ponderSoft > 0L || ponderHard > 0L then
+                this.StartClock ponderSoft ponderHard
 
     /// Main worker only: convert a time/node budget overrun into the shared stop flag.
     member _.CheckTime(nodes: int64) =
@@ -1189,7 +1218,7 @@ let go (control: SearchControl) : Move =
     let struct (soft, hard) =
         (let (a, b) = computeTimes control.Config.MoveOverhead control.Limits stm in struct (a, b))
 
-    control.StartClock soft hard
+    control.StartClockPonder soft hard control.Limits.Ponder
 
     let maxDepth =
         if control.Limits.Depth > 0 then

@@ -432,3 +432,34 @@ let ``Compact preserves the live subtree and drops garbage`` () =
     Assert.True(ngc >= 0) // the grandchild survived with its stats
     Assert.Equal(1, compacted.NodeN ngc)
     Assert.True(abs (compacted.NodeW ngc - 0.3f) < 1e-6f)
+
+// ---------------------------------------------------------------------------
+// Ponder clock: search unbounded until ponderhit arms the remembered budget (race-safe both orders)
+// ---------------------------------------------------------------------------
+[<Fact>]
+let ``ponder clock stays unbounded until ponderhit arms the budget`` () =
+    let mkControl ponder =
+        let lim = { defaultLimits with Ponder = ponder; WTime = 3000; BTime = 3000 }
+        SearchControl(defaultConfig, lim, TranspositionTable(1), StartPosFen, [||])
+
+    // ponder: the budget is stored but the clock runs unbounded (soft = 0) until ponderhit.
+    let c1 = mkControl true
+    c1.StartClockPonder 100L 400L true
+    Assert.Equal(0L, c1.BaseSoftMs)
+    Assert.False(c1.SoftTimeUp) // soft = 0 is never "up"
+    c1.PonderHit()
+    Assert.Equal(100L, c1.BaseSoftMs) // ponderhit armed the remembered soft budget
+
+    // race: ponderhit arrives BEFORE the search stored the budget -> StartClockPonder arms it when it runs.
+    let c2 = mkControl true
+    c2.PonderHit()
+    Assert.Equal(0L, c2.BaseSoftMs) // nothing to arm yet
+    c2.StartClockPonder 100L 400L true
+    Assert.Equal(100L, c2.BaseSoftMs)
+
+    // a non-ponder search: ponderhit is a no-op (cannot disturb the real clock).
+    let c3 = SearchControl(defaultConfig, { defaultLimits with WTime = 3000 }, TranspositionTable(1), StartPosFen, [||])
+    c3.StartClockPonder 100L 400L false
+    Assert.Equal(100L, c3.BaseSoftMs)
+    c3.PonderHit()
+    Assert.Equal(100L, c3.BaseSoftMs)
