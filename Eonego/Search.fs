@@ -259,6 +259,7 @@ type SearchControl
     let mutable ponderSoft = 0L // real budget remembered during a ponder search; armed by PonderHit
     let mutable ponderHard = 0L
     let mutable ponderHitPending = false // ponderhit that arrived before the search stored its budget
+    let ponderLock = obj () // guards the ponder fields, shared between the UCI thread and the search thread
     let mutable mctsNodeBudget = false // MCTS treats `go nodes N` as an ITERATION budget => CheckTime ignores Nodes
     member _.Config = config
     member _.Limits = limits
@@ -293,13 +294,16 @@ type SearchControl
     /// (arrived before this stored the budget), arm immediately here.
     member this.StartClockPonder (soft: int64) (hard: int64) (ponder: bool) =
         if ponder then
-            ponderSoft <- soft
-            ponderHard <- hard
+            // The lock (vs bare volatile) also closes the store-load / Dekker window if a ponderhit runs on
+            // the UCI thread at the same instant — one of the two methods always arms the budget.
+            lock ponderLock (fun () ->
+                ponderSoft <- soft
+                ponderHard <- hard
 
-            if ponderHitPending then
-                this.StartClock soft hard
-            else
-                this.StartClock 0L 0L
+                if ponderHitPending then
+                    this.StartClock soft hard
+                else
+                    this.StartClock 0L 0L)
         else
             this.StartClock soft hard
 
@@ -307,10 +311,11 @@ type SearchControl
     /// search (spurious ponderhit); if the budget is not stored yet, StartClockPonder arms it when it runs.
     member this.PonderHit() =
         if limits.Ponder then
-            ponderHitPending <- true
+            lock ponderLock (fun () ->
+                ponderHitPending <- true
 
-            if ponderSoft > 0L || ponderHard > 0L then
-                this.StartClock ponderSoft ponderHard
+                if ponderSoft > 0L || ponderHard > 0L then
+                    this.StartClock ponderSoft ponderHard)
 
     /// MCTS uses `go nodes N` as an iteration budget (Lc0 convention) and counts iterations itself, so its
     /// driver disables the leaf-node stop here; alpha-beta leaves it on (the `go nodes N` = leaf nodes).
