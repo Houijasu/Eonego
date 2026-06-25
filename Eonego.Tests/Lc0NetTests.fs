@@ -380,3 +380,83 @@ let ``Lc0 int8 quantization of the whole net keeps top move and value`` () =
             // Value drives leaf Q in a pure-Lc0 design; require it to barely move (eval is in [-1,1]).
             Assert.True(abs (vf - vq) < 0.05f, sprintf "whole-net int8 value %f vs %f (diff %f)" vf vq (abs (vf - vq)))
             Assert.True(maxd < 2.0f, sprintf "whole-net int8 max logit diff %f (logits are O(1..10))" maxd)
+
+// ---------------------------------------------------------------------------
+// The harder int8 gate: ACTIVATION quantization. A real int8 kernel feeds each GEMM int8 activations and
+// accumulates in int32; activation precision (not weight precision) is where CNNs usually lose accuracy,
+// and it compounds through 21 ReLU blocks. Lc0Net.FakeQuantActs snaps every post-ReLU activation to a
+// per-tensor symmetric int8 grid (a pessimistic proxy for a real u8 kernel). We check two things:
+//   (1) activations-only (fp32 weights) — isolates the new variable;
+//   (2) activations + whole-net int8 weights — the actual int8 forward.
+// Both must keep the top move and barely move the value. If either fails, int8 conv kernels are a no-go
+// until finer (per-channel activation) quant; if both pass, activation quant is green-lit too.
+// ---------------------------------------------------------------------------
+[<Fact>]
+let ``Lc0 int8 activation quantization keeps a near-best move and value`` () =
+    match tryNetPath () with
+    | None -> ()
+    | Some p ->
+        match load p with
+        | Failed r -> Assert.Fail r
+        | Loaded net ->
+            // whole-net int8 weights (reuses the per-row helpers above).
+            let netQ =
+                { net with
+                    Input = q8conv net.Input
+                    Tower =
+                        net.Tower
+                        |> Array.map (fun r ->
+                            { r with
+                                Conv1 = q8conv r.Conv1
+                                Conv2 = q8conv r.Conv2
+                                Se = q8se r.Se })
+                    PolicyConv = q8conv net.PolicyConv
+                    PolicyW = q8 net.PolicyW (net.PolicyW.Length / Eonego.Lc0PolicyMap.NumPolicy)
+                    ValueConv = q8conv net.ValueConv
+                    Value1W = q8 net.Value1W (net.Value1W.Length / net.Value1B.Length)
+                    Value2W = q8 net.Value2W net.Value2W.Length }
+
+            let topOf (l: float32[]) =
+                let mutable a = 0
+                for i in 1 .. 1857 do
+                    if l.[i] > l.[a] then a <- i
+                a
+
+            // Diverse positions: white/black, castling, sharp tactics, a bare K+P endgame.
+            let fens =
+                [ "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+                  "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3"
+                  "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"
+                  "8/2k5/8/8/3K4/8/4P3/8 w - - 0 1" ]
+
+            // Robust criterion: rather than demanding the EXACT top move (which can flip on legitimately-close
+            // calls), require the move int8 picks to be near-best under the fp32 net — its fp32 logit within
+            // `margin` of the fp32 best. That is exactly what search quality depends on (a near-optimal prior).
+            let margin = 0.9f
+
+            try
+                for fen in fens do
+                    let pos = Position.OfFen fen
+                    let inBuf = Array.zeroCreate<float32> (112 * 64)
+                    Eonego.Lc0Encoder.encodeInto pos inBuf
+
+                    Eonego.Lc0Net.FakeQuantActs <- false
+                    let struct (lRef, vRef) = Eonego.Lc0Net.forward true net (Eonego.Lc0Net.Lc0Scratch(net)) inBuf
+                    let bestRef = topOf lRef
+
+                    Eonego.Lc0Net.FakeQuantActs <- true
+                    let struct (lA, vA) = Eonego.Lc0Net.forward true net (Eonego.Lc0Net.Lc0Scratch(net)) inBuf // acts-only
+                    let struct (lAW, vAW) = Eonego.Lc0Net.forward true netQ (Eonego.Lc0Net.Lc0Scratch(netQ)) inBuf // full int8
+                    Eonego.Lc0Net.FakeQuantActs <- false
+
+                    // (1) activations-only regret + value.
+                    let regretA = lRef.[bestRef] - lRef.[topOf lA]
+                    Assert.True(regretA < margin, sprintf "act-only regret %f at %s" regretA fen)
+                    Assert.True(abs (vRef - vA) < 0.06f, sprintf "act-only value %f vs %f at %s" vRef vA fen)
+
+                    // (2) full int8 (acts + weights) regret + value.
+                    let regretAW = lRef.[bestRef] - lRef.[topOf lAW]
+                    Assert.True(regretAW < margin, sprintf "full-int8 regret %f at %s" regretAW fen)
+                    Assert.True(abs (vRef - vAW) < 0.08f, sprintf "full-int8 value %f vs %f at %s" vRef vAW fen)
+            finally
+                Eonego.Lc0Net.FakeQuantActs <- false // never leak the toggle into other tests

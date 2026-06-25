@@ -15,6 +15,15 @@ open Eonego.Lc0Proto
 // ---------------------------------------------------------------------------
 // Kernels (gated by `useAvx2`; scalar path is the reference).
 // ---------------------------------------------------------------------------
+
+/// TEST-ONLY activation fake-quant toggle. When true, every reluInPlace snaps its output slice to a
+/// per-tensor symmetric int8 grid (scale = max/127), modelling int8 activation precision as it compounds
+/// through the 21-block tower — WITHOUT writing any int8 kernel. Post-ReLU activations feed every conv/FC
+/// GEMM, so this covers the inter-block stream that error would accumulate in. It is a *pessimistic* proxy
+/// for a real u8-activation kernel (127 positive levels vs u8's 255). Default false => the production
+/// forward is byte-identical (one predictable-false branch per relu). NOT thread-safe; tests are single-threaded.
+let mutable FakeQuantActs = false
+
 let private reluInPlace (useAvx2: bool) (a: float32[]) (off: int) (n: int) : unit =
     let endi = off + n
 
@@ -32,6 +41,20 @@ let private reluInPlace (useAvx2: bool) (a: float32[]) (off: int) (n: int) : uni
     else
         for i in off .. endi - 1 do
             if a.[i] < 0.0f then a.[i] <- 0.0f
+
+    if FakeQuantActs then
+        // Per-tensor symmetric int8 of the post-ReLU slice (values >= 0): scale = max/127, round, rescale.
+        let mutable mx = 0.0f
+
+        for i in off .. endi - 1 do
+            if a.[i] > mx then mx <- a.[i]
+
+        if mx > 0.0f then
+            let inv = 127.0f / mx
+            let scale = mx / 127.0f
+
+            for i in off .. endi - 1 do
+                a.[i] <- MathF.Round(a.[i] * inv) * scale
 
 /// out[outC * nPos*64] = conv(W[outC*inC*k*k], input[inC * nPos*64]) + bias ; k in {1,3}, same padding.
 /// Batched over `nPos` independent 8x8 boards: a tensor is channel-major float32[C * nPos*64], a channel's
