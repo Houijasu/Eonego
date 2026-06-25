@@ -54,6 +54,17 @@ let private tryInt (s: string) : int =
     | true, v -> v
     | _ -> 0
 
+/// An MCTS tuning parameter overridable via an env var (for SPRT/self-play sweeps without unlocking the
+/// release UCI surface). Defaults to the shipped value when unset/invalid.
+let private envInt (name: string) (defaultValue: int) : int =
+    match System.Environment.GetEnvironmentVariable name with
+    | null
+    | "" -> defaultValue
+    | s ->
+        match Int32.TryParse s with
+        | true, v -> v
+        | _ -> defaultValue
+
 /// UCI moves are castling/en-passant flag-lossy via parseUci, so re-stamp each against legal generation.
 let private matchMove (pos: Position) (uci: string) : Move =
     let t = parseUci uci
@@ -199,9 +210,10 @@ let private startSearch (st: UciState) (lim: SearchLimits) =
               UseAspTweaks = true
               MoveOverhead = st.MoveOverhead
               UseMcts = true
-              MctsCpuct = 150
-              MctsLeafDepth = 8
-              MctsK = 200
+              // MCTS tuning knobs, env-overridable for SPRT sweeps (defaults are the shipped values).
+              MctsCpuct = envInt "EONEGO_CPUCT" 150
+              MctsLeafDepth = envInt "EONEGO_LEAFDEPTH" 8
+              MctsK = envInt "EONEGO_K" 200
               // Lc0 (if loaded via EONEGO_LC0) drives priors; else the history-softmax fallback.
               UseLc0 = st.Lc0Net.IsSome
               // Batched Lc0 forwards per worker (EXPERIMENTAL, default OFF=1): on this hardware the larger
