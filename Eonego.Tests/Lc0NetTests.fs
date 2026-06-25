@@ -101,7 +101,16 @@ let ``Lc0 1858 policy map round-trips legal moves with no collisions`` () =
             let flip s = if stmIsBlack then s ^^^ 56 else s
             let uci = Eonego.Lc0PolicyMap.nnIndexToUci.[idx]
             Assert.Equal(flip (fromSq m), psq uci 0)
-            Assert.Equal(flip (toSq m), psq uci 2)
+            // Castling maps to the rook square (king-captures-rook: e1h1/e1a1), not the king's two-square dest.
+            let expectedTo =
+                if isCastling m then
+                    let kf = flip (fromSq m) &&& 7
+                    let tf = flip (toSq m) &&& 7
+                    (flip (fromSq m) &&& 56) ||| (if tf > kf then 7 else 0)
+                else
+                    flip (toSq m)
+
+            Assert.Equal(expectedTo, psq uci 2)
 
             if isPromotion m then
                 let pc = (m >>> 12) &&& 0x3 // 0=N,1=B,2=R,3=Q
@@ -156,6 +165,36 @@ let ``Lc0 encoder produces the expected 112-plane structure`` () =
 // The "principled opening move" check is the strongest end-to-end correctness signal without an lc0 oracle:
 // a broken conv/encoder/BN/SE/policy-map would yield garbage (uniform or random) policy.
 // ---------------------------------------------------------------------------
+// Regression: the net encodes castling as king-captures-rook (e1h1/e1a1), so moveToNNIndex must remap the
+// king-two-squares castling move to the rook square — otherwise O-O reads the wrong (near-zero) policy slot.
+// Position is the Ruy Lopez Berlin after ...Nf6, where 4.O-O is the main line: the net must give O-O a large
+// prior. Before the fix O-O's prior was ~0.005 (rank 11/32) and the engine never castled.
+[<Fact>]
+let ``Lc0 gives castling its main-line prior (king-to-rook encoding)`` () =
+    match tryNetPath () with
+    | None -> ()
+    | Some p ->
+        match load p with
+        | Failed r -> Assert.Fail r
+        | Loaded net ->
+            let pos = Position.OfFen "r1bqkb1r/pppp1ppp/2n2n2/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 0 4"
+            let inBuf = Array.zeroCreate<float32> (112 * 64)
+            Eonego.Lc0Encoder.encodeInto pos inBuf
+            let moves = Eonego.Tests.TestFixtures.collectLegal pos
+            let priors = Array.zeroCreate<float32> moves.Length
+            let scratch = Eonego.Lc0Net.Lc0Scratch(net)
+            Eonego.Lc0Net.lc0PriorsInto true net pos moves moves.Length inBuf scratch priors |> ignore
+
+            let mutable ci = -1
+            for i in 0 .. moves.Length - 1 do
+                if toUci moves.[i] = "e1g1" then ci <- i
+
+            Assert.True(ci >= 0, "O-O (e1g1) must be a legal move here")
+            Assert.True(
+                priors.[ci] > 0.3f,
+                "O-O prior = " + priors.[ci].ToString("0.000") + " (expected the net's main-line castling prior; was ~0.005 before the king-to-rook fix)"
+            )
+
 [<Fact>]
 let ``Lc0 forward pass: scalar==AVX2 and sane policy+value`` () =
     match tryNetPath () with

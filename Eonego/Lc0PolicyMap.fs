@@ -41,7 +41,16 @@ let private packedToNN: int[] =
 let moveToNNIndex (stmIsBlack: bool) (m: Move) : int =
     let flip s = if stmIsBlack then s ^^^ 56 else s
     let frm = flip (fromSq m)
-    let dst = flip (toSq m)
+    let mutable dst = flip (toSq m)
+    // lc0 encodes castling as king-CAPTURES-ROOK (e1h1 / e1a1), NOT king-two-squares (e1g1 / e1c1) — verified
+    // against the shipped net (logit[e1h1]=6.88 >> logit[e1g1]=0.37 in a Ruy Lopez where O-O is the main move).
+    // Eonego's castling move is king-two-squares, so remap the destination to the rook's square (same back rank,
+    // file h for kingside / file a for queenside) before the table lookup, matching lc0's MoveToNNIndex.
+    if isCastling m then
+        let kingFile = frm &&& 7
+        let toFile = dst &&& 7
+        dst <- (frm &&& 56) ||| (if toFile > kingFile then 7 else 0)
+
     let promo = if isPromotion m then (m >>> 12) &&& 0x3 else 0
     let packed = promo * 4096 + frm * 64 + dst
     if packed >= 0 && packed < packedToNN.Length then packedToNN.[packed] else -1
