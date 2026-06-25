@@ -312,3 +312,19 @@ let ``batched Lc0 MCTS gather produces a legal, principled move with consistent 
         let principled = [ "e2e4"; "d2d4"; "g1f3"; "c2c4"; "g2g3"; "b1c3" ]
         Assert.True(List.contains best principled, "batched startpos best = " + best)
     | _ -> () // soft-skip: needs both the SF and Lc0 nets
+
+// ---------------------------------------------------------------------------
+// WAC-style tactical regression suite (deterministic oracle + SF leaf). A guard against search regressions
+// from future tuning; each position is a short, unambiguous tactic the hybrid must find.
+// ---------------------------------------------------------------------------
+[<Theory>]
+[<InlineData("6k1/5ppp/8/8/8/8/8/R6K w - - 0 1", "a1a8")>] // mate in 1
+[<InlineData("4k3/8/8/3q4/4P3/8/8/3RK3 w - - 0 1", "e4d5")>] // win the hanging queen
+[<InlineData("3r2k1/5ppp/8/8/8/8/5PPP/3R2K1 w - - 0 1", "d1d8")>] // win the back-rank rook
+[<InlineData("3qk3/8/8/8/8/8/8/3RK3 w - - 0 1", "d1d8")>] // win the pinned queen
+let ``WAC: hybrid finds the winning tactic`` (fen: string) (expected: string) =
+    match tryLoadSfNet () with
+    | None -> () // soft-skip: tactics need the SF leaf eval
+    | Some net ->
+        let struct (_, _, m) = mctsToIterations fen [||] 400 defaultConfig (Some net)
+        Assert.Equal(expected, toUci m)
