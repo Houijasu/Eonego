@@ -210,7 +210,9 @@ let private startSearch (st: UciState) (lim: SearchLimits) =
               UseLmrTweaks = true
               UseAspTweaks = true
               MoveOverhead = st.MoveOverhead
-              UseMcts = true
+              // MCTS is the production search; EONEGO_MCTS=0 routes `go` through plain alpha-beta (Search.go)
+              // so one binary can A/B the hybrid vs alpha-beta at equal movetime (the dispatch is at startSearch).
+              UseMcts = (envInt "EONEGO_MCTS" 1) <> 0
               // MCTS tuning knobs, env-overridable for SPRT sweeps (defaults are the shipped values).
               MctsCpuct = envInt "EONEGO_CPUCT" 150
               MctsLeafDepth = envInt "EONEGO_LEAFDEPTH" 8
@@ -290,6 +292,9 @@ let run () =
                     System.IO.Directory.GetFiles(d, "*.pb") |> Array.sort |> Array.tryHead
                 with _ -> None)
             |> Option.defaultValue ""
+        // Explicit disable sentinel: EONEGO_LC0=none/off/0 forces the history-prior fallback WITHOUT auto-
+        // discovery, so an ablation (Lc0 policy vs history priors) can be run on one binary by env alone.
+        | p when (let l = p.Trim().ToLowerInvariant() in l = "none" || l = "off" || l = "0" || l = "disable") -> ""
         | p -> p
 
     let lc0Net =
