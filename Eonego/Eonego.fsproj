@@ -48,6 +48,7 @@
     <Compile Include="Position.fs" />
     <Compile Include="SfNnue.fs" />
     <Compile Include="Lc0Proto.fs" />
+    <Compile Include="Lc0Quant.fs" />
     <Compile Include="Lc0PolicyMap.fs" />
     <Compile Include="Lc0Encoder.fs" />
     <Compile Include="Lc0Net.fs" />
