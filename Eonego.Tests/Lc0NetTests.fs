@@ -460,3 +460,55 @@ let ``Lc0 int8 activation quantization keeps a near-best move and value`` () =
                     Assert.True(abs (vRef - vAW) < 0.08f, sprintf "full-int8 value %f vs %f at %s" vRef vAW fen)
             finally
                 Eonego.Lc0Net.FakeQuantActs <- false // never leak the toggle into other tests
+
+// ---------------------------------------------------------------------------
+// End-to-end gate for the REAL int8 forward (Lc0Net.forwardI8): fp32 input conv + int8 tower/heads + fp32 SE,
+// using the actual i8Conv / i8Matvec kernels and per-channel scales (not the FakeQuantActs simulation). It
+// must track the fp32 forward on diverse positions: the move it prioritises is near-best under fp32 (regret
+// bound), and its value barely moves. This is the production-shaped path, so it is the binding accuracy test.
+// ---------------------------------------------------------------------------
+[<Fact>]
+let ``Lc0 forwardI8 tracks the fp32 forward (near-best move + value)`` () =
+    match tryNetPath () with
+    | None -> ()
+    | Some p ->
+        match load p with
+        | Failed r -> Assert.Fail r
+        | Loaded net ->
+            let q = Eonego.Lc0Net.quantize net
+            let scratch = Eonego.Lc0Net.Lc0Scratch(net)
+            let qs = Eonego.Lc0Net.Lc0Int8Scratch(net)
+
+            let topOf (l: float32[]) =
+                let mutable a = 0
+                for i in 1 .. 1857 do
+                    if l.[i] > l.[a] then a <- i
+                a
+
+            let fens =
+                [ "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+                  "r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3"
+                  "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"
+                  "8/2k5/8/8/3K4/8/4P3/8 w - - 0 1"
+                  "r2q1rk1/1b1nbppp/p2ppn2/1p6/3NPP2/1BN1B3/PPPQ2PP/2KR3R w - - 6 11" ] // high rule50-free middlegame
+
+            let margin = 0.9f
+
+            for fen in fens do
+                let pos = Position.OfFen fen
+                let inBuf = Array.zeroCreate<float32> (112 * 64)
+                Eonego.Lc0Encoder.encodeInto pos inBuf
+
+                let struct (lRef, vRef) = Eonego.Lc0Net.forward true net (Eonego.Lc0Net.Lc0Scratch(net)) inBuf
+                let struct (lI8, vI8) = Eonego.Lc0Net.forwardI8 true net q scratch qs inBuf
+
+                let bestRef = topOf lRef
+                let regret = lRef.[bestRef] - lRef.[topOf lI8]
+                Assert.True(regret < margin, sprintf "forwardI8 regret %f at %s" regret fen)
+                Assert.True(abs (vRef - vI8) < 0.08f, sprintf "forwardI8 value %f vs %f at %s" vRef vI8 fen)
+
+                // logits/value must be finite (no NaN/Inf from a bad scale or saturated dot).
+                Assert.True(
+                    Array.forall (fun x -> not (System.Single.IsNaN x || System.Single.IsInfinity x)) lI8,
+                    sprintf "forwardI8 logits NaN/Inf at %s" fen
+                )

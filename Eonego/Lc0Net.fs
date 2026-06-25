@@ -301,6 +301,121 @@ let forward (useAvx2: bool) (net: Lc0Net) (scratch: Lc0Scratch) (input: float32[
 
     struct (logits, MathF.Tanh vout.[0])
 
+// ---------------------------------------------------------------------------
+// int8 quantized forward. The conv TOWER (~1.6G MACs, the real bottleneck) plus the policy/value convs and
+// FCs run through the saturation-safe u8xi8 kernels (Lc0Quant); the input conv stays fp32 (its raw planes
+// mix piece 0/1 with rule50 up to ~100, so a single per-tensor act scale would crush the piece planes), and
+// SE stays fp32 (negligible compute, non-post-ReLU inputs). Accuracy is green-lit by the FakeQuantActs gate
+// in Lc0NetTests (this path is strictly more accurate — it quantizes fewer layers than that gate).
+// ---------------------------------------------------------------------------
+type Lc0ConvI8 =
+    { W: sbyte[] // [outC][inC*k*k] i8
+      Scale: float32[] // per-output-channel dequant scale
+      B: float32[] // fp32 BN-folded bias
+      InC: int
+      OutC: int
+      K: int }
+
+type Lc0Int8 =
+    { Tower: struct (Lc0ConvI8 * Lc0ConvI8)[] // (conv1, conv2) per block; SE stays fp32 in the source net
+      PolicyConv: Lc0ConvI8
+      PolicyW: sbyte[]
+      PolicyScale: float32[]
+      ValueConv: Lc0ConvI8
+      Value1W: sbyte[]
+      Value1Scale: float32[]
+      Value2W: sbyte[]
+      Value2Scale: float32[] }
+
+let private quantizeConv (cb: Lc0ConvBlock) : Lc0ConvI8 =
+    let struct (w, sc) = Lc0Quant.quantizeRowsI8 cb.W cb.OutC (cb.W.Length / cb.OutC)
+    { W = w; Scale = sc; B = cb.B; InC = cb.InC; OutC = cb.OutC; K = cb.K }
+
+/// Build the int8 companion of a net (call ONCE at load — weights become ~4x smaller and feed the i8 kernels).
+let quantize (net: Lc0Net) : Lc0Int8 =
+    let struct (pw, ps) =
+        Lc0Quant.quantizeRowsI8 net.PolicyW Lc0PolicyMap.NumPolicy (net.PolicyW.Length / Lc0PolicyMap.NumPolicy)
+
+    let struct (v1, v1s) =
+        Lc0Quant.quantizeRowsI8 net.Value1W net.Value1B.Length (net.Value1W.Length / net.Value1B.Length)
+
+    let struct (v2, v2s) = Lc0Quant.quantizeRowsI8 net.Value2W 1 net.Value2W.Length
+
+    { Tower = net.Tower |> Array.map (fun r -> struct (quantizeConv r.Conv1, quantizeConv r.Conv2))
+      PolicyConv = quantizeConv net.PolicyConv
+      PolicyW = pw
+      PolicyScale = ps
+      ValueConv = quantizeConv net.ValueConv
+      Value1W = v1
+      Value1Scale = v1s
+      Value2W = v2
+      Value2Scale = v2s }
+
+/// Per-Worker int8 scratch (byte im2col buffers + FC act/raw scratch), sized once from the net's dims.
+[<Sealed>]
+type Lc0Int8Scratch(net: Lc0Net) =
+    let c = net.Channels
+    member val InU8: byte[] = Array.zeroCreate (c * 64) // >= max conv inC * 64
+    member val ColT: byte[] = Array.zeroCreate (64 * (c * 9)) // >= 64 * max kk (tower 3x3)
+    member val ActBuf: byte[] = Array.zeroCreate (net.PolicyConv.OutC * 64) // >= max FC k
+    member val RawBuf: int[] = Array.zeroCreate Lc0PolicyMap.NumPolicy // >= max FC rows
+
+/// int8 forward: fp32 input conv + ReLU, then the SE-residual tower and policy/value heads through the int8
+/// conv/FC kernels (SE gate stays fp32). Returns (logits aliasing scratch.Logits, value). Mirrors `forward`
+/// buffer-for-buffer; `qs` byte buffers are reused across every conv/FC (each call fully overwrites its region).
+let forwardI8
+    (useAvx2: bool)
+    (net: Lc0Net)
+    (q: Lc0Int8)
+    (scratch: Lc0Scratch)
+    (qs: Lc0Int8Scratch)
+    (input: float32[])
+    : struct (float32[] * float32) =
+    let c = net.Channels
+    let col = scratch.Col
+    let cur = scratch.Cur
+    let tmp = scratch.Tmp
+    let resSave = scratch.ResSave
+    let z = scratch.Z
+    let s1 = scratch.S1
+    let s2 = scratch.S2
+    let inU8 = qs.InU8
+    let colT = qs.ColT
+
+    // Input convolution 112 -> 256 (3x3) + ReLU — fp32 (raw planes mix piece 0/1 with rule50 up to ~100).
+    conv useAvx2 net.Input.W net.Input.B net.Input.InC net.Input.OutC net.Input.K 1 input col cur
+    reluInPlace useAvx2 cur 0 (c * 64)
+
+    // SE-residual tower (int8 convs, fp32 SE gate).
+    for i in 0 .. net.Tower.Length - 1 do
+        let struct (c1, c2) = q.Tower.[i]
+        Array.blit cur 0 resSave 0 (c * 64)
+        Lc0Quant.i8Conv useAvx2 cur c1.InC c1.OutC c1.K 1 c1.W c1.Scale c1.B inU8 colT tmp
+        reluInPlace useAvx2 tmp 0 (c * 64)
+        Lc0Quant.i8Conv useAvx2 tmp c2.InC c2.OutC c2.K 1 c2.W c2.Scale c2.B inU8 colT cur
+        applySE useAvx2 net.Tower.[i].Se 1 cur resSave z s1 s2
+
+    // Policy head: int8 conv 256->256 (1x1) + ReLU -> int8 FC -> 1858 logits.
+    let polC = net.PolicyConv.OutC
+    let polConv = scratch.PolConv
+    Lc0Quant.i8Conv useAvx2 cur q.PolicyConv.InC polC q.PolicyConv.K 1 q.PolicyConv.W q.PolicyConv.Scale q.PolicyConv.B inU8 colT polConv
+    reluInPlace useAvx2 polConv 0 (polC * 64)
+    let logits = scratch.Logits
+    Lc0Quant.i8Matvec useAvx2 polConv 0 (polC * 64) q.PolicyW q.PolicyScale net.PolicyB Lc0PolicyMap.NumPolicy qs.ActBuf qs.RawBuf logits
+
+    // Value head: int8 conv 256->64 (1x1) + ReLU -> int8 FC 4096->128 + ReLU -> int8 FC 128->1 -> tanh.
+    let valC = net.ValueConv.OutC
+    let valConv = scratch.ValConv
+    Lc0Quant.i8Conv useAvx2 cur q.ValueConv.InC valC q.ValueConv.K 1 q.ValueConv.W q.ValueConv.Scale q.ValueConv.B inU8 colT valConv
+    reluInPlace useAvx2 valConv 0 (valC * 64)
+    let vh = scratch.Vh
+    Lc0Quant.i8Matvec useAvx2 valConv 0 (valC * 64) q.Value1W q.Value1Scale net.Value1B net.Value1B.Length qs.ActBuf qs.RawBuf vh
+    reluInPlace useAvx2 vh 0 net.Value1B.Length
+    let vout = scratch.Vout
+    Lc0Quant.i8Matvec useAvx2 vh 0 net.Value1B.Length q.Value2W q.Value2Scale net.Value2B 1 qs.ActBuf qs.RawBuf vout
+
+    struct (logits, MathF.Tanh vout.[0])
+
 /// Per-Worker BATCHED forward scratch, sized for up to `maxBatch` positions (maxBatch*64 spatial columns).
 /// Same role as Lc0Scratch but batched; `HeadTmp` repacks one board's strided conv output into the
 /// contiguous [channel*64+cell] vector the head FCs expect.
