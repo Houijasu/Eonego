@@ -322,6 +322,8 @@ let ``batched Lc0 MCTS gather produces a legal, principled move with consistent 
 [<InlineData("4k3/8/8/3q4/4P3/8/8/3RK3 w - - 0 1", "e4d5")>] // win the hanging queen
 [<InlineData("3r2k1/5ppp/8/8/8/8/5PPP/3R2K1 w - - 0 1", "d1d8")>] // win the back-rank rook
 [<InlineData("3qk3/8/8/8/8/8/8/3RK3 w - - 0 1", "d1d8")>] // win the pinned queen
+[<InlineData("4k3/8/8/8/8/8/4r3/4K1R1 w - - 0 1", "e1e2")>] // capture the checking rook
+[<InlineData("6k1/8/8/8/8/8/6q1/R5K1 w - - 0 1", "g1g2")>] // capture the checking queen
 let ``WAC: hybrid finds the winning tactic`` (fen: string) (expected: string) =
     match tryLoadSfNet () with
     | None -> () // soft-skip: tactics need the SF leaf eval
