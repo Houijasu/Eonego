@@ -250,7 +250,7 @@ let isLegalRoot (pos: Position) (m: Move) : bool =
 // ---------------------------------------------------------------------------
 [<Sealed>]
 type SearchControl
-    (config: SearchConfig, limits: SearchLimits, tt: TranspositionTable, rootFen: string, rootMoves: Move[], ?net: SfNetwork, ?lc0Net: Lc0Proto.Lc0Net) =
+    (config: SearchConfig, limits: SearchLimits, tt: TranspositionTable, rootFen: string, rootMoves: Move[], ?net: SfNetwork, ?lc0Net: Lc0Proto.Lc0Net, ?lc0Int8: Lc0Net.Lc0Int8) =
     let mutable stopFlag = 0
     let sw = System.Diagnostics.Stopwatch()
     let mutable softMs = 0L
@@ -268,6 +268,8 @@ type SearchControl
     member _.RootMoves = rootMoves
     member _.Net: SfNetwork option = net
     member _.Lc0Net: Lc0Proto.Lc0Net option = lc0Net
+    /// int8 companion of the Lc0 net (built once at load); when present, MCTS priors use the ~2.77x int8 forward.
+    member _.Lc0Int8: Lc0Net.Lc0Int8 option = lc0Int8
     member val LastBest: Move = MoveNone with get, set // result of the most recent go()
     member val LastScore: int = 0 with get, set
     /// Aggregate live node count across all workers (relaxed reads — reporting only, set by go()).
@@ -359,6 +361,11 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
         match control.Lc0Net with
         | Some n when control.Config.UseLc0 -> Lc0Net.Lc0Scratch(n)
         | _ -> Unchecked.defaultof<Lc0Net.Lc0Scratch>
+    // Per-Worker int8 scratch (byte im2col + FC scratch); built only when the int8 companion is present.
+    let lc0Int8Scratch: Lc0Net.Lc0Int8Scratch =
+        match control.Lc0Net, control.Lc0Int8 with
+        | Some n, Some _ when control.Config.UseLc0 -> Lc0Net.Lc0Int8Scratch(n)
+        | _ -> Unchecked.defaultof<Lc0Net.Lc0Int8Scratch>
     let mutable nodes = 0L
     let mutable iters = 0L
     let mutable selDepth = 0
@@ -382,6 +389,7 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     member _.Lc0Priors       = lc0Priors
     member _.Lc0InBuf        = lc0InBuf
     member _.Lc0Scratch      = lc0Scratch
+    member _.Lc0Int8Scratch  = lc0Int8Scratch
 
     member _.Nodes
         with get () = nodes

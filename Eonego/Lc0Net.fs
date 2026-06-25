@@ -552,3 +552,22 @@ let lc0PriorsInto
     let struct (logits, value) = forward useAvx2 net scratch inBuf
     lc0PriorsFromLogits logits 0 pos moves count outPriors
     (value + 1.0f) * 0.5f
+
+/// int8 variant of lc0PriorsInto (~2.77x faster forward). Same contract; runs forwardI8 with the net's int8
+/// companion `q` (Lc0Net.quantize) and the per-Worker int8 scratch `qs`.
+let lc0PriorsIntoI8
+    (useAvx2: bool)
+    (net: Lc0Net)
+    (q: Lc0Int8)
+    (pos: Position)
+    (moves: Move[])
+    (count: int)
+    (inBuf: float32[])
+    (scratch: Lc0Scratch)
+    (qs: Lc0Int8Scratch)
+    (outPriors: float32[])
+    : float32 =
+    Lc0Encoder.encodeInto pos inBuf
+    let struct (logits, value) = forwardI8 useAvx2 net q scratch qs inBuf
+    lc0PriorsFromLogits logits 0 pos moves count outPriors
+    (value + 1.0f) * 0.5f

@@ -437,8 +437,15 @@ let private expand (tree: MctsTree) (w: Worker) (nodeIdx: int) (allowDraw: bool)
                 // Lc0 CNN priors (true hybrid: Lc0 policy + SF-NNUE alpha-beta leaf). v1 ignores the Lc0
                 // value head; the leaf eval stays the negamax+SF path below. Runs once per node-expansion.
                 let net = w.Control.Lc0Net.Value
-                Lc0Net.lc0PriorsInto SfAccumulator.UseAvx2 net pos moves cnt w.Lc0InBuf w.Lc0Scratch w.Lc0Priors
-                |> ignore
+
+                match w.Control.Lc0Int8 with
+                | Some q ->
+                    // int8 forward (~2.77x faster); accuracy green-lit by the forwardI8 parity gate.
+                    Lc0Net.lc0PriorsIntoI8 SfAccumulator.UseAvx2 net q pos moves cnt w.Lc0InBuf w.Lc0Scratch w.Lc0Int8Scratch w.Lc0Priors
+                    |> ignore
+                | None ->
+                    Lc0Net.lc0PriorsInto SfAccumulator.UseAvx2 net pos moves cnt w.Lc0InBuf w.Lc0Scratch w.Lc0Priors
+                    |> ignore
 
                 let priors = w.Lc0Priors
                 let edgeBase = tree.AllocEdges cnt

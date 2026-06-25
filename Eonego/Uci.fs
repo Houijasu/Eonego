@@ -42,6 +42,7 @@ type private UciState =
       mutable MoveOverhead: int
       Net: SfNetwork option
       Lc0Net: Lc0Proto.Lc0Net option // Lc0 CNN priors (root); gated by EONEGO_LC0 env var, else history fallback
+      Lc0Int8: Lc0Net.Lc0Int8 option // int8 companion of Lc0Net (~2.77x forward); built once at load unless EONEGO_LC0_FP32
       Tt: TranspositionTable
       mutable RootFen: string
       mutable RootMoves: Move[]
@@ -232,7 +233,7 @@ let private startSearch (st: UciState) (lim: SearchLimits) =
                       1 }
 
         let control =
-            SearchControl(cfg, lim, st.Tt, st.RootFen, st.RootMoves, ?net = st.Net, ?lc0Net = st.Lc0Net)
+            SearchControl(cfg, lim, st.Tt, st.RootFen, st.RootMoves, ?net = st.Net, ?lc0Net = st.Lc0Net, ?lc0Int8 = st.Lc0Int8)
         st.Control <- Some control
 
         let t =
@@ -296,11 +297,22 @@ let run () =
                 writeLine ("info string Lc0 net load failed (" + r + "); using history priors")
                 None
 
+    // int8 companion (~2.77x faster forward, parity-validated): built once at load when an Lc0 net is present,
+    // unless EONEGO_LC0_FP32 forces the fp32 path (debug/parity escape hatch).
+    let lc0Int8 =
+        match lc0Net with
+        | Some n when (match Environment.GetEnvironmentVariable "EONEGO_LC0_FP32" with null | "" -> true | _ -> false) ->
+            let q = Lc0Net.quantize n
+            writeLine "info string Lc0 int8 forward enabled (set EONEGO_LC0_FP32=1 to force fp32)"
+            Some q
+        | _ -> None
+
     let st =
         { Threads = 1
           MoveOverhead = 10
           Net = net
           Lc0Net = lc0Net
+          Lc0Int8 = lc0Int8
           Tt = TranspositionTable(HashMb)
           RootFen = StartPosFen
           RootMoves = [||]
