@@ -46,7 +46,8 @@ let PrDraw = 3
 [<Literal>]
 let MctsIterPerDepth = 1000 // `go depth N` (no time stop) => N * this many iterations
 
-let private Fpu = 0.5f // first-play-urgency for unvisited children (neutral)
+let private CpuctBase = 19652.0f // cpuct grows ~ln((parentN+base)/base) with visits (Lc0-style exploration)
+let private FpuReduction = 0.20f // FPU = clamp(parentQ - this*sqrt(explored prior mass), 0.05, 0.95)
 let private MctsPriorTemp = 1000.0f // softmax temperature over move-ordering scores
 // Periodic UCI info cadence: WALL-CLOCK, not iteration count. With Lc0 priors the driver runs a few it/s, so
 // an iteration-count trigger (e.g. every 256) would emit nothing for a minute+ and analysis looks frozen.
@@ -248,6 +249,25 @@ let selectEdge (tree: MctsTree) (nodeIdx: int) (cpuct: float32) : int =
     let ne = tree.NodeNumEdges nodeIdx
     let parentN = tree.NodeN nodeIdx
     let sqrtParentN = MathF.Sqrt(float32 (max 1 parentN))
+    // Adaptive cpuct: grows with parent visits so well-explored nodes keep widening (Lc0's log formula).
+    let cpuctEff = cpuct * (1.0f + MathF.Log((float32 parentN + CpuctBase + 1.0f) / CpuctBase))
+    // FPU: value an unvisited child at the parent's Q minus a reduction that grows with the prior mass already
+    // explored, so once the good moves are tried the unseen ones look worse. Pre-pass sums the explored mass.
+    let parentQ = if parentN > 0 then tree.NodeW nodeIdx / float32 parentN else 0.5f
+    let mutable visitedPriorMass = 0.0f
+
+    for k in 0 .. ne - 1 do
+        let ci = tree.EdgeChild(fe + k)
+
+        if ci >= 0 && tree.NodeN ci > 0 then
+            visitedPriorMass <- visitedPriorMass + tree.EdgePrior(fe + k)
+
+    let fpu =
+        let raw = parentQ - FpuReduction * MathF.Sqrt(visitedPriorMass)
+        if raw < 0.05f then 0.05f
+        elif raw > 0.95f then 0.95f
+        else raw
+
     let mutable best = -1
     let mutable bestScore = System.Single.NegativeInfinity
 
@@ -259,7 +279,7 @@ let selectEdge (tree: MctsTree) (nodeIdx: int) (cpuct: float32) : int =
         if not isWinForChild then
             let cn = if ci >= 0 then tree.NodeN ci else 0
             let cw = if ci >= 0 then tree.NodeW ci else 0.0f
-            let s = puctScoreOf cn cw (ci >= 0) (tree.EdgePrior ei) sqrtParentN cpuct Fpu
+            let s = puctScoreOf cn cw (ci >= 0) (tree.EdgePrior ei) sqrtParentN cpuctEff fpu
 
             if s > bestScore then
                 bestScore <- s
