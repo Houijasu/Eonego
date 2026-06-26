@@ -33,19 +33,23 @@ nuget.exe
 .vs/
 .vscode/
 .idea/
-.editorconfig
+*.rsuser
 *.user
 *.suo
 *.userprefs
 *.userosscache
 *.sln.docstates
-*.userprefs
+*.DotSettings.user
 *.swp
 *.*~
 
 # Rider
 *.sln.iml
 .idea_modules/
+
+# F# / .NET tooling
+.ionide/
+.fake/
 
 # Visual Studio Code (keep extensions and settings out)
 .vscode/*.log
@@ -62,6 +66,12 @@ Desktop.ini
 *.tlog
 *.binlog
 
+# Local environment / secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+
 # Temporary files
 *.tmp
 *.bak
@@ -76,19 +86,30 @@ artifacts/
 docs/superpowers/plans/
 
 # MCP / agent tooling caches
+.aidex/
+.claude/
 .serena/
 
-# Trainer artifacts — large / regenerable (the .py scripts, suites/, and the shipped net stay tracked)
+# Trainer artifacts — large / regenerable (.py scripts and suites/ stay tracked)
 trainer/data/
 trainer/nets/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
 *.npz
+*.pt
 trainer/*_state*.json
 
-# External NNUE/policy nets (large, downloaded — Stockfish CC0 / Monty AGPL; not committed)
+# External NNUE nets (large, downloaded — Stockfish CC0; not committed)
 nets/
 *.nnue
-*.network
+
 # Downloaded Stockfish binary used only as a local parity oracle (GPL — never commit)
 tmp_sf/

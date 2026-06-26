@@ -1,25 +1,10 @@
-"""Self-contained UCI match driver + SPRT for Eonego configurations.
+"""Self-contained UCI match driver + SPRT for Eonego processes.
 
-The two players are differentiated by PER-SUBPROCESS ENVIRONMENT VARIABLES, not UCI
-setoptions: the release engine accepts only `Threads` and `Move Overhead` via setoption,
-and every behavioural knob (MCTS on/off, Lc0 net, cpuct, leaf depth, value blend, ...) is
-an EONEGO_* env var. So `--a`/`--b` are comma-separated NAME=VALUE env overrides applied
-to that player's process.
+The release engine exposes only `Threads` and `Move Overhead` via UCI. `--a`/`--b`
+remain available as comma-separated per-subprocess environment overrides for comparing
+different launches or binaries, but Eonego itself does not consume search-mode env knobs.
 
-Budgets MUST be equalized on `go movetime` when the two players use different searches:
-`go nodes N` means MCTS iterations in MCTS mode but leaf-negamax nodes in alpha-beta mode,
-which are not comparable. movetime is the only fair axis across searches.
-
-    # Does the MCTS+Lc0 hybrid beat plain alpha-beta at equal time?
-    python match.py --a "EONEGO_MCTS=1" --b "EONEGO_MCTS=0" --movetime 200 --openings 200 --sprt \
-        --shared "EONEGO_LC0=<path-to>.pb"
-
-    # Lc0 CNN priors vs history-softmax priors (leaf eval stays SF NNUE either way):
-    python match.py --a "EONEGO_LC0=<path>.pb" --b "EONEGO_LC0=none" --movetime 200 --openings 200 --sprt
-
-    # cpuct sweep point:
-    python match.py --a "EONEGO_CPUCT=180" --b "EONEGO_CPUCT=150" --movetime 200 --openings 200 --sprt \
-        --shared "EONEGO_LC0=<path>.pb"
+    python match.py --a "" --b "" --movetime 200 --openings 200 --sprt
 """
 
 import argparse
@@ -182,13 +167,13 @@ def elo_estimate(W, D, L):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--a", required=True, help="env overrides for player A, e.g. 'EONEGO_MCTS=1'")
-    ap.add_argument("--b", required=True, help="env overrides for player B, e.g. 'EONEGO_MCTS=0'")
-    ap.add_argument("--shared", default="", help="env overrides applied to BOTH players, e.g. 'EONEGO_LC0=...pb'")
+    ap.add_argument("--a", required=True, help="env overrides for player A, e.g. 'COMPlus_TieredCompilation=0'")
+    ap.add_argument("--b", required=True, help="env overrides for player B, e.g. 'COMPlus_TieredCompilation=1'")
+    ap.add_argument("--shared", default="", help="env overrides applied to BOTH players")
     ap.add_argument("--exe", default=DEFAULT_EXE, help="path to Eonego.exe (default: AOT publish build)")
     ap.add_argument("--root", default=START_FEN, help="opening root FEN (default: startpos)")
-    ap.add_argument("--movetime", type=int, default=200, help="ms per move (the fair budget across searches)")
-    ap.add_argument("--nodes", type=int, default=0, help="alt budget: go nodes N (only fair for same-search A/B)")
+    ap.add_argument("--movetime", type=int, default=200, help="ms per move")
+    ap.add_argument("--nodes", type=int, default=0, help="alt budget: go nodes N")
     ap.add_argument("--openings", type=int, default=80)
     ap.add_argument("--opening-plies", type=int, default=6)
     ap.add_argument("--seed", type=int, default=12345)

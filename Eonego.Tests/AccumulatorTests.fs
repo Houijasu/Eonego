@@ -1,12 +1,11 @@
-module Eonego.Tests.SfAccumulatorTests
+module Eonego.Tests.AccumulatorTests
 
 open Xunit
 open Eonego.Bitboard
-open Eonego.SfAccumulator
+open Eonego.Accumulator
 open Eonego.Move
 open Eonego.Position
 open Eonego.MoveGeneration
-open Eonego.SfNnue
 open Eonego.Tests.TestFixtures
 
 // Two hand-verified indices: white pawn e2 with WK e1; black pawn e7 with BK e8.
@@ -24,42 +23,8 @@ let ``makeIndex is always in [0, 22528)`` () =
                     let idx = makeIndex pColor pc sq ksq
                     Assert.True(idx >= 0 && idx < 22528, sprintf "idx %d out of range (pc=%d sq=%d ksq=%d)" idx sq pc ksq)
 
-let private assertAccMatches (net: SfNetwork) (pos: Position) =
-    let wA, wP = accumulatorOf net pos White
-    let bA, bP = accumulatorOf net pos Black
-    Assert.Equal<int[]>(wA, pos.SfWhiteAcc)
-    Assert.Equal<int[]>(wP, pos.SfWhitePsqt)
-    Assert.Equal<int[]>(bA, pos.SfBlackAcc)
-    Assert.Equal<int[]>(bP, pos.SfBlackPsqt)
-
-// Depth 2 keeps the from-scratch oracle cost reasonable while hitting castling/promotion/EP/king-refresh
-// (all occur at ply 1 in the chosen FENs; Kiwipete has legal O-O / O-O-O).
-let rec private walk (net: SfNetwork) (pos: Position) (depth: int) =
-    assertAccMatches net pos
-    if depth > 0 then
-        let buf = Array.zeroCreate<Move> 256
-        let span = System.Span<Move>(buf, 0, 256)
-        let n = generateLegal pos span
-        for i in 0 .. n - 1 do
-            pos.Make buf.[i]
-            walk net pos (depth - 1)
-            pos.Unmake buf.[i]
-            assertAccMatches net pos
-
-[<Fact>]
-let ``incremental accumulator equals from-scratch over a make/unmake walk`` () =
-    match tryLoadSfNet () with
-    | None -> ()
-    | Some net ->
-        let fens =
-            [ "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
-              "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"
-              "n1n5/PPPk4/8/8/8/8/4Kppp/5N1N b - - 0 1"
-              "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3" ]
-        for fen in fens do
-            let pos = Position.OfFen fen
-            pos.EnableSfNnue net.FtWeights net.FtPsqt net.FtBiases
-            walk net pos 2
+// NOTE: the incremental-accumulator walk test was removed — the FullThreats net uses a v0 from-scratch eval
+// (no Position-maintained accumulator). makeIndex (HalfKAv2_hm, unchanged) and addFeature stay valid.
 
 [<Fact>]
 let ``addFeature AVX2 equals scalar over random rows`` () =

@@ -1,0 +1,313 @@
+/// FullThreats feature enumeration for the Stockfish-master NNUE ("FullThreats" net, version 0x6A448AFA).
+/// Clean-room port of src/nnue/features/full_threats.{h,cpp}. Threat features encode, for each non-king
+/// piece, every OCCUPIED square it attacks (own pieces = defences, enemy = attacks) plus pawn-blocked-by-pawn
+/// contacts, indexed by (attacker, from, to, attacked, king-bucket, perspective). 60720 dims, <=128 active.
+///
+/// IMPORTANT: this module works entirely in STOCKFISH's piece encoding (PieceType PAWN=1..KING=6; Piece
+/// W_PAWN=1..W_KING=6, B_PAWN=9..B_KING=14, make_piece=(c<<3)+pt) because the index LUTs are generated in it.
+/// Eonego pieces (color*6+type, 0..11) are converted at the enumeration boundary. Squares are LERF in both.
+module Eonego.Threats
+
+open Eonego.Bitboard
+open Eonego.Position
+
+[<Literal>]
+let Dimensions = 60720
+
+[<Literal>]
+let MaxActive = 256 // SF caps at 128 active; 256 is a safe buffer size
+
+// SF Piece values present on a board (W_PAWN..W_KING, B_PAWN..B_KING). Order drives the cumulative offsets.
+let private allPieces = [| 1; 2; 3; 4; 5; 6; 9; 10; 11; 12; 13; 14 |]
+
+// numValidTargets[SfPiece] (PIECE_NB = 16); king has none.
+let private numValidTargets = [| 0; 6; 10; 8; 8; 10; 0; 0; 0; 6; 10; 8; 8; 10; 0; 0 |]
+
+// map[attackerType-1][attackedType-1] (PAWN..KING = type 1..6 -> row/col 0..5); -1 = excluded.
+let private threatMap =
+    array2D
+        [ [ 0; 1; -1; 2; -1; -1 ] // PAWN
+          [ 0; 1; 2; 3; 4; -1 ] // KNIGHT
+          [ 0; 1; 2; 3; -1; -1 ] // BISHOP
+          [ 0; 1; 2; 3; -1; -1 ] // ROOK
+          [ 0; 1; 2; 3; 4; -1 ] // QUEEN
+          [ -1; -1; -1; -1; -1; -1 ] ] // KING
+
+// FullThreats OrientTBL: SQ_A1(0) for files a-d, SQ_H1(7) for files e-h. (Opposite of HalfKAv2_hm's table.)
+let private orientTbl = Array.init 64 (fun sq -> if (sq % 8) < 4 then 0 else 7)
+
+[<Literal>]
+let private FileA = 0x0101010101010101UL
+
+[<Literal>]
+let private FileH = 0x8080808080808080UL
+
+let inline private sfType (sfPiece: int) = sfPiece &&& 7
+let inline private sfColor (sfPiece: int) = sfPiece >>> 3
+let inline private sfMakePiece (c: int) (sfPt: int) = (c <<< 3) + sfPt
+/// Eonego piece (0..11) -> SF piece. e = color*6 + type ; SF = (color<<3) + type + 1.
+let inline private sfOfEonego (e: int) = (e / 6) * 8 + (e % 6) + 1
+
+/// Empty-board pseudo-attacks for a SF non-pawn piece type (KNIGHT=2..KING=6).
+let inline private pseudoAttacks (sfPt: int) (sq: int) : Bitboard =
+    match sfPt with
+    | 2 -> knightAttacks sq
+    | 3 -> bishopAttacks sq 0UL
+    | 4 -> rookAttacks sq 0UL
+    | 5 -> queenAttacks sq 0UL
+    | _ -> kingAttacks sq // 6
+
+/// PawnPushOrAttacks[color][sq] = single-step push (geometric, on-board) | the two diagonal attacks.
+let inline private pawnPushOrAttacks (color: int) (sq: int) : Bitboard =
+    let atk = pawnAttacks color sq
+
+    let push =
+        if color = White then (if sq < 56 then 1UL <<< (sq + 8) else 0UL)
+        else (if sq >= 8 then 1UL <<< (sq - 8) else 0UL)
+
+    atk ||| push
+
+/// The attack/push set used for LUT ordinal counting, per SF Piece.
+let inline private attackSetFor (sfPiece: int) (sq: int) : Bitboard =
+    if sfType sfPiece = 1 then pawnPushOrAttacks (sfColor sfPiece) sq
+    else pseudoAttacks (sfType sfPiece) sq
+
+// ---------------------------------------------------------------------------
+// Generated LUTs (constexpr equivalents from full_threats.cpp), built once at init.
+// ---------------------------------------------------------------------------
+
+// index_lut2[sfPiece][from][to] = popcount of attack-targets strictly below `to`. Flat [16*64*64].
+let private indexLut2 : int[] =
+    let t = Array.zeroCreate (16 * 64 * 64)
+
+    for p in allPieces do
+        for from in 0..63 do
+            let attacks = attackSetFor p from
+            for too in 0..63 do
+                let below = (if too = 0 then 0UL else ((1UL <<< too) - 1UL)) &&& attacks
+                t.[(p * 64 + from) * 64 + too] <- popCount below
+
+    t
+
+// offsets[sfPiece][from] (flat [16*64]) and helper cumulativePieceOffset / cumulativeOffset per piece.
+let private offsets : int[] = Array.zeroCreate (16 * 64)
+let private helperCumPiece : int[] = Array.zeroCreate 16
+let private helperCumOffset : int[] = Array.zeroCreate 16
+
+let private initOffsets () =
+    let mutable cumulativeOffset = 0
+
+    for piece in allPieces do
+        let mutable cumPiece = 0
+        let isPawn = sfType piece = 1
+
+        for from in 0..63 do
+            offsets.[piece * 64 + from] <- cumPiece
+
+            if not isPawn then
+                cumPiece <- cumPiece + popCount (pseudoAttacks (sfType piece) from)
+            elif from >= 8 && from <= 55 then
+                cumPiece <- cumPiece + popCount (pawnPushOrAttacks (sfColor piece) from)
+
+        helperCumPiece.[piece] <- cumPiece
+        helperCumOffset.[piece] <- cumulativeOffset
+        cumulativeOffset <- cumulativeOffset + numValidTargets.[piece] * cumPiece
+
+initOffsets ()
+
+// index_lut1[attacker][attacked][from<to ? 1 : 0]. Flat [16*16*2]. Excluded -> Dimensions (skipped).
+let private indexLut1 : int[] =
+    let t = Array.create (16 * 16 * 2) Dimensions
+
+    for attacker in allPieces do
+        for attacked in allPieces do
+            let enemy = (attacker ^^^ attacked) = 8
+            let aType = sfType attacker
+            let dType = sfType attacked
+            let m = threatMap.[aType - 1, dType - 1]
+            let semiExcluded = (aType = dType) && (enemy || aType <> 1)
+
+            let feature =
+                helperCumOffset.[attacker]
+                + (sfColor attacked * (numValidTargets.[attacker] / 2) + m) * helperCumPiece.[attacker]
+
+            let excluded = m < 0
+            t.[(attacker * 16 + attacked) * 2 + 0] <- if excluded then Dimensions else feature
+            t.[(attacker * 16 + attacked) * 2 + 1] <- if excluded || semiExcluded then Dimensions else feature
+
+    t
+
+/// Feature index for a threat (SF make_index). `attacker`/`attacked` are SF pieces; from/to/ksq squares.
+let makeIndex (perspective: int) (attacker: int) (from: int) (too: int) (attacked: int) (ksq: int) : int =
+    let orientation = orientTbl.[ksq] ^^^ (56 * perspective)
+    let fromO = from ^^^ orientation
+    let toO = too ^^^ orientation
+    let swap = 8 * perspective
+    let attackerO = attacker ^^^ swap
+    let attackedO = attacked ^^^ swap
+
+    indexLut1.[(attackerO * 16 + attackedO) * 2 + (if fromO < toO then 1 else 0)]
+    + offsets.[attackerO * 64 + fromO]
+    + indexLut2.[(attackerO * 64 + fromO) * 64 + toO]
+
+// ---------------------------------------------------------------------------
+// Active-feature enumeration (port of append_active_indices). Fills `buf`, returns count.
+// ---------------------------------------------------------------------------
+let appendActiveThreats (perspective: int) (pos: Position) (buf: int[]) : int =
+    let ksq = pos.KingSquare perspective
+    let occupied = pos.Occupied
+    let allPawns = pos.Pieces Pawn
+    let mutable n = 0
+
+    let emit (attacker: int) (from: int) (too: int) =
+        let attacked = sfOfEonego (pos.PieceOn too)
+        let idx = makeIndex perspective attacker from too attacked ksq
+
+        if idx < Dimensions && n < MaxActive then
+            buf.[n] <- idx
+            n <- n + 1
+
+    for colorBit in 0..1 do
+        let c = perspective ^^^ colorBit // us, then them
+        // --- pawns: diagonal captures onto occupied squares + pawn blocked by a pawn in front ---
+        let attackerP = sfMakePiece c 1
+        let cPawns = pos.PiecesCT c Pawn
+
+        if c = White then
+            let mutable ne = ((cPawns &&& ~~~FileH) <<< 9) &&& occupied
+            while ne <> 0UL do
+                let too = popLsb &ne
+                emit attackerP (too - 9) too
+
+            let mutable nw = ((cPawns &&& ~~~FileA) <<< 7) &&& occupied
+            while nw <> 0UL do
+                let too = popLsb &nw
+                emit attackerP (too - 7) too
+
+            let mutable push = ((allPawns >>> 8) &&& cPawns) <<< 8
+            while push <> 0UL do
+                let too = popLsb &push
+                emit attackerP (too - 8) too
+        else
+            let mutable sw = ((cPawns &&& ~~~FileA) >>> 9) &&& occupied
+            while sw <> 0UL do
+                let too = popLsb &sw
+                emit attackerP (too + 9) too
+
+            let mutable se = ((cPawns &&& ~~~FileH) >>> 7) &&& occupied
+            while se <> 0UL do
+                let too = popLsb &se
+                emit attackerP (too + 7) too
+
+            let mutable push = ((allPawns <<< 8) &&& cPawns) >>> 8
+            while push <> 0UL do
+                let too = popLsb &push
+                emit attackerP (too + 8) too
+
+        // --- knight, bishop, rook, queen: every attack landing on an occupied square ---
+        for sfPt in 2..5 do
+            let attacker = sfMakePiece c sfPt
+            let mutable bb = pos.PiecesCT c (sfPt - 1) // SF type -> Eonego type
+
+            while bb <> 0UL do
+                let from = popLsb &bb
+
+                let attacks =
+                    (match sfPt with
+                     | 2 -> knightAttacks from
+                     | 3 -> bishopAttacks from occupied
+                     | 4 -> rookAttacks from occupied
+                     | _ -> queenAttacks from occupied)
+                    &&& occupied
+
+                let mutable a = attacks
+                while a <> 0UL do
+                    let too = popLsb &a
+                    emit attacker from too
+
+    n
+
+/// As `appendActiveThreats` but enumerates the (perspective-independent) physical threats ONCE and fills BOTH
+/// perspective buffers, computing each perspective's `makeIndex` per threat. Returns `(nW <<< 32) ||| nB`.
+/// The expensive part — slider attack-generation and the popLsb target loops — runs once instead of twice;
+/// only the cheap `makeIndex` is doubled. bufW/bufB receive the SAME SETS as `appendActiveThreats White`/
+/// `Black` would (physical enumeration order may differ, but the caller sorts before diffing, so the result
+/// is bit-identical). Enumeration order here is fixed (white pieces then black) and perspective-free.
+let appendActiveThreatsBoth (pos: Position) (bufW: int[]) (bufB: int[]) : int64 =
+    let ksqW = pos.KingSquare White
+    let ksqB = pos.KingSquare Black
+    let occupied = pos.Occupied
+    let allPawns = pos.Pieces Pawn
+    let mutable nW = 0
+    let mutable nB = 0
+
+    let emit (attacker: int) (from: int) (too: int) =
+        let attacked = sfOfEonego (pos.PieceOn too)
+        let wIdx = makeIndex White attacker from too attacked ksqW
+
+        if wIdx < Dimensions && nW < MaxActive then
+            bufW.[nW] <- wIdx
+            nW <- nW + 1
+
+        let bIdx = makeIndex Black attacker from too attacked ksqB
+
+        if bIdx < Dimensions && nB < MaxActive then
+            bufB.[nB] <- bIdx
+            nB <- nB + 1
+
+    for c in 0..1 do
+        let attackerP = sfMakePiece c 1
+        let cPawns = pos.PiecesCT c Pawn
+
+        if c = White then
+            let mutable ne = ((cPawns &&& ~~~FileH) <<< 9) &&& occupied
+            while ne <> 0UL do
+                let too = popLsb &ne
+                emit attackerP (too - 9) too
+
+            let mutable nw = ((cPawns &&& ~~~FileA) <<< 7) &&& occupied
+            while nw <> 0UL do
+                let too = popLsb &nw
+                emit attackerP (too - 7) too
+
+            let mutable push = ((allPawns >>> 8) &&& cPawns) <<< 8
+            while push <> 0UL do
+                let too = popLsb &push
+                emit attackerP (too - 8) too
+        else
+            let mutable sw = ((cPawns &&& ~~~FileA) >>> 9) &&& occupied
+            while sw <> 0UL do
+                let too = popLsb &sw
+                emit attackerP (too + 9) too
+
+            let mutable se = ((cPawns &&& ~~~FileH) >>> 7) &&& occupied
+            while se <> 0UL do
+                let too = popLsb &se
+                emit attackerP (too + 7) too
+
+            let mutable push = ((allPawns <<< 8) &&& cPawns) >>> 8
+            while push <> 0UL do
+                let too = popLsb &push
+                emit attackerP (too + 8) too
+
+        for sfPt in 2..5 do
+            let attacker = sfMakePiece c sfPt
+            let mutable bb = pos.PiecesCT c (sfPt - 1)
+
+            while bb <> 0UL do
+                let from = popLsb &bb
+
+                let attacks =
+                    (match sfPt with
+                     | 2 -> knightAttacks from
+                     | 3 -> bishopAttacks from occupied
+                     | 4 -> rookAttacks from occupied
+                     | _ -> queenAttacks from occupied)
+                    &&& occupied
+
+                let mutable a = attacks
+                while a <> 0UL do
+                    let too = popLsb &a
+                    emit attacker from too
+
+    (int64 nW <<< 32) ||| int64 nB

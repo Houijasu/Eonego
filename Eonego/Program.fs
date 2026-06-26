@@ -25,8 +25,8 @@ let main argv =
         match argv.[0] with
         | "gen" -> Eonego.Tooling.runGen argv.[1..]
         | _ ->
-            Eonego.Uci.run ()
+            Eonego.UCI.run ()
             0
     else
-        Eonego.Uci.run ()
+        Eonego.UCI.run ()
         0

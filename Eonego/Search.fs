@@ -18,7 +18,7 @@ open Microsoft.FSharp.NativeInterop
 open Eonego.Bitboard
 open Eonego.Move
 open Eonego.Position
-open Eonego.SfNnue
+open Eonego.Nnue
 open Eonego.MoveGeneration
 open Eonego.History
 open Eonego.MovePick
@@ -92,15 +92,7 @@ type SearchConfig =
       UseNmpVerify: bool
       UseLmrTweaks: bool
       UseAspTweaks: bool
-      MoveOverhead: int
-      UseMcts: bool // route `go` through the MCTS-root / negamax-leaf hybrid (Mcts.fs) instead of alpha-beta
-      MctsCpuct: int // PUCT exploration constant, fixed-point ×100 (150 => 1.5)
-      MctsLeafDepth: int // fixed negamax depth at each MCTS leaf (0 => qsearch-only leaf)
-      MctsK: int // logistic cp->winprob scale (centipawns); match the training K
-      UseLc0: bool // use the Lc0 CNN (Lc0Net.fs) for MCTS priors; requires a loaded Lc0 net (else history fallback)
-      MctsBatchSize: int // >1: batch B leaves/worker through one Lc0 forward (virtual-loss gather); 1: single eval
-      UseEvalPriors: bool // no-Lc0 fallback: softmax over each child's SF-NNUE static eval instead of history scores
-      MctsValueBlend: int } // ×100: blend the Lc0 value head into the leaf q, (1-λ)*negamax + λ*lc0value; 0 = pure negamax
+      MoveOverhead: int }
 
 type SearchLimits =
     { MoveTime: int
@@ -130,15 +122,7 @@ let defaultConfig =
       UseNmpVerify = true
       UseLmrTweaks = true
       UseAspTweaks = true
-      MoveOverhead = 10
-      UseMcts = false
-      MctsCpuct = 150
-      MctsLeafDepth = 6
-      MctsK = 200
-      UseLc0 = false
-      MctsBatchSize = 1
-      UseEvalPriors = false
-      MctsValueBlend = 0 }
+      MoveOverhead = 10 }
 
 let defaultLimits =
     { MoveTime = 0
@@ -254,7 +238,7 @@ let isLegalRoot (pos: Position) (m: Move) : bool =
 // ---------------------------------------------------------------------------
 [<Sealed>]
 type SearchControl
-    (config: SearchConfig, limits: SearchLimits, tt: TranspositionTable, rootFen: string, rootMoves: Move[], ?net: SfNetwork, ?lc0Net: Lc0Proto.Lc0Net, ?lc0Int8: Lc0Net.Lc0Int8) =
+    (config: SearchConfig, limits: SearchLimits, tt: TranspositionTable, rootFen: string, rootMoves: Move[], ?net: SfNetwork) =
     let mutable stopFlag = 0
     let sw = System.Diagnostics.Stopwatch()
     let mutable softMs = 0L
@@ -264,23 +248,16 @@ type SearchControl
     let mutable ponderHard = 0L
     let mutable ponderHitPending = false // ponderhit that arrived before the search stored its budget
     let ponderLock = obj () // guards the ponder fields, shared between the UCI thread and the search thread
-    let mutable mctsNodeBudget = false // MCTS treats `go nodes N` as an ITERATION budget => CheckTime ignores Nodes
     member _.Config = config
     member _.Limits = limits
     member _.Tt = tt
     member _.RootFen = rootFen
     member _.RootMoves = rootMoves
     member _.Net: SfNetwork option = net
-    member _.Lc0Net: Lc0Proto.Lc0Net option = lc0Net
-    /// int8 companion of the Lc0 net (built once at load); when present, MCTS priors use the ~2.77x int8 forward.
-    member _.Lc0Int8: Lc0Net.Lc0Int8 option = lc0Int8
     member val LastBest: Move = MoveNone with get, set // result of the most recent go()
     member val LastScore: int = 0 with get, set
     /// Aggregate live node count across all workers (relaxed reads — reporting only, set by go()).
     member val NodeSum: unit -> int64 = (fun () -> 0L) with get, set
-    /// Aggregate completed MCTS iteration count across all workers (reporting only, set by mctsSearch()).
-    /// UCI `info nodes`/`nps` reports this for MCTS; `go nodes N` limits still use NodeSum (leaf nodes).
-    member val IterSum: unit -> int64 = (fun () -> 0L) with get, set
     member _.Stopped: bool = Volatile.Read(&stopFlag) <> 0
     member _.Stop() = Volatile.Write(&stopFlag, 1)
     member _.Reset() = Volatile.Write(&stopFlag, 0)
@@ -323,16 +300,9 @@ type SearchControl
                 if ponderSoft > 0L || ponderHard > 0L then
                     this.StartClock ponderSoft ponderHard)
 
-    /// MCTS uses `go nodes N` as an iteration budget (Lc0 convention) and counts iterations itself, so its
-    /// driver disables the leaf-node stop here; alpha-beta leaves it on (the `go nodes N` = leaf nodes).
-    member _.SetMctsNodeBudget(v: bool) = mctsNodeBudget <- v
-
     /// Main worker only: convert a time/node budget overrun into the shared stop flag.
     member _.CheckTime(nodes: int64) =
-        if
-            (hardMs > 0L && sw.ElapsedMilliseconds >= hardMs)
-            || (not mctsNodeBudget && limits.Nodes > 0L && nodes >= limits.Nodes)
-        then
+        if (hardMs > 0L && sw.ElapsedMilliseconds >= hardMs) || (limits.Nodes > 0L && nodes >= limits.Nodes) then
             Volatile.Write(&stopFlag, 1)
 
 // ---------------------------------------------------------------------------
@@ -355,23 +325,7 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     let exclScoreBuf: int[] = Array.zeroCreate (MaxSearchPly * MaxMoves)
     let exclQuietsBuf: Move[] = Array.zeroCreate (MaxSearchPly * MaxMoves)
     let pv: Move[] = Array.zeroCreate (MaxSearchPly * MaxSearchPly)
-    // Lc0 prior-output buffer (one per Worker, reused every MCTS expand).
-    let lc0Priors: float32[]     = Array.zeroCreate 256
-    // Lc0 CNN input-plane scratch (112*64); the forward pass uses the per-Worker Lc0Scratch below.
-    let lc0InBuf: float32[]      = Array.zeroCreate (Lc0Encoder.Planes * 64)
-    // Lc0 forward-pass scratch — ONE allocation per Worker, reused every expand (was per-call before). Built
-    // only when an Lc0 net is loaded; null otherwise (the Lc0 expand branch is gated on the net's presence).
-    let lc0Scratch: Lc0Net.Lc0Scratch =
-        match control.Lc0Net with
-        | Some n when control.Config.UseLc0 -> Lc0Net.Lc0Scratch(n)
-        | _ -> Unchecked.defaultof<Lc0Net.Lc0Scratch>
-    // Per-Worker int8 scratch (byte im2col + FC scratch); built only when the int8 companion is present.
-    let lc0Int8Scratch: Lc0Net.Lc0Int8Scratch =
-        match control.Lc0Net, control.Lc0Int8 with
-        | Some n, Some _ when control.Config.UseLc0 -> Lc0Net.Lc0Int8Scratch(n)
-        | _ -> Unchecked.defaultof<Lc0Net.Lc0Int8Scratch>
     let mutable nodes = 0L
-    let mutable iters = 0L
     let mutable selDepth = 0
     let mutable rootBest = MoveNone
     let mutable rootScore = 0
@@ -390,21 +344,10 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     member _.ExclScoreBuf = exclScoreBuf
     member _.ExclQuietsBuf = exclQuietsBuf
     member _.Pv = pv
-    member _.Lc0Priors       = lc0Priors
-    member _.Lc0InBuf        = lc0InBuf
-    member _.Lc0Scratch      = lc0Scratch
-    member _.Lc0Int8Scratch  = lc0Int8Scratch
-    /// Lc0 value head (STM-relative win-prob in [0,1]) stashed by the most recent Lc0 expand, consumed by the
-    /// immediately-following evalLeaf when MctsValueBlend > 0. 0.5 = neutral (no Lc0 / history priors).
-    member val Lc0Value : float32 = 0.5f with get, set
 
     member _.Nodes
         with get () = nodes
         and set v = nodes <- v
-
-    /// Completed MCTS iteration count for this worker. Incremented after each backed-up iteration.
-    member _.Iters = iters
-    member _.IncIters() = iters <- iters + 1L
 
     member _.SelDepth
         with get () = selDepth
@@ -431,7 +374,7 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
         pos.LoadFen control.RootFen
 
         match control.Net with
-        | Some net -> SfNnue.bindSfNnue net pos
+        | Some net -> Nnue.bindNnue net pos
         | None -> ()
 
         for m in control.RootMoves do
@@ -439,7 +382,6 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
 
         tables.Clear()
         nodes <- 0L
-        iters <- 0L
         selDepth <- 0
         rootBest <- MoveNone
         rootScore <- 0
@@ -447,8 +389,8 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
 
 let evalPos (w: Worker) (pos: Position) : int =
     match w.Control.Net with
-    | Some net -> SfNnue.evalCp net pos
-    | None -> 0 // unreachable in play: UCI refuses to search with no net (see Uci.startSearch)
+    | Some net -> Nnue.evalCp net pos
+    | None -> 0 // unreachable in play: UCI refuses to search with no net (see UCI.startSearch)
 
 let private updatePv (w: Worker) (ply: int) (m: Move) =
     let pv = w.Pv
@@ -528,6 +470,9 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
         else
             let us = pos.SideToMove
             let ksq = pos.KingSquare us
+            // Loop-invariant: BlockersForKing(us) is restored across every Make/Unmake in this loop, but the
+            // JIT can't prove it (Make/Unmake are opaque), so hoist it out of the per-move legality test.
+            let usBlockers = pos.BlockersForKing us
             let moves = w.MoveBuf.AsSpan(ply * MaxMoves, MaxMoves)
             let scores = w.ScoreBuf.AsSpan(ply * MaxMoves, MaxMoves)
             let mutable mp = mkQSearch pos w.Tables ttMove moves scores
@@ -536,7 +481,7 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
 
             while m <> MoveNone && not cutoff do
                 let needsCheck =
-                    isEnPassant m || fromSq m = ksq || testBit (pos.BlockersForKing us) (fromSq m)
+                    isEnPassant m || fromSq m = ksq || testBit usBlockers (fromSq m)
 
                 let legal = (not needsCheck) || isLegal pos m
 
@@ -764,6 +709,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
             if not ttBlocks then
                 let us = pos.SideToMove
                 let ksq = pos.KingSquare us
+                let usBlockers = pos.BlockersForKing us // loop-invariant across Make/Unmake (see qsearch note)
                 let pcMoves = w.MoveBuf.AsSpan(ply * MaxMoves, MaxMoves)
                 let pcScores = w.ScoreBuf.AsSpan(ply * MaxMoves, MaxMoves)
                 let mutable pcMp = mkProbCut pos w.Tables ttMove (probCutBeta - staticEval) pcMoves pcScores
@@ -773,7 +719,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                     let needsCheck =
                         isEnPassant pcMove
                         || fromSq pcMove = ksq
-                        || testBit (pos.BlockersForKing us) (fromSq pcMove)
+                        || testBit usBlockers (fromSq pcMove)
 
                     if (not needsCheck) || isLegal pos pcMove then
                         w.Stack.[ssCur].CurrentMove <- pcMove
@@ -849,6 +795,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
             let us = pos.SideToMove
             let ksq = pos.KingSquare us
+            let usBlockers = pos.BlockersForKing us // loop-invariant across Make/Unmake (see qsearch note)
             // During a singular exclusion search (same ply) use dedicated per-ply buffers so we don't clobber
             // the OUTER node's in-flight move/score/quiet data at this ply (nor a concurrent exclusion search
             // at another ply up the call stack).
@@ -875,7 +822,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
             while m <> MoveNone && not cutoff do
                 let needsCheck =
-                    isEnPassant m || fromSq m = ksq || testBit (pos.BlockersForKing us) (fromSq m)
+                    isEnPassant m || fromSq m = ksq || testBit usBlockers (fromSq m)
 
                 if m <> excludedMove && ((not needsCheck) || isLegal pos m) then
                     moveCount <- moveCount + 1

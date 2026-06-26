@@ -152,21 +152,41 @@ type Position() =
     let states: StateInfo[] = Array.zeroCreate MaxPly
     let mutable stPly = 0
 
-    // --- SF NNUE incremental accumulator (gated by sfActive; bound raw weight arrays, no SfNetwork type) ---
+    // --- SF FullThreats NNUE incremental accumulator (gated by sfActive) ----------------------------------
+    // Two accumulators per perspective, summed at eval: `half` = biases + HalfKAv2_hm (int16 weights,
+    // dirty-buffer incremental, king-move full-refresh) and `thr` = FullThreats (int8 weights, sorted-set
+    // diff, no king special-case — the diff handles re-indexing). Threats are enumerated each update via the
+    // bound `sfThreatFn` (set to Threats.appendActiveThreats; a delegate avoids the Position<-Threats dep).
+    [<Literal>]
+    let SfMaxThreats = 256
+
     let mutable sfActive = false
-    let sfWhiteAcc: int[] = Array.zeroCreate SfAccumulator.L1
-    let sfWhitePsqt: int[] = Array.zeroCreate SfAccumulator.PsqtBuckets
-    let sfBlackAcc: int[] = Array.zeroCreate SfAccumulator.L1
-    let sfBlackPsqt: int[] = Array.zeroCreate SfAccumulator.PsqtBuckets
-    let mutable sfFtWeights: int16[] = Array.empty
-    let mutable sfFtPsqt: int[] = Array.empty
-    let mutable sfFtBiases: int16[] = Array.empty
-    let sfPlyStride = 2 * (SfAccumulator.L1 + SfAccumulator.PsqtBuckets)
-    // Per-ply snapshot stack, lazy-allocated only when sfActive. Sized MaxPly because stPly reaches
-    // (root moves replayed in SetupRoot) + (search depth). FOOTPRINT: MaxPly*sfPlyStride int32 ~= 12 MB
-    // per Position, i.e. ~12 MB PER LazySMP Worker (each owns its own Position). Deferred memory mitigations
-    // (this phase is correctness-first, int32 to stay bit-exact with the from-scratch oracle): narrow to
-    // int16 (halves it, matches SF), or a forward-accumulator model that avoids the full per-ply snapshot.
+    // MERGED accumulator: one array per perspective holds biases + HalfKA + threats (was split half/thr). The
+    // per-eval read is then a single copy (no add-merge), and the per-ply snapshot copies HALF as much.
+    let sfW: int[] = Array.zeroCreate Accumulator.L1
+    let sfPW: int[] = Array.zeroCreate Accumulator.PsqtBuckets
+    let sfB: int[] = Array.zeroCreate Accumulator.L1
+    let sfPB: int[] = Array.zeroCreate Accumulator.PsqtBuckets
+    let sfSetW: int[] = Array.zeroCreate SfMaxThreats // active threat indices (sorted), white perspective
+    let sfSetB: int[] = Array.zeroCreate SfMaxThreats
+    let mutable sfNW = 0
+    let mutable sfNB = 0
+    let sfTmpW: int[] = Array.zeroCreate SfMaxThreats // enumeration scratch, white perspective
+    let sfTmpB: int[] = Array.zeroCreate SfMaxThreats // enumeration scratch, black perspective
+    let mutable sfBiases: int16[] = Array.empty
+    let mutable sfHalfWeights: int16[] = Array.empty
+    let mutable sfHalfPsqt: int[] = Array.empty
+    let mutable sfThreatWeights: sbyte[] = Array.empty
+    let mutable sfThreatPsqt: int[] = Array.empty
+    // Single-perspective enumerator (enable/refresh) and the shared both-perspective enumerator (hot update —
+    // runs the attack-generation once, computing both perspectives' indices). Delegates avoid the Position<-
+    // Threats dependency; bound together in EnableNnue.
+    let mutable sfThreatFn: (System.Func<Position, int, int[], int>) | null = null
+    let mutable sfThreatFnBoth: (System.Func<Position, int[], int[], int64>) | null = null
+    // Per-ply snapshot stride: 2 merged accumulators (L1) + 2 psqt (8) + 2 threat sets (256) + 2 counts.
+    // (Halved vs the old split layout. Reverse-on-unmake was tried and reverted — re-diffing threats on unmake
+    // doubled the expensive threat enumeration, which outweighed the snapshot's memory-copy cost.)
+    let sfPlyStride = 2 * Accumulator.L1 + 2 * Accumulator.PsqtBuckets + 2 * SfMaxThreats + 2
     let mutable sfStack: int[] = Array.empty
     let sfDirtyPc: int[] = Array.zeroCreate 8
     let sfDirtySq: int[] = Array.zeroCreate 8
@@ -269,55 +289,197 @@ type Position() =
     member _.SideToMove: Color = sideToMove
     member _.GamePly: int = gamePly
 
-    // --- SF NNUE incremental accumulator public accessors + enable ---
+    // --- SF FullThreats NNUE accumulator: public read + refresh/update/snapshot ---
     member _.SfActive: bool = sfActive
-    member _.SfWhiteAcc: int[] = sfWhiteAcc
-    member _.SfWhitePsqt: int[] = sfWhitePsqt
-    member _.SfBlackAcc: int[] = sfBlackAcc
-    member _.SfBlackPsqt: int[] = sfBlackPsqt
 
-    /// Refresh one perspective from scratch (at enable + on a king move). Mirrors SfNnue.buildAcc.
-    member private this.SfRefresh(pColor: Color) =
-        let acc = if pColor = White then sfWhiteAcc else sfBlackAcc
-        let psqt = if pColor = White then sfWhitePsqt else sfBlackPsqt
+    /// Merged accumulator (biases + HalfKA + threats already summed) for a perspective, into caller spans.
+    /// A single memcpy — the per-eval add-merge is gone (the two halves are maintained as one array).
+    member _.SfReadAccInto(pColor: Color, acc: System.Span<int>, psqt: System.Span<int>) =
+        let m = if pColor = White then sfW else sfB
+        let mp = if pColor = White then sfPW else sfPB
+        System.Span<int>(m, 0, Accumulator.L1).CopyTo(acc)
+        System.Span<int>(mp, 0, Accumulator.PsqtBuckets).CopyTo(psqt)
+
+    member private this.SfEnumThreats(pColor: Color, buf: int[]) : int =
+        match sfThreatFn with
+        | null -> 0
+        | f -> f.Invoke(this, pColor, buf)
+
+    /// Shared enumeration: fill sfTmpW (white indices) + sfTmpB (black indices) in one attack-gen pass.
+    /// Returns packed (nW <<< 32) ||| nB. Falls back to two single passes if the both-delegate is unbound.
+    member private this.SfEnumBoth() : struct (int * int) =
+        match sfThreatFnBoth with
+        | null ->
+            let nW = this.SfEnumThreats(White, sfTmpW)
+            let nB = this.SfEnumThreats(Black, sfTmpB)
+            struct (nW, nB)
+        | f ->
+            let packed = f.Invoke(this, sfTmpW, sfTmpB)
+            struct (int (packed >>> 32), int (packed &&& 0xFFFFFFFFL))
+
+    /// Build biases + all HalfKA features into the MERGED accumulator (no threats). Clears the array first.
+    /// Used at enable (then SfRefreshThreats ADDS threats) and as the first half of a king-move refresh.
+    member private this.SfBuildHalf(pColor: Color) =
+        let m = if pColor = White then sfW else sfB
+        let mp = if pColor = White then sfPW else sfPB
         let ksq = this.KingSquare pColor
-        for j in 0 .. SfAccumulator.L1 - 1 do
-            acc.[j] <- int sfFtBiases.[j]
-        System.Array.Clear(psqt, 0, SfAccumulator.PsqtBuckets)
+
+        for j in 0 .. Accumulator.L1 - 1 do
+            m.[j] <- int sfBiases.[j]
+
+        System.Array.Clear(mp, 0, Accumulator.PsqtBuckets)
+
         for sq in 0 .. 63 do
             let pc = board.[sq]
+
             if pc <> NoPiece then
-                SfAccumulator.addFeature acc psqt sfFtWeights sfFtPsqt (SfAccumulator.makeIndex pColor pc sq ksq) 1 SfAccumulator.UseAvx2
+                Accumulator.addFeature m mp sfHalfWeights sfHalfPsqt (Accumulator.makeIndex pColor pc sq ksq) 1 Accumulator.UseAvx2
 
-    /// Bind raw weight arrays + refresh both perspectives. ROOT ONLY.
-    member this.EnableSfNnue (ftWeights: int16[]) (ftPsqt: int[]) (ftBiases: int16[]) =
-        Debug.Assert((stPly = 0), "EnableSfNnue must be called at the root (stPly = 0)")
-        sfFtWeights <- ftWeights
-        sfFtPsqt <- ftPsqt
-        sfFtBiases <- ftBiases
-        if Array.isEmpty sfStack then sfStack <- Array.zeroCreate (MaxPly * sfPlyStride)
+    /// Own-king move full refresh: rebuild biases+HalfKA, then re-add the CURRENT stored threat set (NO
+    /// re-enumeration — reuses sfSet). The subsequent SfDiffThreatsFrom then transitions those (old) threats
+    /// to the new set, so the merged accumulator ends at biases+HalfKA+newThreats. Bit-exact (int add assoc).
+    member private this.SfRefreshMerged(pColor: Color) =
+        this.SfBuildHalf pColor
+        let m = if pColor = White then sfW else sfB
+        let mp = if pColor = White then sfPW else sfPB
+        let set = if pColor = White then sfSetW else sfSetB
+        let n = if pColor = White then sfNW else sfNB
+
+        for k in 0 .. n - 1 do
+            Accumulator.addThreat m mp sfThreatWeights sfThreatPsqt set.[k] 1
+
+    /// Threat contribution (enable only): ADD all active threats into the merged accumulator (which already
+    /// holds biases+HalfKA) and store the sorted active set. NO Array.Clear (it would wipe biases+HalfKA).
+    member private this.SfRefreshThreats(pColor: Color) =
+        let m = if pColor = White then sfW else sfB
+        let mp = if pColor = White then sfPW else sfPB
+        let set = if pColor = White then sfSetW else sfSetB
+        let n = this.SfEnumThreats(pColor, sfTmpW)
+
+        for k in 0 .. n - 1 do
+            let idx = sfTmpW.[k]
+            Accumulator.addThreat m mp sfThreatWeights sfThreatPsqt idx 1
+            set.[k] <- idx
+
+        System.Array.Sort(set, 0, n)
+        if pColor = White then sfNW <- n else sfNB <- n
+
+    /// Bind weights + threat enumerator + refresh both perspectives. ROOT ONLY.
+    member this.EnableNnue
+        (biases: int16[])
+        (halfWeights: int16[])
+        (halfPsqt: int[])
+        (threatWeights: sbyte[])
+        (threatPsqt: int[])
+        (threatFn: System.Func<Position, int, int[], int>)
+        (threatFnBoth: System.Func<Position, int[], int[], int64>)
+        =
+        Debug.Assert((stPly = 0), "EnableNnue must be called at the root (stPly = 0)")
+        sfBiases <- biases
+        sfHalfWeights <- halfWeights
+        sfHalfPsqt <- halfPsqt
+        sfThreatWeights <- threatWeights
+        sfThreatPsqt <- threatPsqt
+        sfThreatFn <- threatFn
+        sfThreatFnBoth <- threatFnBoth
+
+        if Array.isEmpty sfStack then
+            sfStack <- Array.zeroCreate (MaxPly * sfPlyStride)
+
         sfActive <- true
-        this.SfRefresh White
-        this.SfRefresh Black
+        this.SfBuildHalf White
+        this.SfBuildHalf Black
+        this.SfRefreshThreats White
+        this.SfRefreshThreats Black
 
-    /// Apply the dirty buffer to both perspectives (refresh a side iff its own king moved). Call AFTER the
-    /// board mutation completes.
+    /// Threat half: sorted-set diff vs the stored active set (uniform — a king move falls out as a big delta).
+    member private this.SfDiffThreatsFrom(pColor: Color, tmp: int[], newN: int) =
+        let t = if pColor = White then sfW else sfB // threats are applied to the MERGED accumulator
+        let tp = if pColor = White then sfPW else sfPB
+        let oldSet = if pColor = White then sfSetW else sfSetB
+        let oldN = if pColor = White then sfNW else sfNB
+        System.Array.Sort(tmp, 0, newN)
+        let mutable i = 0
+        let mutable j = 0
+
+        while i < oldN && j < newN do
+            let o = oldSet.[i]
+            let nw = tmp.[j]
+
+            if o < nw then
+                Accumulator.addThreat t tp sfThreatWeights sfThreatPsqt o -1
+                i <- i + 1
+            elif o > nw then
+                Accumulator.addThreat t tp sfThreatWeights sfThreatPsqt nw 1
+                j <- j + 1
+            else
+                i <- i + 1
+                j <- j + 1
+
+        while i < oldN do
+            Accumulator.addThreat t tp sfThreatWeights sfThreatPsqt oldSet.[i] -1
+            i <- i + 1
+
+        while j < newN do
+            Accumulator.addThreat t tp sfThreatWeights sfThreatPsqt tmp.[j] 1
+            j <- j + 1
+
+        System.Array.Copy(tmp, 0, oldSet, 0, newN)
+        if pColor = White then sfNW <- newN else sfNB <- newN
+
+    /// Apply HalfKA dirty buffer (own-king move -> half refresh) + threat diff, both perspectives. AFTER mutation.
     member private this.SfUpdate() =
         let mutable whiteKingMoved = false
         let mutable blackKingMoved = false
+
         for i in 0 .. sfDirtyN - 1 do
             if pieceType sfDirtyPc.[i] = King then
                 if pieceColor sfDirtyPc.[i] = White then whiteKingMoved <- true else blackKingMoved <- true
-        if whiteKingMoved then this.SfRefresh White
+
+        if whiteKingMoved then
+            this.SfRefreshMerged White
         else
             let ksq = this.KingSquare White
             for i in 0 .. sfDirtyN - 1 do
-                SfAccumulator.addFeature sfWhiteAcc sfWhitePsqt sfFtWeights sfFtPsqt (SfAccumulator.makeIndex White sfDirtyPc.[i] sfDirtySq.[i] ksq) sfDirtySign.[i] SfAccumulator.UseAvx2
-        if blackKingMoved then this.SfRefresh Black
+                Accumulator.addFeature sfW sfPW sfHalfWeights sfHalfPsqt (Accumulator.makeIndex White sfDirtyPc.[i] sfDirtySq.[i] ksq) sfDirtySign.[i] Accumulator.UseAvx2
+
+        if blackKingMoved then
+            this.SfRefreshMerged Black
         else
             let ksq = this.KingSquare Black
             for i in 0 .. sfDirtyN - 1 do
-                SfAccumulator.addFeature sfBlackAcc sfBlackPsqt sfFtWeights sfFtPsqt (SfAccumulator.makeIndex Black sfDirtyPc.[i] sfDirtySq.[i] ksq) sfDirtySign.[i] SfAccumulator.UseAvx2
+                Accumulator.addFeature sfB sfPB sfHalfWeights sfHalfPsqt (Accumulator.makeIndex Black sfDirtyPc.[i] sfDirtySq.[i] ksq) sfDirtySign.[i] Accumulator.UseAvx2
+
+        let struct (nW, nB) = this.SfEnumBoth()
+        this.SfDiffThreatsFrom(White, sfTmpW, nW)
+        this.SfDiffThreatsFrom(Black, sfTmpB, nB)
+
+    /// Save / restore the full accumulator state for the current ply (called by Make/Unmake).
+    member private _.SfSnapshotSave() =
+        let off = stPly * sfPlyStride
+        let l1 = Accumulator.L1
+        let pb = Accumulator.PsqtBuckets
+        System.Array.Copy(sfW, 0, sfStack, off, l1)
+        System.Array.Copy(sfPW, 0, sfStack, off + l1, pb)
+        System.Array.Copy(sfB, 0, sfStack, off + l1 + pb, l1)
+        System.Array.Copy(sfPB, 0, sfStack, off + 2 * l1 + pb, pb)
+        System.Array.Copy(sfSetW, 0, sfStack, off + 2 * l1 + 2 * pb, SfMaxThreats)
+        System.Array.Copy(sfSetB, 0, sfStack, off + 2 * l1 + 2 * pb + SfMaxThreats, SfMaxThreats)
+        sfStack.[off + 2 * l1 + 2 * pb + 2 * SfMaxThreats] <- sfNW
+        sfStack.[off + 2 * l1 + 2 * pb + 2 * SfMaxThreats + 1] <- sfNB
+
+    member private _.SfSnapshotRestore() =
+        let off = stPly * sfPlyStride
+        let l1 = Accumulator.L1
+        let pb = Accumulator.PsqtBuckets
+        System.Array.Copy(sfStack, off, sfW, 0, l1)
+        System.Array.Copy(sfStack, off + l1, sfPW, 0, pb)
+        System.Array.Copy(sfStack, off + l1 + pb, sfB, 0, l1)
+        System.Array.Copy(sfStack, off + 2 * l1 + pb, sfPB, 0, pb)
+        System.Array.Copy(sfStack, off + 2 * l1 + 2 * pb, sfSetW, 0, SfMaxThreats)
+        System.Array.Copy(sfStack, off + 2 * l1 + 2 * pb + SfMaxThreats, sfSetB, 0, SfMaxThreats)
+        sfNW <- sfStack.[off + 2 * l1 + 2 * pb + 2 * SfMaxThreats]
+        sfNB <- sfStack.[off + 2 * l1 + 2 * pb + 2 * SfMaxThreats + 1]
 
     // --- StateInfo scalar accessors (byref-local read avoids the ~120 B struct copy; the getter itself
     //     is trivial and JIT-inlined — F# forbids MethodImpl on a parameterless property) -------------
@@ -639,7 +801,7 @@ type Position() =
         gamePly <- 0
         // A bulk board load invalidates the incremental SF accumulator: disable it so the piece-placement
         // below records NO deltas (32 PutPiece calls would overflow the small dirty buffer). The caller
-        // re-enables via EnableSfNnue, which rebuilds both perspectives from scratch (SfRefresh).
+        // re-enables via EnableNnue, which rebuilds both perspectives from scratch (SfRefresh).
         sfActive <- false
         let n = fen.Length
         let mutable i = 0
@@ -867,11 +1029,7 @@ type Position() =
         let pPlies = prev.PliesFromNull
         // SF NNUE: snapshot parent accumulator before stPly advances; reset dirty buffer.
         if sfActive then
-            let off = stPly * sfPlyStride
-            System.Array.Copy(sfWhiteAcc, 0, sfStack, off, SfAccumulator.L1)
-            System.Array.Copy(sfWhitePsqt, 0, sfStack, off + SfAccumulator.L1, SfAccumulator.PsqtBuckets)
-            System.Array.Copy(sfBlackAcc, 0, sfStack, off + SfAccumulator.L1 + SfAccumulator.PsqtBuckets, SfAccumulator.L1)
-            System.Array.Copy(sfBlackPsqt, 0, sfStack, off + 2 * SfAccumulator.L1 + SfAccumulator.PsqtBuckets, SfAccumulator.PsqtBuckets)
+            this.SfSnapshotSave()
             sfDirtyN <- 0
         stPly <- stPly + 1
         gamePly <- gamePly + 1
@@ -974,11 +1132,7 @@ type Position() =
         currentKey <- (let p = &states.[stPly] in p.Key)
         // SF NNUE: restore parent accumulator from snapshot (stPly is now back at parent ply).
         if sfActive then
-            let off = stPly * sfPlyStride
-            System.Array.Copy(sfStack, off, sfWhiteAcc, 0, SfAccumulator.L1)
-            System.Array.Copy(sfStack, off + SfAccumulator.L1, sfWhitePsqt, 0, SfAccumulator.PsqtBuckets)
-            System.Array.Copy(sfStack, off + SfAccumulator.L1 + SfAccumulator.PsqtBuckets, sfBlackAcc, 0, SfAccumulator.L1)
-            System.Array.Copy(sfStack, off + 2 * SfAccumulator.L1 + SfAccumulator.PsqtBuckets, sfBlackPsqt, 0, SfAccumulator.PsqtBuckets)
+            this.SfSnapshotRestore()
 
     /// Play a null move (side passes). PRE: not in check.
     member this.MakeNull() : unit =
@@ -992,14 +1146,8 @@ type Position() =
 
         let pCastling = prev.CastlingRights
         let pRule50 = prev.Rule50
-        // SF NNUE: snapshot parent accumulator before stPly advances; no pieces move so no dirty entries.
-        if sfActive then
-            let off = stPly * sfPlyStride
-            System.Array.Copy(sfWhiteAcc, 0, sfStack, off, SfAccumulator.L1)
-            System.Array.Copy(sfWhitePsqt, 0, sfStack, off + SfAccumulator.L1, SfAccumulator.PsqtBuckets)
-            System.Array.Copy(sfBlackAcc, 0, sfStack, off + SfAccumulator.L1 + SfAccumulator.PsqtBuckets, SfAccumulator.L1)
-            System.Array.Copy(sfBlackPsqt, 0, sfStack, off + 2 * SfAccumulator.L1 + SfAccumulator.PsqtBuckets, SfAccumulator.PsqtBuckets)
-            sfDirtyN <- 0
+        // SF NNUE: a null move moves no pieces ⇒ the accumulator is identical ⇒ no snapshot/update needed.
+        if sfActive then sfDirtyN <- 0
         stPly <- stPly + 1
         gamePly <- gamePly + 1
         let st = &states.[stPly]
@@ -1019,13 +1167,7 @@ type Position() =
         gamePly <- gamePly - 1
         sideToMove <- flipColor sideToMove
         currentKey <- (let p = &states.[stPly] in p.Key)
-        // SF NNUE: restore parent accumulator from snapshot (stPly is now back at parent ply).
-        if sfActive then
-            let off = stPly * sfPlyStride
-            System.Array.Copy(sfStack, off, sfWhiteAcc, 0, SfAccumulator.L1)
-            System.Array.Copy(sfStack, off + SfAccumulator.L1, sfWhitePsqt, 0, SfAccumulator.PsqtBuckets)
-            System.Array.Copy(sfStack, off + SfAccumulator.L1 + SfAccumulator.PsqtBuckets, sfBlackAcc, 0, SfAccumulator.L1)
-            System.Array.Copy(sfStack, off + 2 * SfAccumulator.L1 + SfAccumulator.PsqtBuckets, sfBlackPsqt, 0, SfAccumulator.PsqtBuckets)
+        // SF NNUE: a null move left the accumulator unchanged ⇒ nothing to restore.
 
     // --- GivesCheck: does `m` give check? (search/movegen; perft does not use it) -------------------
     // Normal: direct via cached CheckSquares (valid because a `from`-blocked ray would mean the enemy king

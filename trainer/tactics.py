@@ -3,17 +3,11 @@
 The headline metric: fraction of suite positions where the engine, at a fixed budget,
 plays the verified best move. Reported overall and split by tag (mate / win).
 
-The engine is configured by PER-PROCESS ENVIRONMENT VARIABLES, not UCI setoptions (the
-release engine only accepts Threads + Move Overhead via setoption; everything else is an
-EONEGO_* env var). `--env` is comma-separated NAME=VALUE overrides. Budget is `go movetime`
-by default (the fair axis once searches differ); `--nodes` is available for same-search runs.
+The release engine accepts only Threads + Move Overhead via UCI. `--env` is available
+for process-level environment overrides. Budget is `go movetime` by default; `--nodes`
+is available for fixed-node runs.
 
-    # Production Lc0 path:
-    python tactics.py --env "EONEGO_LC0=<path>.pb" --movetime 500
-    # History-prior fallback (no Lc0):
-    python tactics.py --env "EONEGO_LC0=none" --movetime 500
-    # Plain alpha-beta:
-    python tactics.py --env "EONEGO_MCTS=0,EONEGO_LC0=<path>.pb" --movetime 500
+    python tactics.py --movetime 500
 """
 
 import argparse
@@ -77,7 +71,7 @@ def score_player(exe, env_overrides, suite, limit):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--env", default="", help="env overrides, e.g. 'EONEGO_LC0=<path>.pb'")
+    ap.add_argument("--env", default="", help="process env overrides, e.g. 'COMPlus_TieredCompilation=0'")
     ap.add_argument("--exe", default=DEFAULT_EXE)
     ap.add_argument("--suite", default=os.path.join(HERE, "suites", "kga_tactics.tsv"))
     ap.add_argument("--movetime", type=int, default=500, help="ms per position")

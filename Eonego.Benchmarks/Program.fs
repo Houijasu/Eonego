@@ -11,13 +11,12 @@ open BenchmarkDotNet.Running
 open Eonego.Bitboard
 open Eonego.Move
 open Eonego.Position
-open Eonego.SfNnue
+open Eonego.Nnue
 open Eonego.MoveGeneration
 open Eonego.History
 open Eonego.MovePick
 open Eonego.Transposition
 open Eonego.Search
-open Eonego.Mcts
 
 /// Bit-serialization loop shoot-out.
 ///
@@ -417,7 +416,7 @@ type MovePickBench() =
 
         acc
 
-/// Static eval throughput for the Stockfish NNUE — the sole evaluator. NOTE: the from-scratch `SfNnue.evalCp`
+/// Static eval throughput for the Stockfish NNUE — the sole evaluator. NOTE: the from-scratch `Nnue.evalCp`
 /// is NOT 0 B/op (it allocates per-call accumulators) and is ~100x a material eval; this benchmark exists to
 /// MEASURE that cost and track the future incremental+AVX2 speedup. Soft-skips (does nothing) if the SF net
 /// `nets/sf16.nnue` is absent. The XOR-fold is returned so BenchmarkDotNet cannot dead-code-eliminate the loop.
@@ -498,112 +497,6 @@ type SearchBench() =
     member _.SearchDepth7() =
         negamax worker worker.Pos (-INF) INF 7 0 true false
 
-/// MCTS-root / negamax-leaf hybrid throughput. Measures end-to-end iteration cost (selection, expansion,
-/// leaf negamax, backup) on a tactically rich position. The SF net is loaded once in Setup for a realistic
-/// leaf eval; priors come from the history fallback (Lc0 is exercised in Lc0NetTests, not here).
-[<MemoryDiagnoser>]
-[<ShortRunJob>]
-type MctsBench() =
-
-    let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -" // Kiwipete
-
-    let mutable sfNet: SfNetwork option = None
-
-    [<GlobalSetup>]
-    member _.Setup() =
-        let mutable dir = System.IO.DirectoryInfo(System.AppContext.BaseDirectory)
-        let mutable root = None
-
-        while root.IsNone && not (isNull dir) do
-            if System.IO.File.Exists(System.IO.Path.Combine(dir.FullName, "Eonego.slnx")) then
-                root <- Some dir.FullName
-
-            dir <- dir.Parent
-
-        match root with
-        | Some r ->
-            let sp = System.IO.Path.Combine(r, "nets", "sf16.nnue")
-            sfNet <- if System.IO.File.Exists sp then (match load sp with Loaded n -> Some n | _ -> None) else None
-        | None -> ()
-
-    /// Baseline: leaf depth 6, trivial eval (no SF net), history priors — pure tree + qsearch machinery.
-    [<Benchmark(Baseline = true)>]
-    member _.MctsDepth6_200Iters() =
-        let cfg = { defaultConfig with MctsLeafDepth = 6; MctsCpuct = 150; MctsK = 200 }
-        let struct (_, _, _) = mctsToIterations fen [||] 200 cfg None
-        0
-
-    [<Benchmark>]
-    member _.MctsDepth0_200Iters() =
-        let cfg = { defaultConfig with MctsLeafDepth = 0; MctsCpuct = 150; MctsK = 200 }
-        let struct (_, _, _) = mctsToIterations fen [||] 200 cfg None
-        0
-
-    /// SF-net leaf eval (realistic). Soft-skips when the SF net is absent.
-    [<Benchmark>]
-    member _.MctsDepth6_SfNet() =
-        match sfNet with
-        | Some _ ->
-            let cfg = { defaultConfig with MctsLeafDepth = 6; MctsCpuct = 150; MctsK = 200 }
-            let struct (_, _, _) = mctsToIterations fen [||] 200 cfg sfNet
-            0
-        | None -> 0
-
-/// Lc0 CNN forward throughput: fp32 `forward` vs int8 `forwardI8` (tower + heads on the saturation-safe
-/// u8xi8 kernels). The CNN is the MCTS-policy bottleneck, so this is the binding speed measurement for the
-/// int8 effort. Soft-skips (returns 0) if the Lc0 .pb is absent.
-[<MemoryDiagnoser>]
-[<ShortRunJob>]
-type Lc0ForwardBench() =
-    let mutable net: Eonego.Lc0Proto.Lc0Net option = None
-    let mutable q = Unchecked.defaultof<Eonego.Lc0Net.Lc0Int8>
-    let mutable scratch = Unchecked.defaultof<Eonego.Lc0Net.Lc0Scratch>
-    let mutable qs = Unchecked.defaultof<Eonego.Lc0Net.Lc0Int8Scratch>
-    let mutable input: float32[] = [||]
-
-    [<GlobalSetup>]
-    member _.Setup() =
-        let mutable dir = System.IO.DirectoryInfo(System.AppContext.BaseDirectory)
-        let mutable root = None
-
-        while root.IsNone && not (isNull dir) do
-            if System.IO.File.Exists(System.IO.Path.Combine(dir.FullName, "Eonego.slnx")) then
-                root <- Some dir.FullName
-
-            dir <- dir.Parent
-
-        match root with
-        | Some r ->
-            let p = System.IO.Path.Combine(r, "nets", "20x256SE-jj-9-75000000.pb")
-
-            if System.IO.File.Exists p then
-                match Eonego.Lc0Proto.load p with
-                | Eonego.Lc0Proto.Loaded n ->
-                    net <- Some n
-                    q <- Eonego.Lc0Net.quantize n
-                    scratch <- Eonego.Lc0Net.Lc0Scratch(n)
-                    qs <- Eonego.Lc0Net.Lc0Int8Scratch(n)
-                    input <- Array.zeroCreate (112 * 64)
-                    Eonego.Lc0Encoder.encodeInto (Position.OfFen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1") input
-                | _ -> ()
-        | None -> ()
-
-    [<Benchmark(Baseline = true)>]
-    member _.Fp32Forward() =
-        match net with
-        | Some n ->
-            let struct (_, v) = Eonego.Lc0Net.forward true n scratch input
-            v
-        | None -> 0.0f
-
-    [<Benchmark>]
-    member _.Int8Forward() =
-        match net with
-        | Some n ->
-            let struct (_, v) = Eonego.Lc0Net.forwardI8 true n q scratch qs input
-            v
-        | None -> 0.0f
-
 [<EntryPoint>]
 let main argv =
     // `--filter *` runs every benchmark non-interactively when no args are given.
@@ -617,9 +510,7 @@ let main argv =
                typeof<MoveGenBench>
                typeof<MovePickBench>
                typeof<EvalBench>
-               typeof<SearchBench>
-               typeof<MctsBench>
-               typeof<Lc0ForwardBench> |]
+               typeof<SearchBench> |]
         )
         .Run(args)
     |> ignore

@@ -1,8 +1,8 @@
 /// HalfKAv2_hm feature indexing — the single source of truth for the SF NNUE accumulator math.
-/// Compiles BEFORE Position.fs (Position maintains the incremental accumulator and calls these); SfNnue.fs
+/// Compiles BEFORE Position.fs (Position maintains the incremental accumulator and calls these); NNUE.fs
 /// (after Position) reuses them in the from-scratch `buildAcc` oracle. PURE: no Position, no SfNetwork.
 /// Eonego squares are LERF (a1=0) == Stockfish; Color White=0/Black=1; Piece 0..11.
-module Eonego.SfAccumulator
+module Eonego.Accumulator
 
 open System.Runtime.CompilerServices
 open System.Runtime.Intrinsics
@@ -10,7 +10,7 @@ open System.Runtime.Intrinsics.X86
 open Eonego.Bitboard
 
 [<Literal>]
-let L1 = 1536
+let L1 = 1024 // FullThreats accumulator dim (was 1536 for SF16); HalfKA weights are now [feature][1024]
 
 [<Literal>]
 let PsqtBuckets = 8
@@ -68,3 +68,31 @@ let addFeature (acc: int[]) (psqt: int[]) (ftWeights: int16[]) (ftPsqt: int[]) (
     let pb = idx * PsqtBuckets
     for b in 0 .. PsqtBuckets - 1 do
         psqt.[b] <- psqt.[b] + sign * ftPsqt.[pb + b]
+
+/// As addFeature but for a FullThreats feature (int8 weights, int32 psqt). Updates a threat-only accumulator.
+[<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+let addThreat (acc: int[]) (psqt: int[]) (threatWeights: sbyte[]) (threatPsqt: int[]) (idx: int) (sign: int) =
+    let wb = idx * L1
+
+    if UseAvx2 && Avx2.IsSupported then
+        // sign-extend int8 weights (vpmovsxbd) and add/subtract 8 int32 lanes at a time.
+        let mutable j = 0
+
+        if sign > 0 then
+            while j < L1 do
+                let w = Avx2.ConvertToVector256Int32((Vector128.LoadUnsafe(&threatWeights.[wb + j]): Vector128<sbyte>))
+                Vector256.StoreUnsafe(Avx2.Add(Vector256.LoadUnsafe(&acc.[j]), w), &acc.[j])
+                j <- j + 8
+        else
+            while j < L1 do
+                let w = Avx2.ConvertToVector256Int32((Vector128.LoadUnsafe(&threatWeights.[wb + j]): Vector128<sbyte>))
+                Vector256.StoreUnsafe(Avx2.Subtract(Vector256.LoadUnsafe(&acc.[j]), w), &acc.[j])
+                j <- j + 8
+    else
+        for j in 0 .. L1 - 1 do
+            acc.[j] <- acc.[j] + sign * int threatWeights.[wb + j]
+
+    let pb = idx * PsqtBuckets
+
+    for b in 0 .. PsqtBuckets - 1 do
+        psqt.[b] <- psqt.[b] + sign * threatPsqt.[pb + b]

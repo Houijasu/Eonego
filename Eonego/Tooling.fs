@@ -14,7 +14,7 @@ open Eonego.Bitboard
 open Eonego.Move
 open Eonego.Position
 open Eonego.MoveGeneration
-open Eonego.SfNnue
+open Eonego.Nnue
 open Eonego.Search
 
 let private inv = CultureInfo.InvariantCulture
@@ -127,7 +127,7 @@ let private isNoisyBest (pos: Position) (m: Move) : bool =
     isPromotion m || isEnPassant m || not (pos.IsEmpty(toSq m))
 
 let private whiteRelEval (net: SfNetwork) (pos: Position) : int =
-    let e = SfNnue.evalCp net pos
+    let e = Nnue.evalCp net pos
     if pos.SideToMove = White then e else -e
 
 let private softmaxPick (rng: Random) (temp: float) (moves: Move[]) (scores: int[]) : Move =
@@ -328,11 +328,11 @@ let runGen (args: string[]) : int =
 
         match flag m "net" with
         | Some path ->
-            match SfNnue.load path with
-            | SfNnue.Failed r ->
+            match Nnue.load path with
+            | Nnue.Failed r ->
                 errLine ("failed to load net: " + r)
                 1
-            | SfNnue.Loaded n -> runGenGames outPath startFen games depthOpt nodesOpt temp seed randomPlies maxPlies n
+            | Nnue.Loaded n -> runGenGames outPath startFen games depthOpt nodesOpt temp seed randomPlies maxPlies n
         | None ->
             errLine "gen requires --net <path> (SF NNUE file)"
             1
