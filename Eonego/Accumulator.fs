@@ -43,10 +43,60 @@ let makeIndex (pColor: Color) (pc: int) (sq: int) (ksq: int) : int =
     let ps = if pColor = White then psWhite else psBlack
     (sq ^^^ orient) + ps.[pc] + kbBase
 
-/// acc[j] += sign*ftWeights[idx*L1+j] (all j); psqt[b] += sign*ftPsqt[idx*PsqtBuckets+b]. AVX2 widens the
-/// int16 weights to int32 (vpmovsxwd) and adds/subtracts 8 lanes at a time; bit-exact int32 arithmetic.
+// Shared dirty-frame payloads for Position's lazy NNUE stack. Dirty threats are physical edges in Eonego
+// piece encoding; Threats.fs converts them to perspective-dependent feature indices at apply time.
+[<Literal>]
+let MaxDirtyPieces = 8
+
+[<Literal>]
+let MaxDirtyThreats = 512
+
+[<Literal>]
+let private DirtyThreatSignBit = 1 <<< 20
+
+[<Literal>]
+let private DirtyThreatEdgeMask = DirtyThreatSignBit - 1
+
 [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-let addFeature (acc: int[]) (psqt: int[]) (ftWeights: int16[]) (ftPsqt: int[]) (idx: int) (sign: int) (useAvx2: bool) =
+let packDirtyThreatEdge (attacker: int) (from: int) (too: int) (attacked: int) : int =
+    attacker ||| (attacked <<< 4) ||| (from <<< 8) ||| (too <<< 14)
+
+[<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+let packSignedDirtyThreat (edge: int) (sign: int) : int =
+    (edge &&& DirtyThreatEdgeMask) ||| (if sign > 0 then DirtyThreatSignBit else 0)
+
+[<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+let dirtyThreatEdge (signedEdge: int) : int = signedEdge &&& DirtyThreatEdgeMask
+
+[<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+let dirtyThreatSign (signedEdge: int) : int = if (signedEdge &&& DirtyThreatSignBit) <> 0 then 1 else -1
+
+[<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+let dirtyThreatAttacker (edge: int) : int = edge &&& 0xF
+
+[<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+let dirtyThreatAttacked (edge: int) : int = (edge >>> 4) &&& 0xF
+
+[<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+let dirtyThreatFrom (edge: int) : int = (edge >>> 8) &&& 0x3F
+
+[<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+let dirtyThreatTo (edge: int) : int = (edge >>> 14) &&& 0x3F
+
+/// acc[accOff+j] += sign*ftWeights[idx*L1+j] (all j); psqt[psqtOff+b] += sign*ftPsqt[idx*PsqtBuckets+b].
+/// AVX2 widens the int16 weights to int32 and adds/subtracts 8 lanes at a time.
+[<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+let addFeatureAt
+    (acc: int[])
+    (accOff: int)
+    (psqt: int[])
+    (psqtOff: int)
+    (ftWeights: int16[])
+    (ftPsqt: int[])
+    (idx: int)
+    (sign: int)
+    (useAvx2: bool)
+    =
     let wb = idx * L1
 
     if useAvx2 && Avx2.IsSupported then
@@ -54,45 +104,69 @@ let addFeature (acc: int[]) (psqt: int[]) (ftWeights: int16[]) (ftPsqt: int[]) (
         if sign > 0 then
             while j < L1 do
                 let w = Avx2.ConvertToVector256Int32((Vector128.LoadUnsafe(&ftWeights.[wb + j]) : Vector128<int16>))
-                Vector256.StoreUnsafe(Avx2.Add(Vector256.LoadUnsafe(&acc.[j]), w), &acc.[j])
+                Vector256.StoreUnsafe(Avx2.Add(Vector256.LoadUnsafe(&acc.[accOff + j]), w), &acc.[accOff + j])
                 j <- j + 8
         else
             while j < L1 do
                 let w = Avx2.ConvertToVector256Int32((Vector128.LoadUnsafe(&ftWeights.[wb + j]) : Vector128<int16>))
-                Vector256.StoreUnsafe(Avx2.Subtract(Vector256.LoadUnsafe(&acc.[j]), w), &acc.[j])
+                Vector256.StoreUnsafe(Avx2.Subtract(Vector256.LoadUnsafe(&acc.[accOff + j]), w), &acc.[accOff + j])
                 j <- j + 8
     else
         for j in 0 .. L1 - 1 do
-            acc.[j] <- acc.[j] + sign * int ftWeights.[wb + j]
+            let k = accOff + j
+            acc.[k] <- acc.[k] + sign * int ftWeights.[wb + j]
 
     let pb = idx * PsqtBuckets
     for b in 0 .. PsqtBuckets - 1 do
-        psqt.[b] <- psqt.[b] + sign * ftPsqt.[pb + b]
+        let k = psqtOff + b
+        psqt.[k] <- psqt.[k] + sign * ftPsqt.[pb + b]
 
-/// As addFeature but for a FullThreats feature (int8 weights, int32 psqt). Updates a threat-only accumulator.
+/// Zero-offset compatibility wrapper.
 [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-let addThreat (acc: int[]) (psqt: int[]) (threatWeights: sbyte[]) (threatPsqt: int[]) (idx: int) (sign: int) =
+let addFeature (acc: int[]) (psqt: int[]) (ftWeights: int16[]) (ftPsqt: int[]) (idx: int) (sign: int) (useAvx2: bool) =
+    addFeatureAt acc 0 psqt 0 ftWeights ftPsqt idx sign useAvx2
+
+/// As addFeatureAt but for a FullThreats feature (int8 weights, int32 psqt).
+[<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+let addThreatAt
+    (acc: int[])
+    (accOff: int)
+    (psqt: int[])
+    (psqtOff: int)
+    (threatWeights: sbyte[])
+    (threatPsqt: int[])
+    (idx: int)
+    (sign: int)
+    (useAvx2: bool)
+    =
     let wb = idx * L1
 
-    if UseAvx2 && Avx2.IsSupported then
+    if useAvx2 && Avx2.IsSupported then
         // sign-extend int8 weights (vpmovsxbd) and add/subtract 8 int32 lanes at a time.
         let mutable j = 0
 
         if sign > 0 then
             while j < L1 do
                 let w = Avx2.ConvertToVector256Int32((Vector128.LoadUnsafe(&threatWeights.[wb + j]): Vector128<sbyte>))
-                Vector256.StoreUnsafe(Avx2.Add(Vector256.LoadUnsafe(&acc.[j]), w), &acc.[j])
+                Vector256.StoreUnsafe(Avx2.Add(Vector256.LoadUnsafe(&acc.[accOff + j]), w), &acc.[accOff + j])
                 j <- j + 8
         else
             while j < L1 do
                 let w = Avx2.ConvertToVector256Int32((Vector128.LoadUnsafe(&threatWeights.[wb + j]): Vector128<sbyte>))
-                Vector256.StoreUnsafe(Avx2.Subtract(Vector256.LoadUnsafe(&acc.[j]), w), &acc.[j])
+                Vector256.StoreUnsafe(Avx2.Subtract(Vector256.LoadUnsafe(&acc.[accOff + j]), w), &acc.[accOff + j])
                 j <- j + 8
     else
         for j in 0 .. L1 - 1 do
-            acc.[j] <- acc.[j] + sign * int threatWeights.[wb + j]
+            let k = accOff + j
+            acc.[k] <- acc.[k] + sign * int threatWeights.[wb + j]
 
     let pb = idx * PsqtBuckets
 
     for b in 0 .. PsqtBuckets - 1 do
-        psqt.[b] <- psqt.[b] + sign * threatPsqt.[pb + b]
+        let k = psqtOff + b
+        psqt.[k] <- psqt.[k] + sign * threatPsqt.[pb + b]
+
+/// Zero-offset compatibility wrapper.
+[<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+let addThreat (acc: int[]) (psqt: int[]) (threatWeights: sbyte[]) (threatPsqt: int[]) (idx: int) (sign: int) =
+    addThreatAt acc 0 psqt 0 threatWeights threatPsqt idx sign UseAvx2

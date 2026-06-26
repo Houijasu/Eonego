@@ -37,6 +37,17 @@ let private withNet (f: SfNetwork -> unit) =
         | Failed reason -> Assert.Fail("FullThreats net failed to load: " + reason)
         | Loaded net -> f net
 
+let private assertRawAccEqualsOracle (net: SfNetwork) (bound: Position) (oracle: Position) =
+    for persp in [ White; Black ] do
+        let incAcc = Array.zeroCreate L1
+        let incPsqt = Array.zeroCreate PsqtBuckets
+        let refAcc = Array.zeroCreate L1
+        let refPsqt = Array.zeroCreate PsqtBuckets
+        bound.SfReadAccInto(persp, Span<int>(incAcc), Span<int>(incPsqt))
+        buildAccOracle net oracle persp (Span<int>(refAcc)) (Span<int>(refPsqt))
+        Assert.Equal<int[]>(refAcc, incAcc)
+        Assert.Equal<int[]>(refPsqt, incPsqt)
+
 [<Fact>]
 let ``loads to EOF with the FullThreats version`` () =
     withNet (fun net ->
@@ -78,6 +89,7 @@ let ``incremental accumulator equals from-scratch over a make/unmake walk`` () =
               "8/8/8/3k4/8/3K4/4P3/8 w - - 0 1" ] // king-move endgame
 
         let rec walk (b: Position) (o: Position) (depth: int) =
+            assertRawAccEqualsOracle net b o
             Assert.Equal(evalCp net o, evalCp net b) // from-scratch (unbound) == incremental (bound)
 
             if depth > 0 then
@@ -93,6 +105,55 @@ let ``incremental accumulator equals from-scratch over a make/unmake walk`` () =
             bindNnue net bound // sfActive -> incremental
             let oracle = Position.OfFen fen // unbound -> from-scratch
             walk bound oracle 2)
+
+[<Fact>]
+let ``lazy accumulator replays unevaluated real-move chains`` () =
+    withNet (fun net ->
+        let fens =
+            [ "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"
+              "8/8/8/3k4/8/3K4/4P3/8 w - - 0 1" ]
+
+        for fen in fens do
+            let bound = Position.OfFen fen
+            bindNnue net bound
+            let oracle = Position.OfFen fen
+            let m1 = (collectLegal bound).[0]
+            bound.Make m1
+            oracle.Make m1
+            let m2 = (collectLegal bound).[0]
+            bound.Make m2
+            oracle.Make m2
+            assertRawAccEqualsOracle net bound oracle
+            Assert.Equal(evalCp net oracle, evalCp net bound)
+            bound.Unmake m2
+            oracle.Unmake m2
+            bound.Unmake m1
+            oracle.Unmake m1
+            assertRawAccEqualsOracle net bound oracle)
+
+[<Fact>]
+let ``null moves preserve sfTop and replay across following real move`` () =
+    withNet (fun net ->
+        let bound = Position.OfFen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+        bindNnue net bound
+        let oracle = Position.OfFen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+        let top0 = bound.SfTop
+        bound.MakeNull()
+        oracle.MakeNull()
+        Assert.Equal(top0, bound.SfTop)
+        assertRawAccEqualsOracle net bound oracle
+        let m = (collectLegal bound).[0]
+        bound.Make m
+        oracle.Make m
+        Assert.Equal(top0 + 1, bound.SfTop)
+        assertRawAccEqualsOracle net bound oracle
+        bound.Unmake m
+        oracle.Unmake m
+        Assert.Equal(top0, bound.SfTop)
+        bound.UnmakeNull()
+        oracle.UnmakeNull()
+        Assert.Equal(top0, bound.SfTop)
+        assertRawAccEqualsOracle net bound oracle)
 
 // The AVX2 forward kernels (ftProduct/fc0/fc1/fc2) MUST be bit-identical to the scalar reference. evalInternal
 // takes an explicit useAvx2 so both paths run in ONE process on the SAME maintained accumulator — any delta is

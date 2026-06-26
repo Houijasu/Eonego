@@ -311,3 +311,38 @@ let appendActiveThreatsBoth (pos: Position) (bufW: int[]) (bufB: int[]) : int64 
                     emit attacker from too
 
     (int64 nW <<< 32) ||| int64 nB
+
+/// Convert perspective-agnostic dirty physical threat edges to signed FullThreats feature indices for both
+/// perspectives. Positive encoded values mean add `(v - 1)`, negative values mean remove `(-v - 1)`.
+let appendChangedThreatsBothAt (pos: Position) (dirty: int[]) (dirtyOff: int) (dirtyN: int) (bufW: int[]) (bufB: int[]) : int64 =
+    let ksqW = pos.KingSquare White
+    let ksqB = pos.KingSquare Black
+    let mutable nW = 0
+    let mutable nB = 0
+
+    let inline encodeSigned idx sign = if sign > 0 then idx + 1 else -idx - 1
+
+    for i in 0 .. dirtyN - 1 do
+        let signedEdge = dirty.[dirtyOff + i]
+        let edge = Accumulator.dirtyThreatEdge signedEdge
+        let sign = Accumulator.dirtyThreatSign signedEdge
+        let attacker = sfOfEonego (Accumulator.dirtyThreatAttacker edge)
+        let attacked = sfOfEonego (Accumulator.dirtyThreatAttacked edge)
+        let from = Accumulator.dirtyThreatFrom edge
+        let too = Accumulator.dirtyThreatTo edge
+        let wIdx = makeIndex White attacker from too attacked ksqW
+
+        if wIdx < Dimensions && nW < bufW.Length then
+            bufW.[nW] <- encodeSigned wIdx sign
+            nW <- nW + 1
+
+        let bIdx = makeIndex Black attacker from too attacked ksqB
+
+        if bIdx < Dimensions && nB < bufB.Length then
+            bufB.[nB] <- encodeSigned bIdx sign
+            nB <- nB + 1
+
+    (int64 nW <<< 32) ||| int64 nB
+
+let appendChangedThreatsBoth (pos: Position) (dirty: int[]) (dirtyN: int) (bufW: int[]) (bufB: int[]) : int64 =
+    appendChangedThreatsBothAt pos dirty 0 dirtyN bufW bufB

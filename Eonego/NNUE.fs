@@ -2,8 +2,8 @@
 /// Clean-room from the published nnue-pytorch format + the SF master inference spec. Dual-input feature
 /// transformer: the L1=1024 accumulator (and 8 PSQT buckets) is built from BOTH HalfKAv2_hm features
 /// (int16 `weights`) AND FullThreats features (int8 `threatWeights`); HalfKA indexing is reused from
-/// `Accumulator.makeIndex`, threats from `Threats`. v0 is a from-scratch eval (no incremental
-/// accumulator) — correct but slow; an incremental/threats-diff accumulator is a deferred optimisation.
+/// `Accumulator.makeIndex`, threats from `Threats`. Bound positions use Position's lazy incremental
+/// accumulator; unbound positions keep the from-scratch path as an oracle.
 ///
 /// Licensing: Stockfish `.nnue` FILES are CC0; this loader is a clean-room implementation of the file
 /// format (not copyrightable) and the integer inference, not a copy of SF's GPL C++. See THIRD-PARTY-NOTICES.
@@ -334,6 +334,10 @@ let private buildAcc (net: SfNetwork) (pos: Position) (pColor: Color) (acc: Span
         for b in 0 .. PsqtBuckets - 1 do
             psqt.[b] <- psqt.[b] + net.ThreatPsqtWeights.[pb + b]
 
+/// Public oracle for tests/diagnostics: build one perspective's raw accumulator from the board.
+let buildAccOracle (net: SfNetwork) (pos: Position) (pColor: Color) (acc: Span<int>) (psqt: Span<int>) =
+    buildAcc net pos pColor acc psqt
+
 let inline private clampFt (v: int) = if v < 0 then 0 elif v > FtMaxVal then FtMaxVal else v
 
 /// 8 lanes of clamp(acc[k],0,255)*clamp(acc[k+Half],0,255) >> 9 (the FT pairwise product), result in [0,126].
@@ -445,28 +449,18 @@ let private fc2Dot (a1: Span<byte>) (fc2w: sbyte[]) (fc2b: int) (useAvx2: bool) 
 
 /// SF-Value (the network output, ~NormalizeToPawnValue per pawn): (125*psqt + 131*positional)/128.
 /// `useAvx2` selects the SIMD vs scalar forward path (production passes the module `UseAvx2`; tests pass both
-/// to assert bit-exactness). SkipLocalsInit drops the ~14 KB/call stackalloc zeroing — every buffer is fully
-/// written before read EXCEPT conc's padding lanes [62,63], which `conc.Clear()` below still zeroes.
+/// to assert bit-exactness). SkipLocalsInit drops stackalloc zeroing; every stack buffer is fully written
+/// before read, and the two padded conc lanes are set explicitly.
 [<System.Runtime.CompilerServices.SkipLocalsInit>]
-let evalInternal (net: SfNetwork) (pos: Position) (useAvx2: bool) : int =
-    let accWP = NativePtr.stackalloc<int> L1
-    let accW = Span<int>(NativePtr.toVoidPtr accWP, L1)
-    let accBP = NativePtr.stackalloc<int> L1
-    let accB = Span<int>(NativePtr.toVoidPtr accBP, L1)
-    let psqWP = NativePtr.stackalloc<int> PsqtBuckets
-    let psqW = Span<int>(NativePtr.toVoidPtr psqWP, PsqtBuckets)
-    let psqBP = NativePtr.stackalloc<int> PsqtBuckets
-    let psqB = Span<int>(NativePtr.toVoidPtr psqBP, PsqtBuckets)
-
-    if pos.SfActive then
-        // incremental: read the maintained accumulators (biases + HalfKA + threats)
-        pos.SfReadAccInto(White, accW, psqW)
-        pos.SfReadAccInto(Black, accB, psqB)
-    else
-        // from-scratch oracle (tests / unbound)
-        buildAcc net pos White accW psqW
-        buildAcc net pos Black accB psqB
-
+let private evalFromAcc
+    (net: SfNetwork)
+    (pos: Position)
+    (accW: Span<int>)
+    (accB: Span<int>)
+    (psqW: Span<int>)
+    (psqB: Span<int>)
+    (useAvx2: bool)
+    : int =
     let stm = pos.SideToMove
     let accUs = if stm = White then accW else accB
     let accThem = if stm = White then accB else accW
@@ -494,12 +488,13 @@ let evalInternal (net: SfNetwork) (pos: Position) (useAvx2: bool) : int =
     fc0Gemv ft stack.Fc0W stack.Fc0B fc0 useAvx2
 
     // conc: sqr(fc0[0..30]) in [0..30], lin(fc0[0..30]) in [31..61], [62..63]=0. fc0[31] is skip-only.
-    conc.Clear()
-
     for o in 0 .. 30 do
         let x = fc0.[o]
         conc.[o] <- byte (min 127L ((int64 x * int64 x) >>> 21)) // SqrClippedReLU, shift 2*7+7
         conc.[31 + o] <- byte (max 0 (min 127 (x >>> 7))) // ClippedReLU, shift 7
+
+    conc.[62] <- 0uy
+    conc.[63] <- 0uy
 
     // fc_1: 64 -> 32 (AVX2 GEMV)
     fc1Gemv conc stack.Fc1W stack.Fc1B fc1 useAvx2
@@ -521,6 +516,30 @@ let evalInternal (net: SfNetwork) (pos: Position) (useAvx2: bool) : int =
     let posV = outputValue / 16
     (125 * psqtV + 131 * posV) / 128
 
+[<System.Runtime.CompilerServices.SkipLocalsInit>]
+let evalInternal (net: SfNetwork) (pos: Position) (useAvx2: bool) : int =
+    if pos.SfActive then
+        // Incremental hot path: materialize the current lazy frame if needed, then read it in place.
+        let accW = pos.SfAccSpan White
+        let accB = pos.SfAccSpan Black
+        let psqW = pos.SfPsqtSpan White
+        let psqB = pos.SfPsqtSpan Black
+        evalFromAcc net pos accW accB psqW psqB useAvx2
+    else
+        // From-scratch oracle (tests / unbound positions).
+        let accWP = NativePtr.stackalloc<int> L1
+        let accW = Span<int>(NativePtr.toVoidPtr accWP, L1)
+        let accBP = NativePtr.stackalloc<int> L1
+        let accB = Span<int>(NativePtr.toVoidPtr accBP, L1)
+        let psqWP = NativePtr.stackalloc<int> PsqtBuckets
+        let psqW = Span<int>(NativePtr.toVoidPtr psqWP, PsqtBuckets)
+        let psqBP = NativePtr.stackalloc<int> PsqtBuckets
+        let psqB = Span<int>(NativePtr.toVoidPtr psqBP, PsqtBuckets)
+
+        buildAcc net pos White accW psqW
+        buildAcc net pos Black accB psqB
+        evalFromAcc net pos accW accB psqW psqB useAvx2
+
 /// Side-to-move-relative centipawns, clamped to +/-EvalMax.
 let evalCp (net: SfNetwork) (pos: Position) : int =
     let cp = int (int64 (evalInternal net pos UseAvx2) * 100L / int64 NormalizeToPawnValue)
@@ -538,3 +557,5 @@ let bindNnue (net: SfNetwork) (pos: Position) : unit =
         net.ThreatPsqtWeights
         (System.Func<Position, int, int[], int>(fun p persp buf -> Threats.appendActiveThreats persp p buf))
         (System.Func<Position, int[], int[], int64>(fun p bw bb -> Threats.appendActiveThreatsBoth p bw bb))
+        (System.Func<Position, int[], int, int, int[], int[], int64>(fun p dirty off n bw bb ->
+            Threats.appendChangedThreatsBothAt p dirty off n bw bb))
