@@ -13,6 +13,9 @@ publish/
 # BenchmarkDotNet artifacts
 BenchmarkDotNet.Artifacts/
 
+# Golden-eval capture artifact (written to repo root by GoldenEvalTests in capture mode)
+eonego-golden-eval.txt
+
 # Test results
 [Tt]est[Rr]esult*/
 [Bb]uild[Rr]esult.*/
