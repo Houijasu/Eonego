@@ -59,18 +59,20 @@ let inline valueFromTt (v: int) (ply: int) : int =
 
 /// LMR reduction table r[depth][moveCount], built once at init (read-only ⇒ LazySMP-safe, like the eval
 /// tables). r grows with both depth and move number: late moves at high depth are searched much shallower.
-let private Reductions: int[,] =
-    let t = Array2D.zeroCreate 64 64
+// Flat 64*64 (row d*64 + m), NOT int[,]: a single-dimension array's element access elides bounds checks the
+// JIT cannot for multidim T[,], and the `< 64` guard below already bounds both indices.
+let private Reductions: int[] =
+    let t = Array.zeroCreate (64 * 64)
 
     for d in 1..63 do
         for m in 1..63 do
-            t.[d, m] <- int (0.5 + log (float d) * log (float m) / 2.2)
+            t.[d * 64 + m] <- int (0.5 + log (float d) * log (float m) / 2.2)
 
     t
 
 let inline private reduction (depth: int) (moveCount: int) : int =
     if depth < 64 && moveCount < 64 then
-        Reductions.[depth, moveCount]
+        Reductions.[depth * 64 + moveCount]
     else
         6
 

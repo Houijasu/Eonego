@@ -14,7 +14,8 @@
     <!-- Allow unsafe code for pointer/bitboard optimizations -->
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 
-    <!-- GC tuned for throughput -->
+    <!-- GC tuned for throughput. A/B'd workstation+non-concurrent (2026-06-29): no gain on the 0-alloc search
+         (~2.01M vs ~2.04M nps 8T), so Server+Concurrent retained (conventional + marginally faster). -->
     <ServerGarbageCollection>true</ServerGarbageCollection>
     <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
     <RetainVMGarbageCollection>true</RetainVMGarbageCollection>

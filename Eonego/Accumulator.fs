@@ -5,6 +5,7 @@
 module Eonego.Accumulator
 
 open System.Runtime.CompilerServices
+open System.Runtime.InteropServices
 open System.Runtime.Intrinsics
 open System.Runtime.Intrinsics.X86
 open Eonego.Bitboard
@@ -84,10 +85,12 @@ let dirtyThreatFrom (edge: int) : int = (edge >>> 8) &&& 0x3F
 let dirtyThreatTo (edge: int) : int = (edge >>> 14) &&& 0x3F
 
 /// acc[accOff+j] += sign*ftWeights[idx*L1+j] (all j); psqt[psqtOff+b] += sign*ftPsqt[idx*PsqtBuckets+b].
-/// AVX2 widens the int16 weights to int32 and adds/subtracts 8 lanes at a time.
+/// int16 accumulator: HalfKA weights are already int16, so AVX2 adds/subtracts 16 lanes directly (no widen).
+/// PSQT stays int32. The int16 sum wraps on two's-complement overflow identically in scalar and SIMD, but the
+/// trained net keeps it in range (gated by the incremental==int32-oracle overflow test).
 [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
 let addFeatureAt
-    (acc: int[])
+    (acc: int16[])
     (accOff: int)
     (psqt: int[])
     (psqtOff: int)
@@ -100,21 +103,27 @@ let addFeatureAt
     let wb = idx * L1
 
     if useAvx2 && Avx2.IsSupported then
+        // Base-ref + element-offset loads/stores skip the per-iteration array bounds checks the JIT can't elide
+        // when accOff/wb are runtime values. 16 int16 lanes/iter (vpaddw/vpsubw); bit-identical to scalar.
+        let accBase = &MemoryMarshal.GetArrayDataReference acc
+        let wBase = &MemoryMarshal.GetArrayDataReference ftWeights
         let mutable j = 0
         if sign > 0 then
             while j < L1 do
-                let w = Avx2.ConvertToVector256Int32((Vector128.LoadUnsafe(&ftWeights.[wb + j]) : Vector128<int16>))
-                Vector256.StoreUnsafe(Avx2.Add(Vector256.LoadUnsafe(&acc.[accOff + j]), w), &acc.[accOff + j])
-                j <- j + 8
+                let w = Vector256.LoadUnsafe(&wBase, unativeint (wb + j))
+                let cur = Vector256.LoadUnsafe(&accBase, unativeint (accOff + j))
+                Vector256.StoreUnsafe(Avx2.Add(cur, w), &accBase, unativeint (accOff + j))
+                j <- j + 16
         else
             while j < L1 do
-                let w = Avx2.ConvertToVector256Int32((Vector128.LoadUnsafe(&ftWeights.[wb + j]) : Vector128<int16>))
-                Vector256.StoreUnsafe(Avx2.Subtract(Vector256.LoadUnsafe(&acc.[accOff + j]), w), &acc.[accOff + j])
-                j <- j + 8
+                let w = Vector256.LoadUnsafe(&wBase, unativeint (wb + j))
+                let cur = Vector256.LoadUnsafe(&accBase, unativeint (accOff + j))
+                Vector256.StoreUnsafe(Avx2.Subtract(cur, w), &accBase, unativeint (accOff + j))
+                j <- j + 16
     else
         for j in 0 .. L1 - 1 do
             let k = accOff + j
-            acc.[k] <- acc.[k] + sign * int ftWeights.[wb + j]
+            acc.[k] <- acc.[k] + int16 (sign * int ftWeights.[wb + j])
 
     let pb = idx * PsqtBuckets
     for b in 0 .. PsqtBuckets - 1 do
@@ -123,13 +132,13 @@ let addFeatureAt
 
 /// Zero-offset compatibility wrapper.
 [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-let addFeature (acc: int[]) (psqt: int[]) (ftWeights: int16[]) (ftPsqt: int[]) (idx: int) (sign: int) (useAvx2: bool) =
+let addFeature (acc: int16[]) (psqt: int[]) (ftWeights: int16[]) (ftPsqt: int[]) (idx: int) (sign: int) (useAvx2: bool) =
     addFeatureAt acc 0 psqt 0 ftWeights ftPsqt idx sign useAvx2
 
-/// As addFeatureAt but for a FullThreats feature (int8 weights, int32 psqt).
+/// As addFeatureAt but for a FullThreats feature (int8 weights -> int16 accumulator, int32 psqt).
 [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
 let addThreatAt
-    (acc: int[])
+    (acc: int16[])
     (accOff: int)
     (psqt: int[])
     (psqtOff: int)
@@ -142,23 +151,28 @@ let addThreatAt
     let wb = idx * L1
 
     if useAvx2 && Avx2.IsSupported then
-        // sign-extend int8 weights (vpmovsxbd) and add/subtract 8 int32 lanes at a time.
+        // sign-extend int8 weights to int16 (vpmovsxbw) and add/subtract 16 int16 lanes at a time; base-ref +
+        // offset loads/stores skip the per-iteration bounds checks (bit-identical to the scalar form).
+        let accBase = &MemoryMarshal.GetArrayDataReference acc
+        let wBase = &MemoryMarshal.GetArrayDataReference threatWeights
         let mutable j = 0
 
         if sign > 0 then
             while j < L1 do
-                let w = Avx2.ConvertToVector256Int32((Vector128.LoadUnsafe(&threatWeights.[wb + j]): Vector128<sbyte>))
-                Vector256.StoreUnsafe(Avx2.Add(Vector256.LoadUnsafe(&acc.[accOff + j]), w), &acc.[accOff + j])
-                j <- j + 8
+                let w = Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&wBase, unativeint (wb + j)))
+                let cur = Vector256.LoadUnsafe(&accBase, unativeint (accOff + j))
+                Vector256.StoreUnsafe(Avx2.Add(cur, w), &accBase, unativeint (accOff + j))
+                j <- j + 16
         else
             while j < L1 do
-                let w = Avx2.ConvertToVector256Int32((Vector128.LoadUnsafe(&threatWeights.[wb + j]): Vector128<sbyte>))
-                Vector256.StoreUnsafe(Avx2.Subtract(Vector256.LoadUnsafe(&acc.[accOff + j]), w), &acc.[accOff + j])
-                j <- j + 8
+                let w = Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&wBase, unativeint (wb + j)))
+                let cur = Vector256.LoadUnsafe(&accBase, unativeint (accOff + j))
+                Vector256.StoreUnsafe(Avx2.Subtract(cur, w), &accBase, unativeint (accOff + j))
+                j <- j + 16
     else
         for j in 0 .. L1 - 1 do
             let k = accOff + j
-            acc.[k] <- acc.[k] + sign * int threatWeights.[wb + j]
+            acc.[k] <- acc.[k] + int16 (sign * int threatWeights.[wb + j])
 
     let pb = idx * PsqtBuckets
 
@@ -168,5 +182,5 @@ let addThreatAt
 
 /// Zero-offset compatibility wrapper.
 [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-let addThreat (acc: int[]) (psqt: int[]) (threatWeights: sbyte[]) (threatPsqt: int[]) (idx: int) (sign: int) =
+let addThreat (acc: int16[]) (psqt: int[]) (threatWeights: sbyte[]) (threatPsqt: int[]) (idx: int) (sign: int) =
     addThreatAt acc 0 psqt 0 threatWeights threatPsqt idx sign UseAvx2

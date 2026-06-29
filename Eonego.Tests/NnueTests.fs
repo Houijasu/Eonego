@@ -39,14 +39,55 @@ let private withNet (f: SfNetwork -> unit) =
 
 let private assertRawAccEqualsOracle (net: SfNetwork) (bound: Position) (oracle: Position) =
     for persp in [ White; Black ] do
-        let incAcc = Array.zeroCreate L1
+        let incAcc = Array.zeroCreate<int16> L1 // int16 incremental accumulator
         let incPsqt = Array.zeroCreate PsqtBuckets
+        let refAcc = Array.zeroCreate L1 // int32 "true value" oracle
+        let refPsqt = Array.zeroCreate PsqtBuckets
+        bound.SfReadAccInto(persp, Span<int16>(incAcc), Span<int>(incPsqt))
+        buildAccOracle net oracle persp (Span<int>(refAcc)) (Span<int>(refPsqt))
+        // int16 incremental == int16(true value), AND the true value fits int16 (the overflow gate the old
+        // both-int32 test could not express).
+        for j in 0 .. L1 - 1 do
+            Assert.True(
+                refAcc.[j] >= -32768 && refAcc.[j] <= 32767,
+                sprintf "acc[%d] = %d exceeds int16 range (perspective %A)" j refAcc.[j] persp
+            )
+
+            Assert.Equal(int16 refAcc.[j], incAcc.[j])
+
+        Assert.Equal<int[]>(refPsqt, incPsqt)
+
+// Wide overflow gate: over a perft-style legal-move corpus the int32 "true value" accumulator must stay within
+// int16 range for BOTH perspectives — the realistic guard that the trained net's sums actually fit in search.
+[<Fact>]
+let ``int32 oracle accumulator stays within int16 range over a deep corpus`` () =
+    withNet (fun net ->
+        let cases =
+            [ "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 3 // startpos
+              "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1", 2 // kiwipete
+              "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1", 3 ] // sparse endgame
+
         let refAcc = Array.zeroCreate L1
         let refPsqt = Array.zeroCreate PsqtBuckets
-        bound.SfReadAccInto(persp, Span<int>(incAcc), Span<int>(incPsqt))
-        buildAccOracle net oracle persp (Span<int>(refAcc)) (Span<int>(refPsqt))
-        Assert.Equal<int[]>(refAcc, incAcc)
-        Assert.Equal<int[]>(refPsqt, incPsqt)
+
+        let check (p: Position) =
+            for persp in [ White; Black ] do
+                buildAccOracle net p persp (Span<int>(refAcc)) (Span<int>(refPsqt))
+
+                for j in 0 .. L1 - 1 do
+                    Assert.True(refAcc.[j] >= -32768 && refAcc.[j] <= 32767, sprintf "acc[%d]=%d exceeds int16" j refAcc.[j])
+
+        let rec walk (p: Position) (depth: int) =
+            check p
+
+            if depth > 0 then
+                for m in collectLegal p do
+                    p.Make m
+                    walk p (depth - 1)
+                    p.Unmake m
+
+        for (fen, depth) in cases do
+            walk (Position.OfFen fen) depth)
 
 [<Fact>]
 let ``loads to EOF with the FullThreats version`` () =
@@ -155,6 +196,35 @@ let ``null moves preserve sfTop and replay across following real move`` () =
         Assert.Equal(top0, bound.SfTop)
         assertRawAccEqualsOracle net bound oracle)
 
+[<Fact>]
+let ``changed threat indices are materialized lazily after make`` () =
+    withNet (fun net ->
+        let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"
+        let scout = Position.OfFen fen
+        let dirty = Array.zeroCreate Eonego.Accumulator.MaxDirtyThreats
+        let move =
+            collectLegal scout
+            |> Array.find (fun m -> scout.SfDebugCollectDirtyThreats(m, dirty) > 0)
+        let bound = Position.OfFen fen
+        let mutable changedCalls = 0
+        bound.EnableNnue
+            net.FtBiases
+            net.Weights
+            net.PsqtWeights
+            net.ThreatWeights
+            net.ThreatPsqtWeights
+            (System.Func<Position, int, int[], int>(fun p persp buf -> Eonego.Threats.appendActiveThreats persp p buf))
+            (System.Func<Position, int[], int[], int64>(fun p bw bb -> Eonego.Threats.appendActiveThreatsBoth p bw bb))
+            (System.Func<Position, int[], int, int, int[], int[], int64>(fun p dirty off n bw bb ->
+                changedCalls <- changedCalls + 1
+                Eonego.Threats.appendChangedThreatsBothAt p dirty off n bw bb))
+        bound.Make move
+        Assert.Equal(0, changedCalls)
+        evalCp net bound |> ignore
+        Assert.True(changedCalls > 0)
+        bound.Unmake move)
+
+
 // The AVX2 forward kernels (ftProduct/fc0/fc1/fc2) MUST be bit-identical to the scalar reference. evalInternal
 // takes an explicit useAvx2 so both paths run in ONE process on the SAME maintained accumulator — any delta is
 // a SIMD-kernel bug. Walks several positions to exercise varied fc0/conc/fc1 magnitudes.
@@ -169,7 +239,11 @@ let ``forward AVX2 path equals scalar path bit-exactly`` () =
                   "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1" ] // sparse endgame
 
             let rec walk (b: Position) (depth: int) =
-                Assert.Equal(evalInternal net b false, evalInternal net b true) // scalar == AVX2
+                let scalar = evalInternal net b false false
+                Assert.Equal(scalar, evalInternal net b true false) // scalar == AVX2
+
+                if System.Runtime.Intrinsics.X86.AvxVnni.IsSupported then
+                    Assert.Equal(scalar, evalInternal net b true true) // scalar == AVX2 + VNNI (vpdpbusd)
 
                 if depth > 0 then
                     for m in collectLegal b do

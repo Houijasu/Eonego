@@ -18,6 +18,24 @@ open Eonego.MovePick
 open Eonego.Transposition
 open Eonego.Search
 
+/// Walk up to the repo root (holds Eonego.slnx) and load the real FullThreats net if present. Shared by the
+/// NNUE benchmarks so they exercise the actual evaluator instead of no-opping on a stale filename.
+let private loadFullThreatsNet () : SfNetwork option =
+    let mutable dir = System.IO.DirectoryInfo(System.AppContext.BaseDirectory)
+    let mutable root = None
+
+    while root.IsNone && not (isNull dir) do
+        if System.IO.File.Exists(System.IO.Path.Combine(dir.FullName, "Eonego.slnx")) then
+            root <- Some dir.FullName
+
+        dir <- dir.Parent
+
+    match root with
+    | Some r ->
+        let p = System.IO.Path.Combine(r, "nets", "nn-f8a759c05f9f.nnue")
+        if System.IO.File.Exists p then (match load p with Loaded n -> Some n | _ -> None) else None
+    | None -> None
+
 /// Bit-serialization loop shoot-out.
 ///
 /// The engine's hottest inner loop walks the set bits of a bitboard (one per
@@ -416,10 +434,17 @@ type MovePickBench() =
 
         acc
 
-/// Static eval throughput for the Stockfish NNUE — the sole evaluator. NOTE: the from-scratch `Nnue.evalCp`
-/// is NOT 0 B/op (it allocates per-call accumulators) and is ~100x a material eval; this benchmark exists to
-/// MEASURE that cost and track the future incremental+AVX2 speedup. Soft-skips (does nothing) if the SF net
-/// `nets/sf16.nnue` is absent. The XOR-fold is returned so BenchmarkDotNet cannot dead-code-eliminate the loop.
+/// Static eval throughput for the Stockfish FullThreats NNUE — the sole evaluator. Soft-skips (does nothing)
+/// if `nets/nn-f8a759c05f9f.nnue` is absent. These four benchmarks DECOMPOSE the per-node cost so the
+/// eval-vs-make-time-threat-tracking question can be settled empirically (the previous EvalBench loaded a
+/// stale filename and measured nothing; it also only exercised the unbound from-scratch path, never the
+/// production incremental delta-apply). All return an XOR-fold so BDN cannot dead-code-eliminate the loop.
+///   EvalFromScratch  : unbound positions -> from-scratch oracle (buildAcc). Reference / upper bound.
+///   EvalBoundRoot    : net bound, root frame already computed -> FORWARD PASS ONLY (FT product + GEMVs).
+///   MakeUnmake       : make/unmake over a move list, NO eval -> pure make-time threat tracking cost.
+///   MakeEvalUnmake   : make/eval/unmake -> make + incremental delta-apply + forward.
+/// Decomposition: make-time ~= MakeUnmake; incremental-apply ~= (MakeEvalUnmake - MakeUnmake) - EvalBoundRoot;
+/// forward ~= EvalBoundRoot. If MakeUnmake dominates MakeEvalUnmake, make-time threat tracking is the bottleneck.
 [<MemoryDiagnoser>]
 [<ShortRunJob>]
 type EvalBench() =
@@ -430,38 +455,88 @@ type EvalBench() =
            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - -" // rook endgame (low phase)
            "8/8/8/3k4/8/3K4/4P3/8 w - -" |] // pawn endgame (phase 0)
 
+    // Capture-rich position for the bound make/eval/unmake benches (heavy threat churn per move).
+    let richFen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -" // Kiwipete
+
     let mutable positions: Position[] = [||]
     let mutable net: SfNetwork option = None
+    let mutable bound = Unchecked.defaultof<Position>
+    let moves: Move[] = Array.zeroCreate 256
+    let mutable nMoves = 0
 
     [<GlobalSetup>]
     member _.Setup() =
         positions <- fens |> Array.map Position.OfFen
-        // Walk up to the repo root (holds Eonego.slnx) and load nets/sf16.nnue if present.
-        let mutable dir = System.IO.DirectoryInfo(System.AppContext.BaseDirectory)
-        let mutable root = None
+        net <- loadFullThreatsNet ()
 
-        while root.IsNone && not (isNull dir) do
-            if System.IO.File.Exists(System.IO.Path.Combine(dir.FullName, "Eonego.slnx")) then
-                root <- Some dir.FullName
+        match net with
+        | Some n ->
+            bound <- Position.OfFen richFen
+            Eonego.Nnue.bindNnue n bound // SfActive = true; root frame (0) materialized -> incremental path live
+            nMoves <- generateLegal bound (Span<Move>(moves))
+        | None -> ()
 
-            dir <- dir.Parent
-
-        net <-
-            match root with
-            | Some r ->
-                let p = System.IO.Path.Combine(r, "nets", "sf16.nnue")
-                if System.IO.File.Exists p then (match load p with Loaded n -> Some n | _ -> None) else None
-            | None -> None
-
-    /// Evaluate the fixed set; XOR-fold and return. Does nothing if no net is loaded.
-    [<Benchmark>]
-    member _.EvalFixedSet() =
+    /// Unbound from-scratch oracle path (reference upper bound). Does nothing if no net is loaded.
+    [<Benchmark(Baseline = true)>]
+    member _.EvalFromScratch() =
         let mutable acc = 0
 
         match net with
         | Some n ->
             for pos in positions do
                 acc <- acc ^^^ evalCp n pos
+        | None -> ()
+
+        acc
+
+    /// Forward pass only: the bound root stays computed across calls, so SfEnsureComputed is a no-op.
+    [<Benchmark>]
+    member _.EvalBoundRoot() =
+        match net with
+        | Some n -> evalCp n bound
+        | None -> 0
+
+    /// Forward pass via the AVX2 (double-MultiplyAddAdjacent) GEMV path — same-run baseline for VNNI.
+    [<Benchmark>]
+    member _.ForwardAvx2() =
+        match net with
+        | Some n -> evalInternal n bound true false
+        | None -> 0
+
+    /// Forward pass via the AVX-VNNI (vpdpbusd) GEMV path. Compare to ForwardAvx2 IN THE SAME RUN (cross-run
+    /// machine state varies ~2x from thermal/turbo, so only the in-run ratio is meaningful).
+    [<Benchmark>]
+    member _.ForwardVnni() =
+        match net with
+        | Some n -> evalInternal n bound true true
+        | None -> 0
+
+    /// Pure make-time threat tracking (SfUpdatePieceThreats / SfRayBeyond + dirty recording), no eval.
+    [<Benchmark>]
+    member _.MakeUnmake() =
+        let mutable acc = 0
+
+        if net.IsSome then
+            for i in 0 .. nMoves - 1 do
+                let m = moves.[i]
+                bound.Make m
+                acc <- acc ^^^ m
+                bound.Unmake m
+
+        acc
+
+    /// Make + incremental delta-apply (1-frame) + forward, the real production per-node cost.
+    [<Benchmark>]
+    member _.MakeEvalUnmake() =
+        let mutable acc = 0
+
+        match net with
+        | Some n ->
+            for i in 0 .. nMoves - 1 do
+                let m = moves.[i]
+                bound.Make m
+                acc <- acc ^^^ evalCp n bound
+                bound.Unmake m
         | None -> ()
 
         acc
@@ -475,9 +550,12 @@ type SearchBench() =
 
     let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -" // Kiwipete (rich tree)
     let mutable worker = Unchecked.defaultof<Worker>
+    let mutable net: SfNetwork option = None
 
     [<GlobalSetup>]
     member _.Setup() =
+        net <- loadFullThreatsNet () // bind the real net so evalPos exercises NNUE (was None -> eval=0)
+
         let cfg =
             { defaultConfig with
                 Threads = 1
@@ -486,7 +564,7 @@ type SearchBench() =
                 UsePruning = true }
 
         let tt = TranspositionTable(16)
-        let control = SearchControl(cfg, defaultLimits, tt, fen, [||])
+        let control = SearchControl(cfg, defaultLimits, tt, fen, [||], ?net = net)
         worker <- Worker(0, true, control)
         worker.SetupRoot()
         control.Reset()

@@ -161,8 +161,8 @@ type Position() =
 
     let mutable sfActive = false
     let mutable sfTop = 0
-    let mutable sfAccW: int[] = Array.empty
-    let mutable sfAccB: int[] = Array.empty
+    let mutable sfAccW: int16[] = Array.empty
+    let mutable sfAccB: int16[] = Array.empty
     let mutable sfPsqW: int[] = Array.empty
     let mutable sfPsqB: int[] = Array.empty
     let mutable sfComputedW: bool[] = Array.empty
@@ -457,8 +457,8 @@ type Position() =
 
     member private _.SfEnsureStorage() =
         if Array.isEmpty sfAccW then
-            sfAccW <- Array.zeroCreate (MaxPly * Accumulator.L1)
-            sfAccB <- Array.zeroCreate (MaxPly * Accumulator.L1)
+            sfAccW <- Array.zeroCreate<int16> (MaxPly * Accumulator.L1)
+            sfAccB <- Array.zeroCreate<int16> (MaxPly * Accumulator.L1)
             sfPsqW <- Array.zeroCreate (MaxPly * Accumulator.PsqtBuckets)
             sfPsqB <- Array.zeroCreate (MaxPly * Accumulator.PsqtBuckets)
             sfComputedW <- Array.zeroCreate MaxPly
@@ -503,7 +503,7 @@ type Position() =
         let ksq = this.KingSquare pColor
 
         for j in 0 .. Accumulator.L1 - 1 do
-            acc.[accOff + j] <- int sfBiases.[j]
+            acc.[accOff + j] <- sfBiases.[j]
 
         System.Array.Clear(psq, psqOff, Accumulator.PsqtBuckets)
 
@@ -578,18 +578,7 @@ type Position() =
             System.Array.Copy(sfDirtyThreats, 0, sfFrameThreats, this.SfThreatOff frame, threatN)
 
             if threatN <> 0 then
-                match sfThreatFnChangedBoth with
-                | null -> sfFrameChangedValid.[frame] <- false
-                | f ->
-                    let packed = f.Invoke(this, sfFrameThreats, this.SfThreatOff frame, threatN, sfChangedW, sfChangedB)
-                    let nW = int (packed >>> 32)
-                    let nB = int (packed &&& 0xFFFFFFFFL)
-                    let off = this.SfThreatOff frame
-                    System.Array.Copy(sfChangedW, 0, sfFrameChangedW, off, nW)
-                    System.Array.Copy(sfChangedB, 0, sfFrameChangedB, off, nB)
-                    sfFrameChangedNW.[frame] <- nW
-                    sfFrameChangedNB.[frame] <- nB
-                    sfFrameChangedValid.[frame] <- true
+                sfFrameChangedValid.[frame] <- false
             else
                 sfFrameChangedNW.[frame] <- 0
                 sfFrameChangedNB.[frame] <- 0
@@ -678,17 +667,17 @@ type Position() =
                     computed.[sfTop] <- true
 
     /// Merged accumulator (biases + HalfKA + threats already summed) for a perspective, into caller spans.
-    member this.SfReadAccInto(pColor: Color, acc: System.Span<int>, psqt: System.Span<int>) =
+    member this.SfReadAccInto(pColor: Color, acc: System.Span<int16>, psqt: System.Span<int>) =
         this.SfEnsureComputed pColor
         let m = if pColor = White then sfAccW else sfAccB
         let mp = if pColor = White then sfPsqW else sfPsqB
-        System.Span<int>(m, this.SfAccOff sfTop, Accumulator.L1).CopyTo(acc)
+        System.Span<int16>(m, this.SfAccOff sfTop, Accumulator.L1).CopyTo(acc)
         System.Span<int>(mp, this.SfPsqOff sfTop, Accumulator.PsqtBuckets).CopyTo(psqt)
 
-    member this.SfAccSpan(pColor: Color) : System.Span<int> =
+    member this.SfAccSpan(pColor: Color) : System.Span<int16> =
         this.SfEnsureComputed pColor
         let m = if pColor = White then sfAccW else sfAccB
-        System.Span<int>(m, this.SfAccOff sfTop, Accumulator.L1)
+        System.Span<int16>(m, this.SfAccOff sfTop, Accumulator.L1)
 
     member this.SfPsqtSpan(pColor: Color) : System.Span<int> =
         this.SfEnsureComputed pColor
@@ -696,7 +685,7 @@ type Position() =
         System.Span<int>(mp, this.SfPsqOff sfTop, Accumulator.PsqtBuckets)
 
     /// Compatibility escape hatch for tests/probes that still want an array. Prefer SfAccSpan in hot code.
-    member this.SfAccArray(pColor: Color) : int[] =
+    member this.SfAccArray(pColor: Color) : int16[] =
         this.SfEnsureComputed pColor
         let src = if pColor = White then sfAccW else sfAccB
         src.[this.SfAccOff sfTop .. this.SfAccOff sfTop + Accumulator.L1 - 1]

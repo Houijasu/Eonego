@@ -10,6 +10,7 @@
     <Compile Include="AccumulatorTests.fs" />
     <Compile Include="ThreatsTests.fs" />
     <Compile Include="NnueTests.fs" />
+    <Compile Include="GoldenEvalTests.fs" />
     <Compile Include="BitboardTests.fs" />
     <Compile Include="MoveTests.fs" />
     <Compile Include="ZobristTests.fs" />

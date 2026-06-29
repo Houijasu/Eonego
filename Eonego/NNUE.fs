@@ -70,6 +70,15 @@ let NormalizeToPawnValue = 356
 let UseAvx2 =
     Avx2.IsSupported && Environment.GetEnvironmentVariable("EONEGO_FORCE_SCALAR") <> "1"
 
+/// AVX-VNNI (vpdpbusd) fuses the two-op vpmaddubsw+vpmaddwd GEMV into a single instruction. Bit-exact with the
+/// AVX2 emulation whenever no i16 saturation occurs (proven for these kernels: max |ft|*|w|*2 = 32004 < 32767).
+/// Implies AVX2 (the FT product and accumulator stay on the AVX2 path). EONEGO_FORCE_NOVNNI disables it so the
+/// scalar/AVX2 parity tests can force the non-VNNI path. Read once.
+let UseVnni =
+    AvxVnni.IsSupported
+    && Environment.GetEnvironmentVariable("EONEGO_FORCE_SCALAR") <> "1"
+    && Environment.GetEnvironmentVariable("EONEGO_FORCE_NOVNNI") <> "1"
+
 /// One per-bucket fc stack: fc0 (L1->32), fc1 (62->32), fc2 (32->1). Weights int8 (natural [out][padded_in]),
 /// biases int32.
 type SfLayerStack =
@@ -334,34 +343,53 @@ let private buildAcc (net: SfNetwork) (pos: Position) (pColor: Color) (acc: Span
         for b in 0 .. PsqtBuckets - 1 do
             psqt.[b] <- psqt.[b] + net.ThreatPsqtWeights.[pb + b]
 
-/// Public oracle for tests/diagnostics: build one perspective's raw accumulator from the board.
+/// Public oracle for tests/diagnostics: build one perspective's raw int32 accumulator from the board. Kept as
+/// int32 (the mathematically exact "true value") so tests can assert the int16 incremental path == int16(this)
+/// AND that this never exceeds int16 range (the overflow gate).
 let buildAccOracle (net: SfNetwork) (pos: Position) (pColor: Color) (acc: Span<int>) (psqt: Span<int>) =
     buildAcc net pos pColor acc psqt
 
+/// Production from-scratch build into an int16 accumulator (unbound positions / eval else-branch): build the
+/// exact int32 value, then narrow to int16. Narrowing == the incremental int16 wrap (int16 of a sum-in-int32
+/// is order-independent, and the int32 oracle never overflows int32). PSQT stays int32.
+[<System.Runtime.CompilerServices.SkipLocalsInit>]
+let private buildAccProd (net: SfNetwork) (pos: Position) (pColor: Color) (acc: Span<int16>) (psqt: Span<int>) =
+    let tmpP = NativePtr.stackalloc<int> L1
+    let tmp = Span<int>(NativePtr.toVoidPtr tmpP, L1)
+    buildAcc net pos pColor tmp psqt
+
+    for j in 0 .. L1 - 1 do
+        acc.[j] <- int16 tmp.[j]
+
 let inline private clampFt (v: int) = if v < 0 then 0 elif v > FtMaxVal then FtMaxVal else v
+
+// Hoisted SIMD constants: avoid rebuilding per call (the FT product builds these ~64x/eval, the narrow ~16x).
+// Bit-identical to the inline `Vector256.Create(...)`; AOT may already fold them, so this is cheap insurance.
+let private V255 = Vector256.Create(255)
+let private VOnes16 = Vector256.Create(1s)
+let private VNarrowPerm = Vector256.Create(0, 4, 1, 5, 2, 6, 3, 7)
 
 /// 8 lanes of clamp(acc[k],0,255)*clamp(acc[k+Half],0,255) >> 9 (the FT pairwise product), result in [0,126].
 [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-let private ftClampProd (acc: Span<int>) (k: int) : Vector256<int> =
-    let zero = Vector256<int>.Zero
-    let c255 = Vector256.Create(255)
-    let a = Avx2.Min(Avx2.Max((Vector256.LoadUnsafe(&acc.[k]): Vector256<int>), zero), c255)
-    let b = Avx2.Min(Avx2.Max((Vector256.LoadUnsafe(&acc.[k + Half]): Vector256<int>), zero), c255)
+let private ftClampProd (acc: Span<int16>) (k: int) : Vector256<int> =
+    // int16 accumulator: load 8 int16, sign-extend to int32 (vpmovsxwd), then clamp/multiply/shift unchanged.
+    // The product stays int32 — a 16-lane int16 multiply of two [0,255] values (up to 65025) would overflow.
+    let a = Avx2.Min(Avx2.Max(Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(&acc.[k])), Vector256<int>.Zero), V255)
+    let b = Avx2.Min(Avx2.Max(Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(&acc.[k + Half])), Vector256<int>.Zero), V255)
     Avx2.ShiftRightLogical(Avx2.MultiplyLow(a, b), 9uy)
 
 /// Narrow 32 FT products from `acc` (offset `off`) to 32 linear-order bytes at `ft[dst]`. vpackusdw x2 +
 /// vpackuswb interleave per 128-bit lane; vpermd with {0,4,1,5,2,6,3,7} undoes it. Values [0,126] => exact.
 [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-let private ftNarrow32 (ft: Span<byte>) (acc: Span<int>) (off: int) (dst: int) =
-    let perm = Vector256.Create(0, 4, 1, 5, 2, 6, 3, 7)
+let private ftNarrow32 (ft: Span<byte>) (acc: Span<int16>) (off: int) (dst: int) =
     let p01 = Avx2.PackUnsignedSaturate(ftClampProd acc off, ftClampProd acc (off + 8))
     let p23 = Avx2.PackUnsignedSaturate(ftClampProd acc (off + 16), ftClampProd acc (off + 24))
     let packed = Avx2.PackUnsignedSaturate(p01.AsInt16(), p23.AsInt16())
-    Vector256.StoreUnsafe(Avx2.PermuteVar8x32(packed.AsInt32(), perm).AsByte(), &ft.[dst])
+    Vector256.StoreUnsafe(Avx2.PermuteVar8x32(packed.AsInt32(), VNarrowPerm).AsByte(), &ft.[dst])
 
 /// Feature-transformer pairwise product into a u8 buffer: ft[j] = clamp(a,0,255)*clamp(b,0,255)/512.
 /// AVX2: clamp via Min/Max, vpmulld, >>9, narrow to byte. Bit-exact with scalar (product <= 65025, /512).
-let private ftProductInto (accUs: Span<int>) (accThem: Span<int>) (ft: Span<byte>) (useAvx2: bool) =
+let private ftProductInto (accUs: Span<int16>) (accThem: Span<int16>) (ft: Span<byte>) (useAvx2: bool) =
     if useAvx2 then
         // 32 u8 outputs/iter via ftNarrow32 (vpackusdw x2 -> vpackuswb -> vpermd). Half (512) is a multiple of 32.
         let mutable j = 0
@@ -372,15 +400,13 @@ let private ftProductInto (accUs: Span<int>) (accThem: Span<int>) (ft: Span<byte
             j <- j + 32
     else
         for j in 0 .. Half - 1 do
-            ft.[j] <- byte ((clampFt accUs.[j] * clampFt accUs.[j + Half]) / 512)
-            ft.[Half + j] <- byte ((clampFt accThem.[j] * clampFt accThem.[j + Half]) / 512)
+            ft.[j] <- byte ((clampFt (int accUs.[j]) * clampFt (int accUs.[j + Half])) / 512)
+            ft.[Half + j] <- byte ((clampFt (int accThem.[j]) * clampFt (int accThem.[j + Half])) / 512)
 
 /// fc_0 GEMV (1024 -> 32): vpmaddubsw(u8 ft, i8 w) -> i16 pairs, vpmaddwd(_, ones) -> i32. Bit-exact:
 /// max |ft|*|w|*2 = 126*127*2 = 32004 < 32767 (no i16 saturation); int32 accumulation order-independent.
-let private fc0Gemv (ft: Span<byte>) (fc0w: sbyte[]) (fc0b: int[]) (fc0: Span<int>) (useAvx2: bool) =
-    if useAvx2 then
-        let ones = Vector256.Create(1s)
-
+let private fc0Gemv (ft: Span<byte>) (fc0w: sbyte[]) (fc0b: int[]) (fc0: Span<int>) (useAvx2: bool) (useVnni: bool) =
+    if useVnni then
         for o in 0 .. Fc0Out - 1 do
             let wb = o * L1
             let mutable acc = Vector256<int>.Zero
@@ -389,7 +415,20 @@ let private fc0Gemv (ft: Span<byte>) (fc0w: sbyte[]) (fc0b: int[]) (fc0: Span<in
             while i < L1 do
                 let u = (Vector256.LoadUnsafe(&ft.[i]): Vector256<byte>)
                 let w = (Vector256.LoadUnsafe(&fc0w.[wb + i]): Vector256<sbyte>)
-                acc <- Avx2.Add(acc, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u, w), ones))
+                acc <- AvxVnni.MultiplyWideningAndAdd(acc, u, w) // vpdpbusd: u8 x i8 -> i32 accumulate
+                i <- i + 32
+
+            fc0.[o] <- fc0b.[o] + Vector256.Sum(acc)
+    elif useAvx2 then
+        for o in 0 .. Fc0Out - 1 do
+            let wb = o * L1
+            let mutable acc = Vector256<int>.Zero
+            let mutable i = 0
+
+            while i < L1 do
+                let u = (Vector256.LoadUnsafe(&ft.[i]): Vector256<byte>)
+                let w = (Vector256.LoadUnsafe(&fc0w.[wb + i]): Vector256<sbyte>)
+                acc <- Avx2.Add(acc, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u, w), VOnes16))
                 i <- i + 32
 
             fc0.[o] <- fc0b.[o] + Vector256.Sum(acc)
@@ -406,10 +445,8 @@ let private fc0Gemv (ft: Span<byte>) (fc0w: sbyte[]) (fc0b: int[]) (fc0: Span<in
 /// fc_1 GEMV (64 -> 32) over u8 activations: same vpmaddubsw/vpmaddwd pattern as fc0Gemv. Bit-exact: conc in
 /// [0,127], w in [-128,127] => |pair| <= 127*128*2 = 32512 < 32767 (no i16 saturation); int32 sum is
 /// order-independent (|total| <= 64*16256 << 2^31). conc/wb are byte-indexed; Fc1In = 64.
-let private fc1Gemv (conc: Span<byte>) (fc1w: sbyte[]) (fc1b: int[]) (fc1: Span<int>) (useAvx2: bool) =
-    if useAvx2 then
-        let ones = Vector256.Create(1s)
-
+let private fc1Gemv (conc: Span<byte>) (fc1w: sbyte[]) (fc1b: int[]) (fc1: Span<int>) (useAvx2: bool) (useVnni: bool) =
+    if useVnni then
         for o in 0 .. Fc1Out - 1 do
             let wb = o * Fc1In
             let mutable acc = Vector256<int>.Zero
@@ -418,7 +455,20 @@ let private fc1Gemv (conc: Span<byte>) (fc1w: sbyte[]) (fc1b: int[]) (fc1: Span<
             while i < Fc1In do
                 let u = (Vector256.LoadUnsafe(&conc.[i]): Vector256<byte>)
                 let w = (Vector256.LoadUnsafe(&fc1w.[wb + i]): Vector256<sbyte>)
-                acc <- Avx2.Add(acc, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u, w), ones))
+                acc <- AvxVnni.MultiplyWideningAndAdd(acc, u, w)
+                i <- i + 32
+
+            fc1.[o] <- fc1b.[o] + Vector256.Sum(acc)
+    elif useAvx2 then
+        for o in 0 .. Fc1Out - 1 do
+            let wb = o * Fc1In
+            let mutable acc = Vector256<int>.Zero
+            let mutable i = 0
+
+            while i < Fc1In do
+                let u = (Vector256.LoadUnsafe(&conc.[i]): Vector256<byte>)
+                let w = (Vector256.LoadUnsafe(&fc1w.[wb + i]): Vector256<sbyte>)
+                acc <- Avx2.Add(acc, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u, w), VOnes16))
                 i <- i + 32
 
             fc1.[o] <- fc1b.[o] + Vector256.Sum(acc)
@@ -433,9 +483,13 @@ let private fc1Gemv (conc: Span<byte>) (fc1w: sbyte[]) (fc1b: int[]) (fc1: Span<
             fc1.[o] <- s
 
 /// fc_2 (32 -> 1) over u8 activations: a single vpmaddubsw/vpmaddwd dot product. Bit-exact (same bounds).
-let private fc2Dot (a1: Span<byte>) (fc2w: sbyte[]) (fc2b: int) (useAvx2: bool) : int =
-    if useAvx2 then
-        let ones = Vector256.Create(1s)
+let private fc2Dot (a1: Span<byte>) (fc2w: sbyte[]) (fc2b: int) (useAvx2: bool) (useVnni: bool) : int =
+    if useVnni then
+        let u = (Vector256.LoadUnsafe(&a1.[0]): Vector256<byte>)
+        let w = (Vector256.LoadUnsafe(&fc2w.[0]): Vector256<sbyte>)
+        fc2b + Vector256.Sum(AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, u, w))
+    elif useAvx2 then
+        let ones = VOnes16
         let u = (Vector256.LoadUnsafe(&a1.[0]): Vector256<byte>)
         let w = (Vector256.LoadUnsafe(&fc2w.[0]): Vector256<sbyte>)
         fc2b + Vector256.Sum(Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u, w), ones))
@@ -455,11 +509,12 @@ let private fc2Dot (a1: Span<byte>) (fc2w: sbyte[]) (fc2b: int) (useAvx2: bool) 
 let private evalFromAcc
     (net: SfNetwork)
     (pos: Position)
-    (accW: Span<int>)
-    (accB: Span<int>)
+    (accW: Span<int16>)
+    (accB: Span<int16>)
     (psqW: Span<int>)
     (psqB: Span<int>)
     (useAvx2: bool)
+    (useVnni: bool)
     : int =
     let stm = pos.SideToMove
     let accUs = if stm = White then accW else accB
@@ -485,7 +540,7 @@ let private evalFromAcc
 
     // Feature transformer (u8 ft) + fc_0 GEMV (1024 -> 32).
     ftProductInto accUs accThem ft useAvx2
-    fc0Gemv ft stack.Fc0W stack.Fc0B fc0 useAvx2
+    fc0Gemv ft stack.Fc0W stack.Fc0B fc0 useAvx2 useVnni
 
     // conc: sqr(fc0[0..30]) in [0..30], lin(fc0[0..30]) in [31..61], [62..63]=0. fc0[31] is skip-only.
     for o in 0 .. 30 do
@@ -497,14 +552,14 @@ let private evalFromAcc
     conc.[63] <- 0uy
 
     // fc_1: 64 -> 32 (AVX2 GEMV)
-    fc1Gemv conc stack.Fc1W stack.Fc1B fc1 useAvx2
+    fc1Gemv conc stack.Fc1W stack.Fc1B fc1 useAvx2 useVnni
 
     // ac_1: clipped relu, shift 6 -> u8
     for o in 0 .. Fc2In - 1 do
         a1.[o] <- byte (max 0 (min 127 (fc1.[o] >>> 6)))
 
     // fc_2: 32 -> 1
-    let fc2 = fc2Dot a1 stack.Fc2W stack.Fc2B.[0] useAvx2
+    let fc2 = fc2Dot a1 stack.Fc2W stack.Fc2B.[0] useAvx2 useVnni
 
     // output: fwdOut = fc2 + skip; outputValue = fwdOut * (600*16) / (HiddenOneVal*64*2 = 16384)
     let fwdOut = fc2 + fc0.[Fc0Out - 1]
@@ -517,32 +572,32 @@ let private evalFromAcc
     (125 * psqtV + 131 * posV) / 128
 
 [<System.Runtime.CompilerServices.SkipLocalsInit>]
-let evalInternal (net: SfNetwork) (pos: Position) (useAvx2: bool) : int =
+let evalInternal (net: SfNetwork) (pos: Position) (useAvx2: bool) (useVnni: bool) : int =
     if pos.SfActive then
         // Incremental hot path: materialize the current lazy frame if needed, then read it in place.
         let accW = pos.SfAccSpan White
         let accB = pos.SfAccSpan Black
         let psqW = pos.SfPsqtSpan White
         let psqB = pos.SfPsqtSpan Black
-        evalFromAcc net pos accW accB psqW psqB useAvx2
+        evalFromAcc net pos accW accB psqW psqB useAvx2 useVnni
     else
-        // From-scratch oracle (tests / unbound positions).
-        let accWP = NativePtr.stackalloc<int> L1
-        let accW = Span<int>(NativePtr.toVoidPtr accWP, L1)
-        let accBP = NativePtr.stackalloc<int> L1
-        let accB = Span<int>(NativePtr.toVoidPtr accBP, L1)
+        // From-scratch path (tests / unbound positions): int16 accumulator (PSQT int32), built via buildAccProd.
+        let accWP = NativePtr.stackalloc<int16> L1
+        let accW = Span<int16>(NativePtr.toVoidPtr accWP, L1)
+        let accBP = NativePtr.stackalloc<int16> L1
+        let accB = Span<int16>(NativePtr.toVoidPtr accBP, L1)
         let psqWP = NativePtr.stackalloc<int> PsqtBuckets
         let psqW = Span<int>(NativePtr.toVoidPtr psqWP, PsqtBuckets)
         let psqBP = NativePtr.stackalloc<int> PsqtBuckets
         let psqB = Span<int>(NativePtr.toVoidPtr psqBP, PsqtBuckets)
 
-        buildAcc net pos White accW psqW
-        buildAcc net pos Black accB psqB
-        evalFromAcc net pos accW accB psqW psqB useAvx2
+        buildAccProd net pos White accW psqW
+        buildAccProd net pos Black accB psqB
+        evalFromAcc net pos accW accB psqW psqB useAvx2 useVnni
 
 /// Side-to-move-relative centipawns, clamped to +/-EvalMax.
 let evalCp (net: SfNetwork) (pos: Position) : int =
-    let cp = int (int64 (evalInternal net pos UseAvx2) * 100L / int64 NormalizeToPawnValue)
+    let cp = int (int64 (evalInternal net pos UseAvx2 UseVnni) * 100L / int64 NormalizeToPawnValue)
     max -EvalMax (min EvalMax cp)
 
 /// Bind the net into the Position's incremental accumulator (root only). The threat enumerator is passed as
