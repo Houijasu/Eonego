@@ -3,7 +3,7 @@
 Produces the exact 2577-length feature vector the engine's `featuredump` emits.
 Gate: parity_check.py asserts this is byte-identical to the engine over many FENs.
 
-Contract (from NnueRegions.fs / Nnue.fs / Bitboard.fs):
+Contract (from NnueRegions.fs / NNUE.fs / Bitboard.fs):
   * Squares: LERF, a1=0, h1=7, a2=8, ... h8=63.  rank=sq>>3, file=sq&7.
   * Piece index pc = color*6 + pieceType ; White=0 Black=1 ; P=0 N=1 B=2 R=3 Q=4 K=5.
   * 204 k*k regions (k=1..8), grouped by k then row-major by top-left (rank,file).

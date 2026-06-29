@@ -190,6 +190,8 @@ type Position() =
     let mutable sfFrameChangedNW: int[] = Array.empty
     let mutable sfFrameChangedNB: int[] = Array.empty
     let mutable sfFrameChangedValid: bool[] = Array.empty
+    let mutable sfFrameChangedKsqW: int[] = Array.empty
+    let mutable sfFrameChangedKsqB: int[] = Array.empty
     let mutable sfFrameWhiteKingMoved: bool[] = Array.empty
     let mutable sfFrameBlackKingMoved: bool[] = Array.empty
     let mutable sfFrameThreatOverflow: bool[] = Array.empty
@@ -247,6 +249,37 @@ type Position() =
 
         atk ||| push
 
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+    member private this.SfProcessSliders
+        (
+            sliders: Bitboard,
+            putPiece: bool,
+            pc: Piece,
+            sq: Square,
+            computeRay: bool,
+            noRaysContaining: Bitboard,
+            occupiedNoK: Bitboard,
+            rAttacks: Bitboard,
+            bAttacks: Bitboard,
+            addDirectAttacks: bool
+        ) =
+        let mutable ss = sliders
+
+        while ss <> 0UL do
+            let sliderSq = popLsb &ss
+            let slider = board.[sliderSq]
+
+            if computeRay then
+                let ray = this.SfRayBeyond(sliderSq, sq)
+                let discovered = ray &&& (rAttacks ||| bAttacks) &&& occupiedNoK
+
+                if discovered <> 0UL && ((ray &&& noRaysContaining) <> noRaysContaining) then
+                    let threatenedSq = lsb discovered
+                    this.SfAppendDirtyThreat(not putPiece, slider, board.[threatenedSq], sliderSq, threatenedSq)
+
+            if addDirectAttacks then
+                this.SfAppendDirtyThreat(putPiece, slider, pc, sliderSq, sq)
+
     member private this.SfUpdatePieceThreats(pc: Piece, putPiece: bool, sq: Square, computeRay: bool, noRaysContaining: Bitboard) =
         if pc <> NoPiece then
             let occupied = byTypeBB.[AllPieces]
@@ -255,29 +288,11 @@ type Position() =
             let rAttacks = rookAttacks sq occupied
             let bAttacks = bishopAttacks sq occupied
             let occupiedNoK = occupied ^^^ byTypeBB.[King]
-            let mutable sliders = (rookQueens &&& rAttacks) ||| (bishopQueens &&& bAttacks)
-
-            let processSliders addDirectAttacks =
-                let mutable ss = sliders
-
-                while ss <> 0UL do
-                    let sliderSq = popLsb &ss
-                    let slider = board.[sliderSq]
-
-                    if computeRay then
-                        let ray = this.SfRayBeyond(sliderSq, sq)
-                        let discovered = ray &&& (rAttacks ||| bAttacks) &&& occupiedNoK
-
-                        if discovered <> 0UL && ((ray &&& noRaysContaining) <> noRaysContaining) then
-                            let threatenedSq = lsb discovered
-                            this.SfAppendDirtyThreat(not putPiece, slider, board.[threatenedSq], sliderSq, threatenedSq)
-
-                    if addDirectAttacks then
-                        this.SfAppendDirtyThreat(putPiece, slider, pc, sliderSq, sq)
+            let sliders = (rookQueens &&& rAttacks) ||| (bishopQueens &&& bAttacks)
 
             if pieceType pc = King then
                 if computeRay then
-                    processSliders false
+                    this.SfProcessSliders(sliders, putPiece, pc, sq, computeRay, noRaysContaining, occupiedNoK, rAttacks, bAttacks, false)
             else
                 let pt = pieceType pc
                 let c = pieceColor pc
@@ -312,7 +327,7 @@ type Position() =
                     this.SfAppendDirtyThreat(putPiece, pc, board.[too], sq, too)
 
                 if computeRay then
-                    processSliders true
+                    this.SfProcessSliders(sliders, putPiece, pc, sq, computeRay, noRaysContaining, occupiedNoK, rAttacks, bAttacks, true)
                 else
                     incoming <- incoming ||| sliders
 
@@ -474,6 +489,8 @@ type Position() =
             sfFrameChangedNW <- Array.zeroCreate MaxPly
             sfFrameChangedNB <- Array.zeroCreate MaxPly
             sfFrameChangedValid <- Array.zeroCreate MaxPly
+            sfFrameChangedKsqW <- Array.create MaxPly NoSquare
+            sfFrameChangedKsqB <- Array.create MaxPly NoSquare
             sfFrameWhiteKingMoved <- Array.zeroCreate MaxPly
             sfFrameBlackKingMoved <- Array.zeroCreate MaxPly
             sfFrameThreatOverflow <- Array.zeroCreate MaxPly
@@ -528,6 +545,34 @@ type Position() =
         this.SfAddActiveThreats(pColor, frame)
         if pColor = White then sfComputedW.[frame] <- true else sfComputedB.[frame] <- true
 
+    // Both perspectives' active threats from a SINGLE physical enumeration (slider rays walked once),
+    // emitting per-perspective indices into sfTmpW/sfTmpB. Bit-exact vs two SfAddActiveThreats calls:
+    // same indices, and int16 accumulation is order-independent (modular add).
+    member private this.SfAddActiveThreatsBoth(frame: int) =
+        match sfThreatFnBoth with
+        | null ->
+            this.SfAddActiveThreats(White, frame)
+            this.SfAddActiveThreats(Black, frame)
+        | f ->
+            let packed = f.Invoke(this, sfTmpW, sfTmpB)
+            let nW = int (packed >>> 32)
+            let nB = int (packed &&& 0xFFFFFFFFL)
+            let accOff = this.SfAccOff frame
+            let psqOff = this.SfPsqOff frame
+
+            for k in 0 .. nW - 1 do
+                Accumulator.addThreatAt sfAccW accOff sfPsqW psqOff sfThreatWeights sfThreatPsqt sfTmpW.[k] 1 Accumulator.UseAvx2
+
+            for k in 0 .. nB - 1 do
+                Accumulator.addThreatAt sfAccB accOff sfPsqB psqOff sfThreatWeights sfThreatPsqt sfTmpB.[k] 1 Accumulator.UseAvx2
+
+    member private this.SfBuildFullBoth(frame: int) =
+        this.SfBuildHalf(White, frame)
+        this.SfBuildHalf(Black, frame)
+        this.SfAddActiveThreatsBoth(frame)
+        sfComputedW.[frame] <- true
+        sfComputedB.[frame] <- true
+
     member private this.SfBeginFrame() =
         Debug.Assert((sfTop + 1 < MaxPly), "SfBeginFrame: stack overflow")
         sfTop <- sfTop + 1
@@ -539,6 +584,8 @@ type Position() =
         sfFrameChangedNW.[sfTop] <- 0
         sfFrameChangedNB.[sfTop] <- 0
         sfFrameChangedValid.[sfTop] <- false
+        sfFrameChangedKsqW.[sfTop] <- NoSquare
+        sfFrameChangedKsqB.[sfTop] <- NoSquare
         sfFrameWhiteKingMoved.[sfTop] <- false
         sfFrameBlackKingMoved.[sfTop] <- false
         sfFrameThreatOverflow.[sfTop] <- false
@@ -613,6 +660,8 @@ type Position() =
         let psqOff = this.SfPsqOff sfTop
         let dOff = this.SfDirtyOff frame
         let ksq = this.KingSquare pColor
+        let ksqW = this.KingSquare White
+        let ksqB = this.KingSquare Black
 
         for i in 0 .. sfFrameDirtyN.[frame] - 1 do
             let pc = sfFrameDirtyPc.[dOff + i]
@@ -623,7 +672,7 @@ type Position() =
         let threatN = sfFrameThreatN.[frame]
 
         if threatN <> 0 then
-            if sfFrameChangedValid.[frame] then
+            if sfFrameChangedValid.[frame] && sfFrameChangedKsqW.[frame] = ksqW && sfFrameChangedKsqB.[frame] = ksqB then
                 let off = this.SfThreatOff frame
                 if pColor = White then
                     this.SfApplySignedThreats(White, sfTop, sfFrameChangedW, off, sfFrameChangedNW.[frame])
@@ -636,11 +685,20 @@ type Position() =
                     let packed = f.Invoke(this, sfFrameThreats, this.SfThreatOff frame, threatN, sfChangedW, sfChangedB)
                     let nW = int (packed >>> 32)
                     let nB = int (packed &&& 0xFFFFFFFFL)
+                    let off = this.SfThreatOff frame
+
+                    System.Array.Copy(sfChangedW, 0, sfFrameChangedW, off, nW)
+                    System.Array.Copy(sfChangedB, 0, sfFrameChangedB, off, nB)
+                    sfFrameChangedNW.[frame] <- nW
+                    sfFrameChangedNB.[frame] <- nB
+                    sfFrameChangedKsqW.[frame] <- ksqW
+                    sfFrameChangedKsqB.[frame] <- ksqB
+                    sfFrameChangedValid.[frame] <- true
 
                     if pColor = White then
-                        this.SfApplySignedThreats(White, sfTop, sfChangedW, 0, nW)
+                        this.SfApplySignedThreats(White, sfTop, sfFrameChangedW, off, nW)
                     else
-                        this.SfApplySignedThreats(Black, sfTop, sfChangedB, 0, nB)
+                        this.SfApplySignedThreats(Black, sfTop, sfFrameChangedB, off, nB)
 
     member private this.SfEnsureComputed(pColor: Color) =
         if sfActive then
@@ -665,6 +723,87 @@ type Position() =
                         this.SfApplyFrame(pColor, f)
 
                     computed.[sfTop] <- true
+
+    // Replay one frame's deltas onto the sfTop accumulator for BOTH perspectives at once: one pass over the
+    // dirty-piece list (each acc only takes its own perspective's features), one shared changed-threat
+    // conversion. Bit-exact vs SfApplyFrame(White)+SfApplyFrame(Black).
+    member private this.SfApplyFrameBoth(frame: int) =
+        let accOff = this.SfAccOff sfTop
+        let psqOff = this.SfPsqOff sfTop
+        let dOff = this.SfDirtyOff frame
+        let ksqW = this.KingSquare White
+        let ksqB = this.KingSquare Black
+
+        for i in 0 .. sfFrameDirtyN.[frame] - 1 do
+            let pc = sfFrameDirtyPc.[dOff + i]
+            let sq = sfFrameDirtySq.[dOff + i]
+            let sign = sfFrameDirtySign.[dOff + i]
+            Accumulator.addFeatureAt sfAccW accOff sfPsqW psqOff sfHalfWeights sfHalfPsqt (Accumulator.makeIndex White pc sq ksqW) sign Accumulator.UseAvx2
+            Accumulator.addFeatureAt sfAccB accOff sfPsqB psqOff sfHalfWeights sfHalfPsqt (Accumulator.makeIndex Black pc sq ksqB) sign Accumulator.UseAvx2
+
+        let threatN = sfFrameThreatN.[frame]
+
+        if threatN <> 0 then
+            let off = this.SfThreatOff frame
+
+            if sfFrameChangedValid.[frame] && sfFrameChangedKsqW.[frame] = ksqW && sfFrameChangedKsqB.[frame] = ksqB then
+                this.SfApplySignedThreats(White, sfTop, sfFrameChangedW, off, sfFrameChangedNW.[frame])
+                this.SfApplySignedThreats(Black, sfTop, sfFrameChangedB, off, sfFrameChangedNB.[frame])
+            else
+                match sfThreatFnChangedBoth with
+                | null -> ()
+                | f ->
+                    let packed = f.Invoke(this, sfFrameThreats, off, threatN, sfChangedW, sfChangedB)
+                    let nW = int (packed >>> 32)
+                    let nB = int (packed &&& 0xFFFFFFFFL)
+
+                    System.Array.Copy(sfChangedW, 0, sfFrameChangedW, off, nW)
+                    System.Array.Copy(sfChangedB, 0, sfFrameChangedB, off, nB)
+                    sfFrameChangedNW.[frame] <- nW
+                    sfFrameChangedNB.[frame] <- nB
+                    sfFrameChangedKsqW.[frame] <- ksqW
+                    sfFrameChangedKsqB.[frame] <- ksqB
+                    sfFrameChangedValid.[frame] <- true
+
+                    this.SfApplySignedThreats(White, sfTop, sfFrameChangedW, off, nW)
+                    this.SfApplySignedThreats(Black, sfTop, sfFrameChangedB, off, nB)
+
+    // Materialize BOTH perspectives at sfTop in one frame walk (evalInternal always needs both). Takes the
+    // merged path only when the two perspectives' back-walks agree (the common no-king-move/no-overflow
+    // case); falls back to the per-perspective SfEnsureComputed otherwise (byte-identical to that path).
+    member this.SfEnsureBothComputed() =
+        if sfActive && not (sfComputedW.[sfTop] && sfComputedB.[sfTop]) then
+            let mutable baseW = sfTop
+            let mutable blockedW = false
+
+            while baseW > 0 && not blockedW && not sfComputedW.[baseW] do
+                if this.SfFrameNeedsRefresh(White, baseW) then blockedW <- true
+                else baseW <- baseW - 1
+
+            let mutable baseB = sfTop
+            let mutable blockedB = false
+
+            while baseB > 0 && not blockedB && not sfComputedB.[baseB] do
+                if this.SfFrameNeedsRefresh(Black, baseB) then blockedB <- true
+                else baseB <- baseB - 1
+
+            let rebuildW = blockedW || not sfComputedW.[baseW]
+            let rebuildB = blockedB || not sfComputedB.[baseB]
+
+            if not rebuildW && not rebuildB && baseW = baseB then
+                this.SfCopyFrame(White, baseW, sfTop)
+                this.SfCopyFrame(Black, baseB, sfTop)
+
+                for f in baseW + 1 .. sfTop do
+                    this.SfApplyFrameBoth(f)
+
+                sfComputedW.[sfTop] <- true
+                sfComputedB.[sfTop] <- true
+            elif rebuildW && rebuildB then
+                this.SfBuildFullBoth(sfTop)
+            else
+                this.SfEnsureComputed White
+                this.SfEnsureComputed Black
 
     /// Merged accumulator (biases + HalfKA + threats already summed) for a perspective, into caller spans.
     member this.SfReadAccInto(pColor: Color, acc: System.Span<int16>, psqt: System.Span<int>) =
@@ -727,6 +866,8 @@ type Position() =
         sfFrameChangedNW.[0] <- 0
         sfFrameChangedNB.[0] <- 0
         sfFrameChangedValid.[0] <- false
+        sfFrameChangedKsqW.[0] <- NoSquare
+        sfFrameChangedKsqB.[0] <- NoSquare
         sfFrameWhiteKingMoved.[0] <- false
         sfFrameBlackKingMoved.[0] <- false
         sfFrameThreatOverflow.[0] <- false

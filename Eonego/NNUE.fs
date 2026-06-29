@@ -363,29 +363,26 @@ let private buildAccProd (net: SfNetwork) (pos: Position) (pColor: Color) (acc: 
 
 let inline private clampFt (v: int) = if v < 0 then 0 elif v > FtMaxVal then FtMaxVal else v
 
-// Hoisted SIMD constants: avoid rebuilding per call (the FT product builds these ~64x/eval, the narrow ~16x).
+// Hoisted SIMD constants: avoid rebuilding per call (VOnes16 is used by the fc GEMVs; V255s by the FT product).
 // Bit-identical to the inline `Vector256.Create(...)`; AOT may already fold them, so this is cheap insurance.
-let private V255 = Vector256.Create(255)
 let private VOnes16 = Vector256.Create(1s)
-let private VNarrowPerm = Vector256.Create(0, 4, 1, 5, 2, 6, 3, 7)
+let private V255s = Vector256.Create(255s)
 
-/// 8 lanes of clamp(acc[k],0,255)*clamp(acc[k+Half],0,255) >> 9 (the FT pairwise product), result in [0,126].
+/// 16 lanes of clamp(acc[k],0,255)*clamp(acc[k+Half],0,255) >> 9 (the FT pairwise product), result in [0,127].
 [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-let private ftClampProd (acc: Span<int16>) (k: int) : Vector256<int> =
-    // int16 accumulator: load 8 int16, sign-extend to int32 (vpmovsxwd), then clamp/multiply/shift unchanged.
-    // The product stays int32 — a 16-lane int16 multiply of two [0,255] values (up to 65025) would overflow.
-    let a = Avx2.Min(Avx2.Max(Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(&acc.[k])), Vector256<int>.Zero), V255)
-    let b = Avx2.Min(Avx2.Max(Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(&acc.[k + Half])), Vector256<int>.Zero), V255)
+let private ftClampProd16 (acc: Span<int16>) (k: int) : Vector256<int16> =
+    // Stay in int16: clamp to [0,255] (vpmaxsw/vpminsw), vpmullw. The clamped product <= 65025 fits the low
+    // 16 bits exactly, and vpsrlw is an UNSIGNED shift, so >>9 reads it as unsigned (65025 -> 127). Bit-exact.
+    let a = Avx2.Min(Avx2.Max(Vector256.LoadUnsafe(&acc.[k]), Vector256<int16>.Zero), V255s)
+    let b = Avx2.Min(Avx2.Max(Vector256.LoadUnsafe(&acc.[k + Half]), Vector256<int16>.Zero), V255s)
     Avx2.ShiftRightLogical(Avx2.MultiplyLow(a, b), 9uy)
 
-/// Narrow 32 FT products from `acc` (offset `off`) to 32 linear-order bytes at `ft[dst]`. vpackusdw x2 +
-/// vpackuswb interleave per 128-bit lane; vpermd with {0,4,1,5,2,6,3,7} undoes it. Values [0,126] => exact.
+/// Narrow 32 FT products from `acc` (offset `off`) to 32 linear-order bytes at `ft[dst]`. One vpackuswb packs
+/// the two int16 halves (bytes [a0-7,b0-7,a8-15,b8-15]); vpermq 0xD8 (qwords 0,2,1,3) restores linear order.
 [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
 let private ftNarrow32 (ft: Span<byte>) (acc: Span<int16>) (off: int) (dst: int) =
-    let p01 = Avx2.PackUnsignedSaturate(ftClampProd acc off, ftClampProd acc (off + 8))
-    let p23 = Avx2.PackUnsignedSaturate(ftClampProd acc (off + 16), ftClampProd acc (off + 24))
-    let packed = Avx2.PackUnsignedSaturate(p01.AsInt16(), p23.AsInt16())
-    Vector256.StoreUnsafe(Avx2.PermuteVar8x32(packed.AsInt32(), VNarrowPerm).AsByte(), &ft.[dst])
+    let packed = Avx2.PackUnsignedSaturate(ftClampProd16 acc off, ftClampProd16 acc (off + 16))
+    Vector256.StoreUnsafe(Avx2.Permute4x64(packed.AsInt64(), 0xD8uy).AsByte(), &ft.[dst])
 
 /// Feature-transformer pairwise product into a u8 buffer: ft[j] = clamp(a,0,255)*clamp(b,0,255)/512.
 /// AVX2: clamp via Min/Max, vpmulld, >>9, narrow to byte. Bit-exact with scalar (product <= 65025, /512).
@@ -407,31 +404,62 @@ let private ftProductInto (accUs: Span<int16>) (accThem: Span<int16>) (ft: Span<
 /// max |ft|*|w|*2 = 126*127*2 = 32004 < 32767 (no i16 saturation); int32 accumulation order-independent.
 let private fc0Gemv (ft: Span<byte>) (fc0w: sbyte[]) (fc0b: int[]) (fc0: Span<int>) (useAvx2: bool) (useVnni: bool) =
     if useVnni then
-        for o in 0 .. Fc0Out - 1 do
-            let wb = o * L1
-            let mutable acc = Vector256<int>.Zero
+        // Register-block 4 outputs: 4 independent vpdpbusd accumulators break the per-output dependency
+        // chain (vpdpbusd ~5c latency) so the loop runs throughput-bound, not latency-bound; ft reused 4x.
+        // Bit-exact: each output's accumulation order is unchanged (Fc0Out=32 is divisible by 4).
+        let mutable o = 0
+
+        while o < Fc0Out do
+            let wb0 = o * L1
+            let wb1 = wb0 + L1
+            let wb2 = wb1 + L1
+            let wb3 = wb2 + L1
+            let mutable a0 = Vector256<int>.Zero
+            let mutable a1 = Vector256<int>.Zero
+            let mutable a2 = Vector256<int>.Zero
+            let mutable a3 = Vector256<int>.Zero
             let mutable i = 0
 
             while i < L1 do
                 let u = (Vector256.LoadUnsafe(&ft.[i]): Vector256<byte>)
-                let w = (Vector256.LoadUnsafe(&fc0w.[wb + i]): Vector256<sbyte>)
-                acc <- AvxVnni.MultiplyWideningAndAdd(acc, u, w) // vpdpbusd: u8 x i8 -> i32 accumulate
+                a0 <- AvxVnni.MultiplyWideningAndAdd(a0, u, (Vector256.LoadUnsafe(&fc0w.[wb0 + i]): Vector256<sbyte>))
+                a1 <- AvxVnni.MultiplyWideningAndAdd(a1, u, (Vector256.LoadUnsafe(&fc0w.[wb1 + i]): Vector256<sbyte>))
+                a2 <- AvxVnni.MultiplyWideningAndAdd(a2, u, (Vector256.LoadUnsafe(&fc0w.[wb2 + i]): Vector256<sbyte>))
+                a3 <- AvxVnni.MultiplyWideningAndAdd(a3, u, (Vector256.LoadUnsafe(&fc0w.[wb3 + i]): Vector256<sbyte>))
                 i <- i + 32
 
-            fc0.[o] <- fc0b.[o] + Vector256.Sum(acc)
+            fc0.[o] <- fc0b.[o] + Vector256.Sum(a0)
+            fc0.[o + 1] <- fc0b.[o + 1] + Vector256.Sum(a1)
+            fc0.[o + 2] <- fc0b.[o + 2] + Vector256.Sum(a2)
+            fc0.[o + 3] <- fc0b.[o + 3] + Vector256.Sum(a3)
+            o <- o + 4
     elif useAvx2 then
-        for o in 0 .. Fc0Out - 1 do
-            let wb = o * L1
-            let mutable acc = Vector256<int>.Zero
+        let mutable o = 0
+
+        while o < Fc0Out do
+            let wb0 = o * L1
+            let wb1 = wb0 + L1
+            let wb2 = wb1 + L1
+            let wb3 = wb2 + L1
+            let mutable a0 = Vector256<int>.Zero
+            let mutable a1 = Vector256<int>.Zero
+            let mutable a2 = Vector256<int>.Zero
+            let mutable a3 = Vector256<int>.Zero
             let mutable i = 0
 
             while i < L1 do
                 let u = (Vector256.LoadUnsafe(&ft.[i]): Vector256<byte>)
-                let w = (Vector256.LoadUnsafe(&fc0w.[wb + i]): Vector256<sbyte>)
-                acc <- Avx2.Add(acc, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u, w), VOnes16))
+                a0 <- Avx2.Add(a0, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u, (Vector256.LoadUnsafe(&fc0w.[wb0 + i]): Vector256<sbyte>)), VOnes16))
+                a1 <- Avx2.Add(a1, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u, (Vector256.LoadUnsafe(&fc0w.[wb1 + i]): Vector256<sbyte>)), VOnes16))
+                a2 <- Avx2.Add(a2, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u, (Vector256.LoadUnsafe(&fc0w.[wb2 + i]): Vector256<sbyte>)), VOnes16))
+                a3 <- Avx2.Add(a3, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u, (Vector256.LoadUnsafe(&fc0w.[wb3 + i]): Vector256<sbyte>)), VOnes16))
                 i <- i + 32
 
-            fc0.[o] <- fc0b.[o] + Vector256.Sum(acc)
+            fc0.[o] <- fc0b.[o] + Vector256.Sum(a0)
+            fc0.[o + 1] <- fc0b.[o + 1] + Vector256.Sum(a1)
+            fc0.[o + 2] <- fc0b.[o + 2] + Vector256.Sum(a2)
+            fc0.[o + 3] <- fc0b.[o + 3] + Vector256.Sum(a3)
+            o <- o + 4
     else
         for o in 0 .. Fc0Out - 1 do
             let mutable s = fc0b.[o]
@@ -574,7 +602,8 @@ let private evalFromAcc
 [<System.Runtime.CompilerServices.SkipLocalsInit>]
 let evalInternal (net: SfNetwork) (pos: Position) (useAvx2: bool) (useVnni: bool) : int =
     if pos.SfActive then
-        // Incremental hot path: materialize the current lazy frame if needed, then read it in place.
+        // Incremental hot path: materialize BOTH perspectives in one frame walk, then read them in place.
+        pos.SfEnsureBothComputed()
         let accW = pos.SfAccSpan White
         let accB = pos.SfAccSpan Black
         let psqW = pos.SfPsqtSpan White
