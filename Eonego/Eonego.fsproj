@@ -54,8 +54,8 @@
     <Compile Include="History.fs" />
     <Compile Include="MovePick.fs" />
     <Compile Include="Transposition.fs" />
-    <Compile Include="DagNode.fs" />
-    <Compile Include="DagWorkQueue.fs" />
+    <Compile Include="DAGNode.fs" />
+    <Compile Include="DAGQueue.fs" />
     <Compile Include="Search.fs" />
     <Compile Include="Tooling.fs" />
     <Compile Include="UCI.fs" />

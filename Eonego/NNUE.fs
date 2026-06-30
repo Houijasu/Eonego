@@ -14,6 +14,7 @@ module Eonego.Nnue
 
 open System
 open System.Runtime.CompilerServices
+open System.Runtime.InteropServices
 open System.Runtime.Intrinsics
 open System.Runtime.Intrinsics.X86
 open Microsoft.FSharp.NativeInterop
@@ -373,8 +374,11 @@ let private V255s = Vector256.Create(255s)
 let private ftClampProd16 (acc: Span<int16>) (k: int) : Vector256<int16> =
     // Stay in int16: clamp to [0,255] (vpmaxsw/vpminsw), vpmullw. The clamped product <= 65025 fits the low
     // 16 bits exactly, and vpsrlw is an UNSIGNED shift, so >>9 reads it as unsigned (65025 -> 127). Bit-exact.
-    let a = Avx2.Min(Avx2.Max(Vector256.LoadUnsafe(&acc.[k]), Vector256<int16>.Zero), V255s)
-    let b = Avx2.Min(Avx2.Max(Vector256.LoadUnsafe(&acc.[k + Half]), Vector256<int16>.Zero), V255s)
+    // Base-ref + element-offset loads skip the per-iteration bounds checks the JIT can't elide when `k` is a
+    // runtime value (mirrors Accumulator.fs's addFeatureAt/addFeaturePairAt kernels).
+    let accBase = &MemoryMarshal.GetReference acc
+    let a = Avx2.Min(Avx2.Max(Vector256.LoadUnsafe(&accBase, unativeint k), Vector256<int16>.Zero), V255s)
+    let b = Avx2.Min(Avx2.Max(Vector256.LoadUnsafe(&accBase, unativeint (k + Half)), Vector256<int16>.Zero), V255s)
     Avx2.ShiftRightLogical(Avx2.MultiplyLow(a, b), 9uy)
 
 /// Narrow 32 FT products from `acc` (offset `off`) to 32 linear-order bytes at `ft[dst]`. One vpackuswb packs
@@ -382,7 +386,8 @@ let private ftClampProd16 (acc: Span<int16>) (k: int) : Vector256<int16> =
 [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
 let private ftNarrow32 (ft: Span<byte>) (acc: Span<int16>) (off: int) (dst: int) =
     let packed = Avx2.PackUnsignedSaturate(ftClampProd16 acc off, ftClampProd16 acc (off + 16))
-    Vector256.StoreUnsafe(Avx2.Permute4x64(packed.AsInt64(), 0xD8uy).AsByte(), &ft.[dst])
+    let ftBase = &MemoryMarshal.GetReference ft
+    Vector256.StoreUnsafe(Avx2.Permute4x64(packed.AsInt64(), 0xD8uy).AsByte(), &ftBase, unativeint dst)
 
 /// Feature-transformer pairwise product into a u8 buffer: ft[j] = clamp(a,0,255)*clamp(b,0,255)/512.
 /// AVX2: clamp via Min/Max, vpmulld, >>9, narrow to byte. Bit-exact with scalar (product <= 65025, /512).
@@ -407,6 +412,10 @@ let private fc0Gemv (ft: Span<byte>) (fc0w: sbyte[]) (fc0b: int[]) (fc0: Span<in
         // Register-block 4 outputs: 4 independent vpdpbusd accumulators break the per-output dependency
         // chain (vpdpbusd ~5c latency) so the loop runs throughput-bound, not latency-bound; ft reused 4x.
         // Bit-exact: each output's accumulation order is unchanged (Fc0Out=32 is divisible by 4).
+        // Base-ref + element-offset loads skip the per-iteration bounds checks the JIT can't elide when
+        // wb0..wb3/i are runtime values (mirrors Accumulator.fs's addFeatureAt/addFeaturePairAt kernels).
+        let ftBase = &MemoryMarshal.GetReference ft
+        let wBase = &MemoryMarshal.GetArrayDataReference fc0w
         let mutable o = 0
 
         while o < Fc0Out do
@@ -421,11 +430,11 @@ let private fc0Gemv (ft: Span<byte>) (fc0w: sbyte[]) (fc0b: int[]) (fc0: Span<in
             let mutable i = 0
 
             while i < L1 do
-                let u = (Vector256.LoadUnsafe(&ft.[i]): Vector256<byte>)
-                a0 <- AvxVnni.MultiplyWideningAndAdd(a0, u, (Vector256.LoadUnsafe(&fc0w.[wb0 + i]): Vector256<sbyte>))
-                a1 <- AvxVnni.MultiplyWideningAndAdd(a1, u, (Vector256.LoadUnsafe(&fc0w.[wb1 + i]): Vector256<sbyte>))
-                a2 <- AvxVnni.MultiplyWideningAndAdd(a2, u, (Vector256.LoadUnsafe(&fc0w.[wb2 + i]): Vector256<sbyte>))
-                a3 <- AvxVnni.MultiplyWideningAndAdd(a3, u, (Vector256.LoadUnsafe(&fc0w.[wb3 + i]): Vector256<sbyte>))
+                let u = (Vector256.LoadUnsafe(&ftBase, unativeint i): Vector256<byte>)
+                a0 <- AvxVnni.MultiplyWideningAndAdd(a0, u, (Vector256.LoadUnsafe(&wBase, unativeint (wb0 + i)): Vector256<sbyte>))
+                a1 <- AvxVnni.MultiplyWideningAndAdd(a1, u, (Vector256.LoadUnsafe(&wBase, unativeint (wb1 + i)): Vector256<sbyte>))
+                a2 <- AvxVnni.MultiplyWideningAndAdd(a2, u, (Vector256.LoadUnsafe(&wBase, unativeint (wb2 + i)): Vector256<sbyte>))
+                a3 <- AvxVnni.MultiplyWideningAndAdd(a3, u, (Vector256.LoadUnsafe(&wBase, unativeint (wb3 + i)): Vector256<sbyte>))
                 i <- i + 32
 
             fc0.[o] <- fc0b.[o] + Vector256.Sum(a0)
@@ -434,6 +443,8 @@ let private fc0Gemv (ft: Span<byte>) (fc0w: sbyte[]) (fc0b: int[]) (fc0: Span<in
             fc0.[o + 3] <- fc0b.[o + 3] + Vector256.Sum(a3)
             o <- o + 4
     elif useAvx2 then
+        let ftBase = &MemoryMarshal.GetReference ft
+        let wBase = &MemoryMarshal.GetArrayDataReference fc0w
         let mutable o = 0
 
         while o < Fc0Out do
@@ -448,11 +459,11 @@ let private fc0Gemv (ft: Span<byte>) (fc0w: sbyte[]) (fc0b: int[]) (fc0: Span<in
             let mutable i = 0
 
             while i < L1 do
-                let u = (Vector256.LoadUnsafe(&ft.[i]): Vector256<byte>)
-                a0 <- Avx2.Add(a0, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u, (Vector256.LoadUnsafe(&fc0w.[wb0 + i]): Vector256<sbyte>)), VOnes16))
-                a1 <- Avx2.Add(a1, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u, (Vector256.LoadUnsafe(&fc0w.[wb1 + i]): Vector256<sbyte>)), VOnes16))
-                a2 <- Avx2.Add(a2, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u, (Vector256.LoadUnsafe(&fc0w.[wb2 + i]): Vector256<sbyte>)), VOnes16))
-                a3 <- Avx2.Add(a3, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u, (Vector256.LoadUnsafe(&fc0w.[wb3 + i]): Vector256<sbyte>)), VOnes16))
+                let u = (Vector256.LoadUnsafe(&ftBase, unativeint i): Vector256<byte>)
+                a0 <- Avx2.Add(a0, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u, (Vector256.LoadUnsafe(&wBase, unativeint (wb0 + i)): Vector256<sbyte>)), VOnes16))
+                a1 <- Avx2.Add(a1, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u, (Vector256.LoadUnsafe(&wBase, unativeint (wb1 + i)): Vector256<sbyte>)), VOnes16))
+                a2 <- Avx2.Add(a2, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u, (Vector256.LoadUnsafe(&wBase, unativeint (wb2 + i)): Vector256<sbyte>)), VOnes16))
+                a3 <- Avx2.Add(a3, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u, (Vector256.LoadUnsafe(&wBase, unativeint (wb3 + i)): Vector256<sbyte>)), VOnes16))
                 i <- i + 32
 
             fc0.[o] <- fc0b.[o] + Vector256.Sum(a0)
@@ -475,27 +486,35 @@ let private fc0Gemv (ft: Span<byte>) (fc0w: sbyte[]) (fc0b: int[]) (fc0: Span<in
 /// order-independent (|total| <= 64*16256 << 2^31). conc/wb are byte-indexed; Fc1In = 64.
 let private fc1Gemv (conc: Span<byte>) (fc1w: sbyte[]) (fc1b: int[]) (fc1: Span<int>) (useAvx2: bool) (useVnni: bool) =
     if useVnni then
+        // Base-ref + element-offset loads skip the per-iteration bounds checks the JIT can't elide when
+        // wb/i are runtime values (mirrors Accumulator.fs's addFeatureAt/addFeaturePairAt kernels).
+        let concBase = &MemoryMarshal.GetReference conc
+        let wBase = &MemoryMarshal.GetArrayDataReference fc1w
+
         for o in 0 .. Fc1Out - 1 do
             let wb = o * Fc1In
             let mutable acc = Vector256<int>.Zero
             let mutable i = 0
 
             while i < Fc1In do
-                let u = (Vector256.LoadUnsafe(&conc.[i]): Vector256<byte>)
-                let w = (Vector256.LoadUnsafe(&fc1w.[wb + i]): Vector256<sbyte>)
+                let u = (Vector256.LoadUnsafe(&concBase, unativeint i): Vector256<byte>)
+                let w = (Vector256.LoadUnsafe(&wBase, unativeint (wb + i)): Vector256<sbyte>)
                 acc <- AvxVnni.MultiplyWideningAndAdd(acc, u, w)
                 i <- i + 32
 
             fc1.[o] <- fc1b.[o] + Vector256.Sum(acc)
     elif useAvx2 then
+        let concBase = &MemoryMarshal.GetReference conc
+        let wBase = &MemoryMarshal.GetArrayDataReference fc1w
+
         for o in 0 .. Fc1Out - 1 do
             let wb = o * Fc1In
             let mutable acc = Vector256<int>.Zero
             let mutable i = 0
 
             while i < Fc1In do
-                let u = (Vector256.LoadUnsafe(&conc.[i]): Vector256<byte>)
-                let w = (Vector256.LoadUnsafe(&fc1w.[wb + i]): Vector256<sbyte>)
+                let u = (Vector256.LoadUnsafe(&concBase, unativeint i): Vector256<byte>)
+                let w = (Vector256.LoadUnsafe(&wBase, unativeint (wb + i)): Vector256<sbyte>)
                 acc <- Avx2.Add(acc, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u, w), VOnes16))
                 i <- i + 32
 
@@ -513,13 +532,19 @@ let private fc1Gemv (conc: Span<byte>) (fc1w: sbyte[]) (fc1b: int[]) (fc1: Span<
 /// fc_2 (32 -> 1) over u8 activations: a single vpmaddubsw/vpmaddwd dot product. Bit-exact (same bounds).
 let private fc2Dot (a1: Span<byte>) (fc2w: sbyte[]) (fc2b: int) (useAvx2: bool) (useVnni: bool) : int =
     if useVnni then
-        let u = (Vector256.LoadUnsafe(&a1.[0]): Vector256<byte>)
-        let w = (Vector256.LoadUnsafe(&fc2w.[0]): Vector256<sbyte>)
+        // Base-ref + element-offset loads skip the bounds check the JIT can't elide for a Span/array load
+        // (mirrors Accumulator.fs's addFeatureAt/addFeaturePairAt kernels); single load, offset 0.
+        let aBase = &MemoryMarshal.GetReference a1
+        let wBase = &MemoryMarshal.GetArrayDataReference fc2w
+        let u = (Vector256.LoadUnsafe(&aBase, 0un): Vector256<byte>)
+        let w = (Vector256.LoadUnsafe(&wBase, 0un): Vector256<sbyte>)
         fc2b + Vector256.Sum(AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, u, w))
     elif useAvx2 then
         let ones = VOnes16
-        let u = (Vector256.LoadUnsafe(&a1.[0]): Vector256<byte>)
-        let w = (Vector256.LoadUnsafe(&fc2w.[0]): Vector256<sbyte>)
+        let aBase = &MemoryMarshal.GetReference a1
+        let wBase = &MemoryMarshal.GetArrayDataReference fc2w
+        let u = (Vector256.LoadUnsafe(&aBase, 0un): Vector256<byte>)
+        let w = (Vector256.LoadUnsafe(&wBase, 0un): Vector256<sbyte>)
         fc2b + Vector256.Sum(Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u, w), ones))
     else
         let mutable s = fc2b

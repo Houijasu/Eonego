@@ -5,6 +5,7 @@ module Eonego.Benchmarks.Program
 open System
 open System.Numerics
 open System.Runtime.Intrinsics.X86
+open System.Threading
 open Microsoft.FSharp.NativeInterop
 open BenchmarkDotNet.Attributes
 open BenchmarkDotNet.Running
@@ -689,6 +690,143 @@ type DagSearchBench() =
     member _.SearchDepth7DagOn() =
         negamax workerOn workerOn.Pos (-INF) INF 7 0 true false
 
+/// Multi-threaded entry for benchmarking only: mirrors `Search.go`'s thread topology (N workers sharing one
+/// SearchControl - only the lock-free TT/DAG/checkpoint tables are shared mutable state) but stops on a NODE
+/// budget instead of depth/time and skips the UCI `bestmove` stdout write, so repeated BenchmarkDotNet
+/// invocations stay quiet and the wall-clock budget stays roughly comparable across thread counts.
+let private searchNodesMultiThreaded (fen: string) (nodes: int64) (cfg: SearchConfig) (net: SfNetwork option) : int64 =
+    let tt = TranspositionTable(max 1 cfg.HashMb)
+    let limits = { defaultLimits with Nodes = nodes }
+    let control = SearchControl(cfg, limits, tt, fen, [||], ?net = net)
+    control.Reset()
+    control.NewSearch()
+    let n = max 1 cfg.Threads
+    let workers = Array.init n (fun i -> Worker(i, (i = 0), control))
+
+    for w in workers do
+        w.SetupRoot()
+
+    control.NodeSum <-
+        (fun () ->
+            let mutable s = 0L
+
+            for wk in workers do
+                s <- s + wk.Nodes
+
+            s)
+
+    control.StartClock 0L 0L
+
+    let threads =
+        [| for i in 1 .. n - 1 ->
+               let w = workers.[i]
+               let t = Thread(ThreadStart(fun () -> iterativeDeepening w (MaxSearchPly - 1)), 16 * 1024 * 1024)
+               t.IsBackground <- true
+               t.Start()
+               t |]
+
+    iterativeDeepening workers.[0] (MaxSearchPly - 1)
+    control.Stop()
+
+    for t in threads do
+        t.Join()
+
+    let mutable total = 0L
+
+    for w in workers do
+        total <- total + w.Nodes
+
+    total
+
+/// Phase 2 multi-threaded A/B (DAG-on vs DAG-off) at real LazySMP concurrency. `DagSearchBench` above is
+/// Threads=1-only and therefore cannot exercise contention on the shared per-cluster reservation flags
+/// (claim/complete/cancel races between unrelated, non-colliding clusters); this variant runs the SAME
+/// Kiwipete tree under genuine N-worker contention via a fixed NODE budget (so wall time scales down with N
+/// instead of the per-thread workload growing) and reports DAG on/off at each N.
+[<MemoryDiagnoser>]
+[<ShortRunJob>]
+type DagSearchMtBench() =
+
+    let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -" // Kiwipete (rich tree)
+    let nodeBudget = 200_000L
+    let mutable net: SfNetwork option = None
+
+    [<Params(1, 4, 8)>]
+    member val Threads = 1 with get, set
+
+    [<GlobalSetup>]
+    member _.Setup() =
+        net <- loadFullThreatsNet ()
+
+    [<Benchmark(Baseline = true)>]
+    member this.SearchNodesDagOff() =
+        let cfg =
+            { defaultConfig with
+                Threads = this.Threads
+                HashMb = 16
+                UseTt = true
+                UsePruning = true
+                AccCheckpointMb = 4
+                DagHashMb = 0 }
+
+        searchNodesMultiThreaded fen nodeBudget cfg net
+
+    [<Benchmark>]
+    member this.SearchNodesDagOn() =
+        let cfg =
+            { defaultConfig with
+                Threads = this.Threads
+                HashMb = 16
+                UseTt = true
+                UsePruning = true
+                AccCheckpointMb = 4
+                DagHashMb = 2 }
+
+        searchNodesMultiThreaded fen nodeBudget cfg net
+
+/// Phase 1 multi-threaded A/B (checkpoint-cache-on vs off), isolating the AccCheckpoint contribution (DAG off
+/// in both branches) at real concurrency instead of the Threads=1-only `AccCheckpointSearchBench` above.
+[<MemoryDiagnoser>]
+[<ShortRunJob>]
+type AccCheckpointSearchMtBench() =
+
+    let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -" // Kiwipete (rich tree)
+    let nodeBudget = 200_000L
+    let mutable net: SfNetwork option = None
+
+    [<Params(1, 4, 8)>]
+    member val Threads = 1 with get, set
+
+    [<GlobalSetup>]
+    member _.Setup() =
+        net <- loadFullThreatsNet ()
+
+    [<Benchmark(Baseline = true)>]
+    member this.SearchNodesCacheOff() =
+        let cfg =
+            { defaultConfig with
+                Threads = this.Threads
+                HashMb = 16
+                UseTt = true
+                UsePruning = true
+                AccCheckpointMb = 0
+                DagHashMb = 0 }
+
+        searchNodesMultiThreaded fen nodeBudget cfg net
+
+    [<Benchmark>]
+    member this.SearchNodesCacheOn() =
+        let cfg =
+            { defaultConfig with
+                Threads = this.Threads
+                HashMb = 16
+                UseTt = true
+                UsePruning = true
+                AccCheckpointMb = 4
+                DagHashMb = 0 }
+
+        searchNodesMultiThreaded fen nodeBudget cfg net
+
 [<EntryPoint>]
 let main argv =
     // `--filter *` runs every benchmark non-interactively when no args are given.
@@ -704,7 +842,9 @@ let main argv =
                typeof<EvalBench>
                typeof<SearchBench>
                typeof<AccCheckpointSearchBench>
-               typeof<DagSearchBench> |]
+               typeof<DagSearchBench>
+               typeof<AccCheckpointSearchMtBench>
+               typeof<DagSearchMtBench> |]
         )
         .Run(args)
     |> ignore

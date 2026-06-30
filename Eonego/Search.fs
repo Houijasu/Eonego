@@ -970,10 +970,23 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
                     let givesCheck = pos.GivesCheck m
                     let mutable doMove = true
+                    // perf: `reduction depth moveCount` is a pure table lookup; `depth`/`moveCount` are both
+                    // unchanged for the rest of this move's processing, so the forward-pruning use below and
+                    // the LMR base reduction further down (if both run) share one evaluation instead of two.
+                    let mutable cachedReduction = -1
+                    // perf: for a checking move, `pos.SeeGe m 0` (needed below by the check-extension decision)
+                    // is reused by the quiet SEE-prune check just below it: SeeGe is monotone in its threshold,
+                    // and the quiet-prune threshold is always <= 0, so SeeGe(m,0)=true already proves the laxer
+                    // quiet-prune check would also pass, letting it skip its own exchange walk entirely.
+                    let mutable see0Known = false
+                    let mutable see0Val = false
 
                     // --- forward pruning: never on the first real move, never when we might be getting mated ---
                     if usePruning && not isPv && not inCheck && best > -MATE_IN_MAX_PLY then
-                        let lmrDepth = max 0 (depth - 1 - reduction depth moveCount)
+                        if cachedReduction < 0 then
+                            cachedReduction <- reduction depth moveCount
+
+                        let lmrDepth = max 0 (depth - 1 - cachedReduction)
 
                         if isQuiet then
                             // late-move (move-count) pruning — stop trying quiets once deep into the list
@@ -997,15 +1010,31 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                             elif (not givesCheck) && lmrDepth <= 6 && staticEval + 120 + 110 * lmrDepth <= alpha then
                                 skipQuiets <- true
                                 doMove <- false
-                            // SEE — a quiet that walks into a losing exchange
-                            elif lmrDepth <= 7 && not (pos.SeeGe m (-25 * lmrDepth * lmrDepth)) then
+                            // SEE — a quiet that walks into a losing exchange. For a checking move, probe the
+                            // threshold-0 exchange first (cached for reuse by the extension decision below): if
+                            // it already passes, the laxer threshold is guaranteed to pass too (SEE monotonicity,
+                            // lax threshold <= 0), so the second walk at the lax threshold is skipped entirely.
+                            elif
+                                lmrDepth <= 7
+                                && (if givesCheck then
+                                        see0Known <- true
+                                        see0Val <- pos.SeeGe m 0
+                                        not see0Val && not (pos.SeeGe m (-25 * lmrDepth * lmrDepth))
+                                    else
+                                        not (pos.SeeGe m (-25 * lmrDepth * lmrDepth)))
+                            then
                                 doMove <- false
                         elif (not givesCheck) && depth <= 6 && not (pos.SeeGe m (-90 * depth)) then
                             // SEE — a capture that loses material by static exchange at shallow depth
                             doMove <- false
 
                     if doMove then
-                        let mutable ext = if usePruning && givesCheck && pos.SeeGe m 0 then 1 else 0
+                        let mutable ext =
+                            if usePruning && givesCheck then
+                                let see0 = if see0Known then see0Val else pos.SeeGe m 0
+                                if see0 then 1 else 0
+                            else
+                                0
 
                         // Singular / double extension: the TT move, at depth >= 8 with a depth-sufficient
                         // lower-bound TT score, is "singular" if every OTHER move fails low against a
@@ -1054,7 +1083,11 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                             // LMR: table reduction, deeper for non-improving / quiet moves, lighter for captures
                             let mutable r =
                                 if depth >= 3 && moveCount > 1 && not givesCheck then
-                                    let mutable rr = reduction depth moveCount
+                                    let mutable rr =
+                                        if cachedReduction < 0 then
+                                            reduction depth moveCount
+                                        else
+                                            cachedReduction
 
                                     if not improving then
                                         rr <- rr + 1

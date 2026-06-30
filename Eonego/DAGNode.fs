@@ -63,6 +63,22 @@ let StatusDone = 2 // the node's (move, score, depth) are FINAL under (storedAlp
 [<Literal>]
 let ClusterSize = 4
 
+/// Physical stride (in `int`s) between two clusters' reservation flags. 16 ints = 64 bytes = one x64 cache
+/// line, so each cluster's CAS flag gets its own line: two threads claiming/completing/cancelling unrelated
+/// (non-colliding) clusters never bounce the same cache line via the reservation array, only via genuine
+/// key collisions on `entries`. Pure perf padding; the logical cluster index (`ClusterIndex`) is unaffected.
+[<Literal>]
+let ReservationStride = 16
+
+/// Bounded-retry tuning for `Complete`/`Cancel`'s reservation CAS (see `TryReserveSpin`): a handful of short
+/// spins is enough to ride out the sub-microsecond overlap of a sibling claim/complete/cancel on the same
+/// cluster without ever turning this into a blocking wait.
+[<Literal>]
+let ReservationSpinAttempts = 8
+
+[<Literal>]
+let ReservationSpinIterations = 16
+
 [<Literal>]
 let NoClaim = -1
 
@@ -123,7 +139,9 @@ let private clustersFor (mb: int) : int =
 type DagNodeTable(mb: int) =
     let clusterCount = clustersFor mb
     let entries: uint64[] = Array.zeroCreate (clusterCount * ClusterSize * 2) // pairs: key, data
-    let reservations: int[] = Array.zeroCreate clusterCount
+    // One physical `int` per cache line per cluster (see ReservationStride doc) to avoid false-sharing
+    // between unrelated clusters' CAS flags under concurrent LazySMP claim/complete/cancel traffic.
+    let reservations: int[] = Array.zeroCreate (clusterCount * ReservationStride)
     let mutable clusterMask: int = clusterCount - 1
     let mutable clusterMask64: uint64 = uint64 clusterMask
     let mutable generation: int = 0
@@ -141,10 +159,27 @@ type DagNodeTable(mb: int) =
         dStatus d <> StatusEmpty && dGen d = generation
 
     member private _.TryReserve(cluster: int) : bool =
-        Interlocked.CompareExchange(&reservations.[cluster], 1, 0) = 0
+        Interlocked.CompareExchange(&reservations.[cluster * ReservationStride], 1, 0) = 0
+
+    /// Bounded-retry reservation acquire for `Complete`/`Cancel`: unlike `TryClaim` (which is allowed to walk
+    /// away from contention - the caller just falls back to plain search), a caller of `Complete`/`Cancel`
+    /// already owns the claimed slot and is obligated to either publish or release it. A single lost CAS here
+    /// (e.g. racing a sibling worker's claim/complete/cancel on a colliding cluster index) would otherwise
+    /// permanently strand the slot in `StatusExpanding` for the rest of the search generation. A handful of
+    /// `SpinWait` rounds resolves the brief (sub-microsecond) overlap without ever blocking a thread.
+    member private this.TryReserveSpin(cluster: int) : bool =
+        let mutable acquired = this.TryReserve cluster
+        let mutable attempt = 0
+
+        while not acquired && attempt < ReservationSpinAttempts do
+            Thread.SpinWait(ReservationSpinIterations)
+            acquired <- this.TryReserve cluster
+            attempt <- attempt + 1
+
+        acquired
 
     member private _.Release(cluster: int) : unit =
-        Volatile.Write(&reservations.[cluster], 0)
+        Volatile.Write(&reservations.[cluster * ReservationStride], 0)
 
     member _.Clear() : unit =
         Array.Clear(entries, 0, entries.Length)
@@ -245,7 +280,7 @@ type DagNodeTable(mb: int) =
         else
             let cluster = this.ClusterIndex key
 
-            if not (this.TryReserve cluster) then
+            if not (this.TryReserveSpin cluster) then
                 false
             else
                 try
@@ -272,7 +307,7 @@ type DagNodeTable(mb: int) =
         else
             let cluster = this.ClusterIndex key
 
-            if not (this.TryReserve cluster) then
+            if not (this.TryReserveSpin cluster) then
                 false
             else
                 try
@@ -292,5 +327,6 @@ type DagNodeTable(mb: int) =
     member internal _.RawEntries: uint64[] = entries
     member internal _.RawReservations: int[] = reservations
     member internal this.ClusterBase(key: uint64) : int = this.Base key
-    member internal this.ReservationIndex(key: uint64) : int = this.ClusterIndex key
+    // Physical index into RawReservations (cluster index * ReservationStride; see TryReserve/Release).
+    member internal this.ReservationIndex(key: uint64) : int = this.ClusterIndex key * ReservationStride
     member internal _.Generation: int = generation

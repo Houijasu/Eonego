@@ -197,9 +197,14 @@ type AccCheckpointTable(mb: int) =
         Buffer.BlockCopy(srcPsqW, srcPsqWOff * 4, psqW, pWOff * 4, PsqtBuckets * 4)
         Buffer.BlockCopy(srcPsqB, srcPsqBOff * 4, psqB, pWOff * 4, PsqtBuckets * 4)
 
-        // 2. Compute content hash over the just-copied payload (reading from the table keeps cache locality
-        //    and matches what a future reader will recompute).
-        let h = payloadHash accW wOff accB wOff psqW pWOff psqB pWOff realKey
+        // 2. Compute content hash from the CALLER's source buffers, not the table's shared destination slot.
+        //    The src* buffers are private to the calling worker for the duration of this call (never written
+        //    by another thread), so hashing from them is race-free by construction; in the non-racing case the
+        //    dst is a verbatim BlockCopy of src, so the hash is bit-identical to hashing post-copy. Reading the
+        //    shared dst instead would needlessly widen the window during which a second worker's concurrent
+        //    Store to the SAME slot (real and expected with few slots) could interleave with this hash walk.
+        let h =
+            payloadHash srcAccW srcAccWOff srcAccB srcAccBOff srcPsqW srcPsqWOff srcPsqB srcPsqBOff realKey
 
         Volatile.Write(&hashes.[i], h)
         Volatile.Write(&keys.[i], realKey ^^^ h)
