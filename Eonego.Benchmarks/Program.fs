@@ -575,6 +575,65 @@ type SearchBench() =
     member _.SearchDepth7() =
         negamax worker worker.Pos (-INF) INF 7 0 true false
 
+/// LearnedSearch navigation cost model. Confirms (audit-4) that the accumulator MATERIALIZE-X step and
+/// PROXIMITY-ordered expansion matter: best-first jumps reset path frames not-computed, so without
+/// materialize-X each child re-walks the accumulator toward the root. Each op runs LearnedSearch to a
+/// fixed node budget under different toggles; the in-run RATIOS are what matter (cross-run machine state
+/// varies ~2x from thermal/turbo). Soft-skips when no net is present.
+///   Beam1            : W=1 best-first (PV-leaf), materialize ON — the reference.
+///   Beam8Prox        : W=8 beam, proximity ON, materialize ON.
+///   Beam8NoProx      : W=8 beam, proximity OFF — isolates the navigation-churn cost of unordered expansion.
+///   Beam8NoMaterialize : W=8 beam, materialize OFF — isolates the O(depth) per-child re-walk tax.
+[<MemoryDiagnoser>]
+[<ShortRunJob>]
+type LsNavBench() =
+
+    let fen = "r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 0 1" // Italian, rich midgame
+    let nodes = 50_000L
+    let cap = 200_000
+    let mutable net: SfNetwork option = None
+    let mutable leaf: Position -> int = fun _ -> 0
+
+    [<GlobalSetup>]
+    member _.Setup() =
+        net <- loadFullThreatsNet ()
+
+        match net with
+        | Some n -> leaf <- (fun (p: Position) -> evalCp n p)
+        | None -> ()
+
+    [<Benchmark(Baseline = true)>]
+    member _.Beam1() =
+        match net with
+        | Some _ ->
+            let struct (s, _, _) = Eonego.LearnedSearch.searchToNodesTuned fen [||] nodes cap net leaf 1 true true
+            s
+        | None -> 0
+
+    [<Benchmark>]
+    member _.Beam8Prox() =
+        match net with
+        | Some _ ->
+            let struct (s, _, _) = Eonego.LearnedSearch.searchToNodesTuned fen [||] nodes cap net leaf 8 true true
+            s
+        | None -> 0
+
+    [<Benchmark>]
+    member _.Beam8NoProx() =
+        match net with
+        | Some _ ->
+            let struct (s, _, _) = Eonego.LearnedSearch.searchToNodesTuned fen [||] nodes cap net leaf 8 false true
+            s
+        | None -> 0
+
+    [<Benchmark>]
+    member _.Beam8NoMaterialize() =
+        match net with
+        | Some _ ->
+            let struct (s, _, _) = Eonego.LearnedSearch.searchToNodesTuned fen [||] nodes cap net leaf 8 true false
+            s
+        | None -> 0
+
 [<EntryPoint>]
 let main argv =
     // `--filter *` runs every benchmark non-interactively when no args are given.
@@ -588,7 +647,8 @@ let main argv =
                typeof<MoveGenBench>
                typeof<MovePickBench>
                typeof<EvalBench>
-               typeof<SearchBench> |]
+               typeof<SearchBench>
+               typeof<LsNavBench> |]
         )
         .Run(args)
     |> ignore

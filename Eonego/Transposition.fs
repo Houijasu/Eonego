@@ -4,9 +4,8 @@
 /// `Key = realKey ^^^ Data`. A probe accepts an entry iff `Key ^^^ Data = realKey`; a torn read (one field
 /// written by another thread between the reader's two reads) breaks that equality and is rejected as a MISS.
 /// Aligned 64-bit reads/writes are atomic on the 64-bit runtime, so each field is individually torn-free and
-/// the XOR ties the two together — no locks, no Interlocked on the hot path. Volatile.Read/Write on both
-/// fields is MANDATORY: it stops the JIT from hoisting a stale `Key` read out of the cluster loop and pins
-/// the store order (Data before Key, so a fresh Key implies a fresh Data).
+/// the XOR ties the two together. Probes are advisory: a racing or reordered read that does not reconstruct
+/// the requested key is rejected as a miss, which is acceptable for the search table.
 ///
 /// `Data` packing (LSB->MSB): move:16 | score:int16 | eval:int16 | depth:uint8 | genBound:uint8 ,
 /// where genBound = (generation5 << 3) | (ttPv << 2) | bound. generation is therefore only 5 bits
@@ -14,12 +13,12 @@
 /// Clusters of 4 entries (64 B, cache-line sized). Replacement = empty/key-match first, else min
 /// (depth - relativeAge*2). Scores are mate-ply-corrected by the CALLER (Search.valueToTt/valueFromTt).
 ///
-/// Probe/Store are safe under concurrency, but MUST NOT run concurrently with Resize/Clear — the UCI driver
-/// guarantees this by stopping+joining any active search before setoption Hash / ucinewgame.
+/// Probe/Store are lock-free and best-effort under concurrency, but MUST NOT run concurrently with
+/// Resize/Clear — the UCI driver guarantees this by stopping+joining any active search before setoption
+/// Hash / ucinewgame.
 module Eonego.Transposition
 
 open System
-open System.Threading
 open Eonego.Move
 
 [<assembly: System.Runtime.CompilerServices.InternalsVisibleTo("Eonego.Tests")>]
@@ -80,10 +79,11 @@ let private clustersFor (mb: int) : int =
 type TranspositionTable(mb: int) =
     let mutable entries: TtEntry[] = Array.zeroCreate (clustersFor mb * ClusterSize)
     let mutable clusterMask: int = (entries.Length / ClusterSize) - 1
+    let mutable clusterMask64: uint64 = uint64 clusterMask
     let mutable generation: int = 0 // 5-bit; (g+1) &&& 0x1F per NewSearch
 
     member private _.Base(key: uint64) : int =
-        (int ((key >>> 32) &&& uint64 clusterMask)) * ClusterSize
+        (int ((key >>> 32) &&& clusterMask64)) * ClusterSize
 
     /// Zero every entry and reset the generation (new game).
     member _.Clear() : unit =
@@ -94,6 +94,7 @@ type TranspositionTable(mb: int) =
     member _.Resize(newMb: int) : unit =
         entries <- Array.zeroCreate (clustersFor newMb * ClusterSize)
         clusterMask <- (entries.Length / ClusterSize) - 1
+        clusterMask64 <- uint64 clusterMask
         generation <- 0
 
     /// Advance the age counter at the start of a search (5-bit wrap).
@@ -106,21 +107,35 @@ type TranspositionTable(mb: int) =
     /// bound, ttPv).
     member this.Probe(key: uint64) : struct (bool * Move * int * int * int * int * bool) =
         let b = this.Base key
-        let mutable i = 0
-        let mutable result = struct (false, MoveNone, 0, 0, 0, BoundNone, false)
-        let mutable scanning = true
+        let k0 = entries.[b].Key
+        let d0 = entries.[b].Data
+        let gb0 = dGenBound d0
 
-        while scanning && i < ClusterSize do
-            let k = Volatile.Read(&entries.[b + i].Key)
-            let d = Volatile.Read(&entries.[b + i].Data)
-            // XOR self-check; reject the all-zero empty slot (bound = BoundNone) even if realKey = 0.
-            if (k ^^^ d) = key && dBound d <> BoundNone then
-                result <- struct (true, dMove d, dScore d, dEval d, dDepth d, dBound d, dTtPv d)
-                scanning <- false
+        if (k0 ^^^ d0) = key && (gb0 &&& 3) <> BoundNone then
+            struct (true, dMove d0, dScore d0, dEval d0, dDepth d0, gb0 &&& 3, ((gb0 >>> 2) &&& 1) = 1)
+        else
+            let k1 = entries.[b + 1].Key
+            let d1 = entries.[b + 1].Data
+            let gb1 = dGenBound d1
+
+            if (k1 ^^^ d1) = key && (gb1 &&& 3) <> BoundNone then
+                struct (true, dMove d1, dScore d1, dEval d1, dDepth d1, gb1 &&& 3, ((gb1 >>> 2) &&& 1) = 1)
             else
-                i <- i + 1
+                let k2 = entries.[b + 2].Key
+                let d2 = entries.[b + 2].Data
+                let gb2 = dGenBound d2
 
-        result
+                if (k2 ^^^ d2) = key && (gb2 &&& 3) <> BoundNone then
+                    struct (true, dMove d2, dScore d2, dEval d2, dDepth d2, gb2 &&& 3, ((gb2 >>> 2) &&& 1) = 1)
+                else
+                    let k3 = entries.[b + 3].Key
+                    let d3 = entries.[b + 3].Data
+                    let gb3 = dGenBound d3
+
+                    if (k3 ^^^ d3) = key && (gb3 &&& 3) <> BoundNone then
+                        struct (true, dMove d3, dScore d3, dEval d3, dDepth d3, gb3 &&& 3, ((gb3 >>> 2) &&& 1) = 1)
+                    else
+                        struct (false, MoveNone, 0, 0, 0, BoundNone, false)
 
     /// XOR-pack store with cluster replacement. `score`/`eval` are already mate-ply-corrected by the caller.
     member this.Store (key: uint64) (depth: int) (bound: int) (score: int) (eval: int) (move: Move) (ttPv: bool) : unit =
@@ -171,9 +186,8 @@ type TranspositionTable(mb: int) =
         let pvOut = ttPv || (isMatch && dTtPv ed)
         let pvBit = if pvOut then 1 else 0
         let data = packData mv sc ev dpt ((generation <<< 3) ||| (pvBit <<< 2) ||| bd)
-        // Data BEFORE Key: a reader that sees the fresh Key is guaranteed to see the fresh Data.
-        Volatile.Write(&entries.[slot].Data, data)
-        Volatile.Write(&entries.[slot].Key, key ^^^ data)
+        entries.[slot].Data <- data
+        entries.[slot].Key <- key ^^^ data
 
     // --- internals for the test assembly (torn-read injection / inspection) ------------------------
     member internal _.RawEntries: TtEntry[] = entries

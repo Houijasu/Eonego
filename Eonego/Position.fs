@@ -53,6 +53,7 @@ let private castleKingPath: Bitboard[] = Array.zeroCreate 16 // by right bit; sq
 let private castleEmptyPath: Bitboard[] = Array.zeroCreate 16 // by right bit; squares that must be empty
 let private castleRookOrigin: int[] = Array.create 16 NoSquare // by right bit; rook from square
 let private castleKingDest: int[] = Array.create 16 NoSquare // by right bit; king to square
+let private sfRayBeyond: Bitboard[] = Array.zeroCreate (64 * 64) // [from][through] -> squares beyond through
 
 let private bbOf (sqs: int list) : Bitboard =
     List.fold (fun acc s -> acc ||| (1UL <<< s)) 0UL sqs
@@ -93,6 +94,29 @@ let private initTables () =
     castleKingDest.[BK] <- g8
     castleRookOrigin.[BQ] <- a8
     castleKingDest.[BQ] <- c8
+
+    for from in 0..63 do
+        for throughSq in 0..63 do
+            if from <> throughSq then
+                let df = fileOf throughSq - fileOf from
+                let dr = rankOf throughSq - rankOf from
+
+                let step =
+                    if dr = 0 && df <> 0 then (if df > 0 then 1 else -1)
+                    elif df = 0 && dr <> 0 then (if dr > 0 then 8 else -8)
+                    elif df = dr then (if dr > 0 then 9 else -9)
+                    elif df = -dr then (if dr > 0 then 7 else -7)
+                    else 0
+
+                if step <> 0 then
+                    let mutable sq = throughSq + step
+                    let mutable b = 0UL
+
+                    while sq >= 0 && sq < 64 && aligned from throughSq sq do
+                        b <- b ||| (1UL <<< sq)
+                        sq <- sq + step
+
+                    sfRayBeyond.[(from <<< 6) + throughSq] <- b
 
 do initTables ()
 
@@ -213,28 +237,9 @@ type Position() =
             else
                 sfDirtyThreatOverflow <- true
 
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member private _.SfRayBeyond(from: Square, throughSq: Square) : Bitboard =
-        let df = fileOf throughSq - fileOf from
-        let dr = rankOf throughSq - rankOf from
-
-        let step =
-            if dr = 0 && df <> 0 then (if df > 0 then 1 else -1)
-            elif df = 0 && dr <> 0 then (if dr > 0 then 8 else -8)
-            elif df = dr then (if dr > 0 then 9 else -9)
-            elif df = -dr then (if dr > 0 then 7 else -7)
-            else 0
-
-        if step = 0 then
-            0UL
-        else
-            let mutable sq = throughSq + step
-            let mutable b = 0UL
-
-            while sq >= 0 && sq < 64 && aligned from throughSq sq do
-                b <- b ||| (1UL <<< sq)
-                sq <- sq + step
-
-            b
+        sfRayBeyond.[(from <<< 6) + throughSq]
 
     member private _.SfPawnPushOrAttacks(c: Color, sq: Square) : Bitboard =
         let atk = pawnAttacks c sq
@@ -648,10 +653,54 @@ type Position() =
         let accOff = this.SfAccOff frame
         let psqOff = this.SfPsqOff frame
 
-        for i in 0 .. n - 1 do
-            let v = buf.[off + i]
-            let sign, idx = if v > 0 then 1, v - 1 else -1, -v - 1
-            Accumulator.addThreatAt acc accOff psq psqOff sfThreatWeights sfThreatPsqt idx sign Accumulator.UseAvx2
+        if n <= 62 then
+            let addIdxs = sfTmpW
+            let subIdxs = sfTmpB
+            let mutable nAdd = 0
+            let mutable nSub = 0
+
+            for i in 0 .. n - 1 do
+                let v = buf.[off + i]
+
+                if v > 0 then
+                    addIdxs.[nAdd] <- v - 1
+                    nAdd <- nAdd + 1
+                else
+                    subIdxs.[nSub] <- -v - 1
+                    nSub <- nSub + 1
+
+            let pairN = min nAdd nSub
+            let mutable p = 0
+
+            while p + 1 < pairN do
+                Accumulator.addThreatPair2At
+                    acc
+                    accOff
+                    psq
+                    psqOff
+                    sfThreatWeights
+                    sfThreatPsqt
+                    subIdxs.[p]
+                    addIdxs.[p]
+                    subIdxs.[p + 1]
+                    addIdxs.[p + 1]
+                    Accumulator.UseAvx2
+
+                p <- p + 2
+
+            if p < pairN then
+                Accumulator.addThreatPairAt acc accOff psq psqOff sfThreatWeights sfThreatPsqt subIdxs.[p] addIdxs.[p] Accumulator.UseAvx2
+
+            for i in pairN .. nAdd - 1 do
+                Accumulator.addThreatAt acc accOff psq psqOff sfThreatWeights sfThreatPsqt addIdxs.[i] 1 Accumulator.UseAvx2
+
+            for i in pairN .. nSub - 1 do
+                Accumulator.addThreatAt acc accOff psq psqOff sfThreatWeights sfThreatPsqt subIdxs.[i] -1 Accumulator.UseAvx2
+        else
+            for i in 0 .. n - 1 do
+                let v = buf.[off + i]
+                let sign, idx = if v > 0 then 1, v - 1 else -1, -v - 1
+                Accumulator.addThreatAt acc accOff psq psqOff sfThreatWeights sfThreatPsqt idx sign Accumulator.UseAvx2
 
     member private this.SfApplyFrame(pColor: Color, frame: int) =
         let acc = if pColor = White then sfAccW else sfAccB
@@ -663,11 +712,48 @@ type Position() =
         let ksqW = this.KingSquare White
         let ksqB = this.KingSquare Black
 
-        for i in 0 .. sfFrameDirtyN.[frame] - 1 do
-            let pc = sfFrameDirtyPc.[dOff + i]
-            let sq = sfFrameDirtySq.[dOff + i]
-            let sign = sfFrameDirtySign.[dOff + i]
-            Accumulator.addFeatureAt acc accOff psq psqOff sfHalfWeights sfHalfPsqt (Accumulator.makeIndex pColor pc sq ksq) sign Accumulator.UseAvx2
+        let dirtyN = sfFrameDirtyN.[frame]
+        let mutable usedDirty = 0
+
+        for i in 0 .. dirtyN - 1 do
+            if (usedDirty &&& (1 <<< i)) = 0 then
+                let pc = sfFrameDirtyPc.[dOff + i]
+                let sq = sfFrameDirtySq.[dOff + i]
+                let sign = sfFrameDirtySign.[dOff + i]
+
+                if sign < 0 then
+                    let mutable j = i + 1
+                    let mutable pair = -1
+
+                    while pair < 0 && j < dirtyN do
+                        if
+                            (usedDirty &&& (1 <<< j)) = 0
+                            && sfFrameDirtyPc.[dOff + j] = pc
+                            && sfFrameDirtySign.[dOff + j] > 0
+                        then
+                            pair <- j
+                        else
+                            j <- j + 1
+
+                    if pair >= 0 then
+                        usedDirty <- usedDirty ||| (1 <<< i) ||| (1 <<< pair)
+                        let addSq = sfFrameDirtySq.[dOff + pair]
+                        Accumulator.addFeaturePairAt
+                            acc
+                            accOff
+                            psq
+                            psqOff
+                            sfHalfWeights
+                            sfHalfPsqt
+                            (Accumulator.makeIndex pColor pc sq ksq)
+                            (Accumulator.makeIndex pColor pc addSq ksq)
+                            Accumulator.UseAvx2
+                    else
+                        usedDirty <- usedDirty ||| (1 <<< i)
+                        Accumulator.addFeatureAt acc accOff psq psqOff sfHalfWeights sfHalfPsqt (Accumulator.makeIndex pColor pc sq ksq) sign Accumulator.UseAvx2
+                else
+                    usedDirty <- usedDirty ||| (1 <<< i)
+                    Accumulator.addFeatureAt acc accOff psq psqOff sfHalfWeights sfHalfPsqt (Accumulator.makeIndex pColor pc sq ksq) sign Accumulator.UseAvx2
 
         let threatN = sfFrameThreatN.[frame]
 
@@ -734,12 +820,60 @@ type Position() =
         let ksqW = this.KingSquare White
         let ksqB = this.KingSquare Black
 
-        for i in 0 .. sfFrameDirtyN.[frame] - 1 do
-            let pc = sfFrameDirtyPc.[dOff + i]
-            let sq = sfFrameDirtySq.[dOff + i]
-            let sign = sfFrameDirtySign.[dOff + i]
-            Accumulator.addFeatureAt sfAccW accOff sfPsqW psqOff sfHalfWeights sfHalfPsqt (Accumulator.makeIndex White pc sq ksqW) sign Accumulator.UseAvx2
-            Accumulator.addFeatureAt sfAccB accOff sfPsqB psqOff sfHalfWeights sfHalfPsqt (Accumulator.makeIndex Black pc sq ksqB) sign Accumulator.UseAvx2
+        let dirtyN = sfFrameDirtyN.[frame]
+        let mutable usedDirty = 0
+
+        for i in 0 .. dirtyN - 1 do
+            if (usedDirty &&& (1 <<< i)) = 0 then
+                let pc = sfFrameDirtyPc.[dOff + i]
+                let sq = sfFrameDirtySq.[dOff + i]
+                let sign = sfFrameDirtySign.[dOff + i]
+
+                if sign < 0 then
+                    let mutable j = i + 1
+                    let mutable pair = -1
+
+                    while pair < 0 && j < dirtyN do
+                        if
+                            (usedDirty &&& (1 <<< j)) = 0
+                            && sfFrameDirtyPc.[dOff + j] = pc
+                            && sfFrameDirtySign.[dOff + j] > 0
+                        then
+                            pair <- j
+                        else
+                            j <- j + 1
+
+                    if pair >= 0 then
+                        usedDirty <- usedDirty ||| (1 <<< i) ||| (1 <<< pair)
+                        let addSq = sfFrameDirtySq.[dOff + pair]
+                        Accumulator.addFeaturePairAt
+                            sfAccW
+                            accOff
+                            sfPsqW
+                            psqOff
+                            sfHalfWeights
+                            sfHalfPsqt
+                            (Accumulator.makeIndex White pc sq ksqW)
+                            (Accumulator.makeIndex White pc addSq ksqW)
+                            Accumulator.UseAvx2
+                        Accumulator.addFeaturePairAt
+                            sfAccB
+                            accOff
+                            sfPsqB
+                            psqOff
+                            sfHalfWeights
+                            sfHalfPsqt
+                            (Accumulator.makeIndex Black pc sq ksqB)
+                            (Accumulator.makeIndex Black pc addSq ksqB)
+                            Accumulator.UseAvx2
+                    else
+                        usedDirty <- usedDirty ||| (1 <<< i)
+                        Accumulator.addFeatureAt sfAccW accOff sfPsqW psqOff sfHalfWeights sfHalfPsqt (Accumulator.makeIndex White pc sq ksqW) sign Accumulator.UseAvx2
+                        Accumulator.addFeatureAt sfAccB accOff sfPsqB psqOff sfHalfWeights sfHalfPsqt (Accumulator.makeIndex Black pc sq ksqB) sign Accumulator.UseAvx2
+                else
+                    usedDirty <- usedDirty ||| (1 <<< i)
+                    Accumulator.addFeatureAt sfAccW accOff sfPsqW psqOff sfHalfWeights sfHalfPsqt (Accumulator.makeIndex White pc sq ksqW) sign Accumulator.UseAvx2
+                    Accumulator.addFeatureAt sfAccB accOff sfPsqB psqOff sfHalfWeights sfHalfPsqt (Accumulator.makeIndex Black pc sq ksqB) sign Accumulator.UseAvx2
 
         let threatN = sfFrameThreatN.[frame]
 
@@ -820,6 +954,14 @@ type Position() =
 
     member this.SfPsqtSpan(pColor: Color) : System.Span<int> =
         this.SfEnsureComputed pColor
+        let mp = if pColor = White then sfPsqW else sfPsqB
+        System.Span<int>(mp, this.SfPsqOff sfTop, Accumulator.PsqtBuckets)
+
+    member this.SfAccSpanComputed(pColor: Color) : System.Span<int16> =
+        let m = if pColor = White then sfAccW else sfAccB
+        System.Span<int16>(m, this.SfAccOff sfTop, Accumulator.L1)
+
+    member this.SfPsqtSpanComputed(pColor: Color) : System.Span<int> =
         let mp = if pColor = White then sfPsqW else sfPsqB
         System.Span<int>(mp, this.SfPsqOff sfTop, Accumulator.PsqtBuckets)
 

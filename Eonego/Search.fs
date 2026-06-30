@@ -210,9 +210,14 @@ let private hasAnyLegalMove (pos: Position) : bool =
 /// 50-move rule applies (Rule50 >= 100) EXCEPT when it is checkmate on the 100th ply: if a legal move
 /// exists the rule holds; if none exists the node's move loop yields mate/stalemate, preserving the exception.
 let isImmediateDraw (pos: Position) : bool =
-    isRepetition pos
-    || insufficientMaterial pos
-    || (pos.Rule50 >= 100 && hasAnyLegalMove pos)
+    let rule50 = pos.Rule50
+
+    if rule50 < 4 && pos.Pieces Pawn <> 0UL then
+        false
+    else
+        isRepetition pos
+        || insufficientMaterial pos
+        || (rule50 >= 100 && hasAnyLegalMove pos)
 
 let firstLegalMove (pos: Position) : Move =
     let p = NativePtr.stackalloc<Move> MaxMoves
@@ -333,6 +338,7 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     let mutable rootScore = 0
     let mutable completedDepth = 0
     let mutable nmpMinPly = 0 // NMP allowed only at ply >= this; set during an NMP-verification region (Feature 7)
+    let mutable stopSeen = false
     member _.Id = id
     member _.IsMain = isMain
     member _.Control = control
@@ -371,6 +377,10 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
         with get () = nmpMinPly
         and set v = nmpMinPly <- v
 
+    member _.StopSeen
+        with get () = stopSeen
+        and set v = stopSeen <- v
+
     /// Rebuild this worker's Position from the immutable root (FEN + replayed moves) and reset per-search state.
     member _.SetupRoot() =
         pos.LoadFen control.RootFen
@@ -388,6 +398,21 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
         rootBest <- MoveNone
         rootScore <- 0
         completedDepth <- 0
+        stopSeen <- false
+
+let inline private pollStop (w: Worker) : bool =
+    if w.StopSeen then
+        true
+    elif (w.Nodes &&& 8191L) = 0L then
+        if w.IsMain then
+            w.Control.CheckTime w.Nodes
+
+        let stopped = w.Control.Stopped
+        if stopped then
+            w.StopSeen <- true
+        stopped
+    else
+        false
 
 let evalPos (w: Worker) (pos: Position) : int =
     match w.Control.Net with
@@ -420,13 +445,12 @@ let private updatePv (w: Worker) (ply: int) (m: Move) =
 let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: int) : int =
     w.Nodes <- w.Nodes + 1L
 
-    if w.IsMain && (w.Nodes &&& 2047L) = 0L then
-        w.Control.CheckTime w.Nodes
+    let stopNow = pollStop w
 
     if ply > w.SelDepth then
         w.SelDepth <- ply
 
-    if ply > 0 && w.Control.Stopped then
+    if ply > 0 && stopNow then
         0
     elif ply > 0 && isImmediateDraw pos then
         0
@@ -510,7 +534,7 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
                     let v = -(qsearch w pos (-beta) (-alpha) (ply + 1))
                     pos.Unmake m
 
-                    if w.Control.Stopped then
+                    if pollStop w then
                         cutoff <- true
                     else
                         if v > best then
@@ -528,7 +552,7 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
             if inCheck && movesPlayed = 0 then
                 -MATE + ply
             else
-                if useTt && not w.Control.Stopped then
+                if useTt && not (pollStop w) then
                     let bound =
                         if best <= alphaIn then BoundUpper
                         elif best >= beta then BoundLower
@@ -544,8 +568,7 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
 let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthIn: int) (ply: int) (isPv: bool) (cutNode: bool) : int =
     w.Nodes <- w.Nodes + 1L
 
-    if w.IsMain && (w.Nodes &&& 2047L) = 0L then
-        w.Control.CheckTime w.Nodes
+    let stopNow = pollStop w
 
     if ply > w.SelDepth then
         w.SelDepth <- ply
@@ -554,7 +577,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
     if isPv && ply < MaxSearchPly then
         w.Pv.[ply * MaxSearchPly] <- MoveNone
 
-    if ply > 0 && w.Control.Stopped then
+    if ply > 0 && stopNow then
         0
     elif ply > 0 && isImmediateDraw pos then
         0
@@ -656,7 +679,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
             then
                 let v = qsearch w pos alpha (alpha + 1) ply
 
-                if v <= alpha && not w.Control.Stopped then
+                if v <= alpha && not (pollStop w) then
                     result <- v
                     produced <- true
             elif
@@ -673,7 +696,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                 let v = -(negamax w pos (-beta) (-beta + 1) (depthIn - r) (ply + 1) false false)
                 pos.UnmakeNull()
 
-                if v >= beta && not w.Control.Stopped then
+                if v >= beta && not (pollStop w) then
                     // Zugzwang verification: at high depth (and not already inside a verification region),
                     // re-search the ORIGINAL position with NMP suppressed for the next few plies (NmpMinPly),
                     // and only trust the cutoff if it also fails high. NmpMinPly both bounds the verification
@@ -688,7 +711,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                         let vv = negamax w pos (beta - 1) beta (depthIn - r) ply false false
                         w.NmpMinPly <- 0
 
-                        if vv >= beta && not w.Control.Stopped then
+                        if vv >= beta && not (pollStop w) then
                             result <- clampedV
                             produced <- true
 
@@ -717,7 +740,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                 let mutable pcMp = mkProbCut pos w.Tables ttMove (probCutBeta - staticEval) pcMoves pcScores
                 let mutable pcMove = nextMove &pcMp false
 
-                while pcMove <> MoveNone && not produced && not w.Control.Stopped do
+                while pcMove <> MoveNone && not produced && not (pollStop w) do
                     let needsCheck =
                         isEnPassant pcMove
                         || fromSq pcMove = ksq
@@ -734,7 +757,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
                         pos.Unmake pcMove
 
-                        if not w.Control.Stopped && v >= probCutBeta then
+                        if not (pollStop w) && v >= probCutBeta then
                             // Trust a sufficient existing TT entry over clobbering it; else store + return v.
                             if ttHit && ttDepth >= depthIn - 3 && ttScore <> VALUE_NONE && ttScore >= probCutBeta then
                                 result <- ttScore
@@ -746,7 +769,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
                             produced <- true
 
-                    pcMove <- if produced || w.Control.Stopped then MoveNone else nextMove &pcMp false
+                    pcMove <- if produced || pollStop w then MoveNone else nextMove &pcMp false
 
         // 5. move loop
         if not produced then
@@ -890,7 +913,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                             let sv = negamax w pos (singularBeta - 1) singularBeta sDepth ply false cutNode
                             w.Stack.[ssCur].ExcludedMove <- MoveNone
 
-                            if not w.Control.Stopped && sv < singularBeta then
+                            if not (pollStop w) && sv < singularBeta then
                                 ext <- ext + (if (not isPv) && sv < singularBeta - 16 then 2 else 1)
 
                         // Cap so check + double extensions can't push newDepth past depthIn + 1.
@@ -967,7 +990,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
                         pos.Unmake m
 
-                        if w.Control.Stopped then
+                        if pollStop w then
                             cutoff <- true
                         else
                             if v > best then
@@ -1024,7 +1047,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                 // only move -> report a fail-low so the caller treats it as singular (don't store).
                 result <- (if excludedMove <> MoveNone then alpha elif inCheck then -MATE + ply else 0)
             else
-                if useTt && not w.Control.Stopped && excludedMove = MoveNone then
+                if useTt && not (pollStop w) && excludedMove = MoveNone then
                     let bound =
                         if best <= alphaIn then BoundUpper
                         elif best >= beta then BoundLower
@@ -1082,6 +1105,9 @@ let private reportInfo (w: Worker) (depth: int) (score: int) =
         else
             sb.Append(' ').Append(toUci mv) |> ignore
             i <- i + 1
+
+    if i = 0 && w.RootBest <> MoveNone then
+        sb.Append(' ').Append(toUci w.RootBest) |> ignore
 
     writeLine (sb.ToString())
 
@@ -1232,6 +1258,10 @@ let go (control: SearchControl) : Move =
 
     control.LastBest <- best
     control.LastScore <- workers.[0].RootScore
+
+    if workers.[0].CompletedDepth > 0 then
+        reportInfo workers.[0] workers.[0].CompletedDepth workers.[0].RootScore
+
     writeLine ("bestmove " + toUci best)
     best
 

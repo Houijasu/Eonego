@@ -24,6 +24,8 @@ let main argv =
     if argv.Length > 0 then
         match argv.[0] with
         | "gen" -> Eonego.Tooling.runGen argv.[1..]
+        | "lstrace" -> Eonego.Tooling.runLsTrace argv.[1..]
+        | "lsforward" -> Eonego.Tooling.runLsForward argv.[1..]
         | _ ->
             Eonego.UCI.run ()
             0

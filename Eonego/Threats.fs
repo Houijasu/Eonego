@@ -45,8 +45,11 @@ let private FileH = 0x8080808080808080UL
 let inline private sfType (sfPiece: int) = sfPiece &&& 7
 let inline private sfColor (sfPiece: int) = sfPiece >>> 3
 let inline private sfMakePiece (c: int) (sfPt: int) = (c <<< 3) + sfPt
+
+let private sfPieceOfEonego = [| 1; 2; 3; 4; 5; 6; 9; 10; 11; 12; 13; 14 |]
+
 /// Eonego piece (0..11) -> SF piece. e = color*6 + type ; SF = (color<<3) + type + 1.
-let inline private sfOfEonego (e: int) = (e / 6) * 8 + (e % 6) + 1
+let inline private sfOfEonego (e: int) = sfPieceOfEonego.[e]
 
 /// Empty-board pseudo-attacks for a SF non-pawn piece type (KNIGHT=2..KING=6).
 let inline private pseudoAttacks (sfPt: int) (sq: int) : Bitboard =
@@ -137,12 +140,9 @@ let private indexLut1 : int[] =
 
     t
 
-/// Feature index for a threat (SF make_index). `attacker`/`attacked` are SF pieces; from/to/ksq squares.
-let makeIndex (perspective: int) (attacker: int) (from: int) (too: int) (attacked: int) (ksq: int) : int =
-    let orientation = orientTbl.[ksq] ^^^ (56 * perspective)
+let inline private makeIndexOriented (orientation: int) (swap: int) (attacker: int) (from: int) (too: int) (attacked: int) : int =
     let fromO = from ^^^ orientation
     let toO = too ^^^ orientation
-    let swap = 8 * perspective
     let attackerO = attacker ^^^ swap
     let attackedO = attacked ^^^ swap
 
@@ -150,18 +150,24 @@ let makeIndex (perspective: int) (attacker: int) (from: int) (too: int) (attacke
     + offsets.[attackerO * 64 + fromO]
     + indexLut2.[(attackerO * 64 + fromO) * 64 + toO]
 
+/// Feature index for a threat (SF make_index). `attacker`/`attacked` are SF pieces; from/to/ksq squares.
+let makeIndex (perspective: int) (attacker: int) (from: int) (too: int) (attacked: int) (ksq: int) : int =
+    makeIndexOriented (orientTbl.[ksq] ^^^ (56 * perspective)) (8 * perspective) attacker from too attacked
+
 // ---------------------------------------------------------------------------
 // Active-feature enumeration (port of append_active_indices). Fills `buf`, returns count.
 // ---------------------------------------------------------------------------
 let appendActiveThreats (perspective: int) (pos: Position) (buf: int[]) : int =
     let ksq = pos.KingSquare perspective
+    let orientation = orientTbl.[ksq] ^^^ (56 * perspective)
+    let swap = 8 * perspective
     let occupied = pos.Occupied
     let allPawns = pos.Pieces Pawn
     let mutable n = 0
 
     let emit (attacker: int) (from: int) (too: int) =
         let attacked = sfOfEonego (pos.PieceOn too)
-        let idx = makeIndex perspective attacker from too attacked ksq
+        let idx = makeIndexOriented orientation swap attacker from too attacked
 
         if idx < Dimensions && n < MaxActive then
             buf.[n] <- idx
@@ -236,6 +242,8 @@ let appendActiveThreats (perspective: int) (pos: Position) (buf: int[]) : int =
 let appendActiveThreatsBoth (pos: Position) (bufW: int[]) (bufB: int[]) : int64 =
     let ksqW = pos.KingSquare White
     let ksqB = pos.KingSquare Black
+    let orientW = orientTbl.[ksqW]
+    let orientB = orientTbl.[ksqB] ^^^ 56
     let occupied = pos.Occupied
     let allPawns = pos.Pieces Pawn
     let mutable nW = 0
@@ -243,13 +251,13 @@ let appendActiveThreatsBoth (pos: Position) (bufW: int[]) (bufB: int[]) : int64 
 
     let emit (attacker: int) (from: int) (too: int) =
         let attacked = sfOfEonego (pos.PieceOn too)
-        let wIdx = makeIndex White attacker from too attacked ksqW
+        let wIdx = makeIndexOriented orientW 0 attacker from too attacked
 
         if wIdx < Dimensions && nW < MaxActive then
             bufW.[nW] <- wIdx
             nW <- nW + 1
 
-        let bIdx = makeIndex Black attacker from too attacked ksqB
+        let bIdx = makeIndexOriented orientB 8 attacker from too attacked
 
         if bIdx < Dimensions && nB < MaxActive then
             bufB.[nB] <- bIdx
@@ -317,6 +325,8 @@ let appendActiveThreatsBoth (pos: Position) (bufW: int[]) (bufB: int[]) : int64 
 let appendChangedThreatsBothAt (pos: Position) (dirty: int[]) (dirtyOff: int) (dirtyN: int) (bufW: int[]) (bufB: int[]) : int64 =
     let ksqW = pos.KingSquare White
     let ksqB = pos.KingSquare Black
+    let orientW = orientTbl.[ksqW]
+    let orientB = orientTbl.[ksqB] ^^^ 56
     let mutable nW = 0
     let mutable nB = 0
 
@@ -330,13 +340,13 @@ let appendChangedThreatsBothAt (pos: Position) (dirty: int[]) (dirtyOff: int) (d
         let attacked = sfOfEonego (Accumulator.dirtyThreatAttacked edge)
         let from = Accumulator.dirtyThreatFrom edge
         let too = Accumulator.dirtyThreatTo edge
-        let wIdx = makeIndex White attacker from too attacked ksqW
+        let wIdx = makeIndexOriented orientW 0 attacker from too attacked
 
         if wIdx < Dimensions && nW < bufW.Length then
             bufW.[nW] <- encodeSigned wIdx sign
             nW <- nW + 1
 
-        let bIdx = makeIndex Black attacker from too attacked ksqB
+        let bIdx = makeIndexOriented orientB 8 attacker from too attacked
 
         if bIdx < Dimensions && nB < bufB.Length then
             bufB.[nB] <- encodeSigned bIdx sign

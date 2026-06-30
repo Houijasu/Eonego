@@ -26,6 +26,8 @@ let private errLine (s: string) = Console.Error.WriteLine(s)
 let private usage () =
     writeLine "Eonego tooling subcommands:"
     writeLine "  gen --start <fen> --games N --out <file> --net <path> [--depth D | --nodes K] [--temp T] [--seed S] [--random-plies P] [--max-plies M]"
+    writeLine "  lstrace --in <fens> --out <trace.tsv> --net <sf.nnue> [--budget N] [--cap C]   (LearnedSearch supervised-trace generator)"
+    writeLine "  lsforward --lsnet <eongls> --in <featrows.tsv> [--out <file>]                  (EONGLS priority-net inference, for parity)"
 
 /// Hand-rolled `--key value` parser; returns a map of flag -> optional value.
 let private parseFlags (args: string[]) : Map<string, string option> =
@@ -336,3 +338,80 @@ let runGen (args: string[]) : int =
         | None ->
             errLine "gen requires --net <path> (SF NNUE file)"
             1
+
+/// LearnedSearch supervised-trace generator: run W=1 best-first (fixed priority) on each input FEN and
+/// dump per-expansion (features, leafEval, root-impact) rows for the priority-net trainer.
+let runLsTrace (args: string[]) : int =
+    let m = parseFlags args
+
+    match flag m "in", flag m "out", flag m "net" with
+    | Some inPath, Some outPath, Some netPath ->
+        match Nnue.load netPath with
+        | Nnue.Failed r ->
+            errLine ("failed to load SF net: " + r)
+            1
+        | Nnue.Loaded net ->
+            let budget = flagInt64 m "budget" 20000L
+            let cap = flagInt m "cap" 1_048_576
+            use writer = new StreamWriter(outPath, false, Encoding.UTF8)
+            writer.WriteLine("# eonego lstrace v1 NF=" + string LearnedSearch.NF + " budget=" + string budget)
+            let mutable count = 0
+
+            for line in File.ReadLines inPath do
+                let s = line.Trim()
+
+                if s.Length > 0 && not (s.StartsWith "#") then
+                    let fen = (s.Split(';').[0]).Trim()
+                    let pos = Position.OfFen fen
+                    Nnue.bindNnue net pos
+                    let tree = LearnedSearch.LsTree(cap)
+                    tree.TraceTo(pos, (fun (p: Position) -> Nnue.evalCp net p), budget, writer, fen)
+                    count <- count + 1
+
+            writer.Flush()
+            writeLine ("lstrace: traced " + string count + " positions -> " + outPath)
+            0
+    | _ ->
+        errLine "lstrace requires --in <fens> --out <trace.tsv> --net <sf.nnue> [--budget N] [--cap C]"
+        1
+
+/// EONGLS priority-net inference over feature rows (NF ints per line) — the engine side of the
+/// Python↔engine parity gate (compare to trainer/ls_intref.py on identical rows).
+let runLsForward (args: string[]) : int =
+    let m = parseFlags args
+
+    match flag m "lsnet", flag m "in" with
+    | Some lsPath, Some inPath ->
+        match LearnedSearch.loadBytes (File.ReadAllBytes lsPath) with
+        | None ->
+            errLine "failed to load EONGLS (see info string)"
+            1
+        | Some net ->
+            let sb = StringBuilder()
+            let x = Array.zeroCreate<int> LearnedSearch.NF
+
+            for line in File.ReadLines inPath do
+                let s = line.Trim()
+
+                if s.Length > 0 && not (s.StartsWith "#") then
+                    let toks = s.Split([| ' '; '\t' |], StringSplitOptions.RemoveEmptyEntries)
+
+                    if toks.Length >= LearnedSearch.NF then
+                        for i in 0 .. LearnedSearch.NF - 1 do
+                            x.[i] <-
+                                match Int32.TryParse(toks.[i], NumberStyles.Integer, inv) with
+                                | true, v -> v
+                                | _ -> 0
+
+                        sb.AppendLine(string (LearnedSearch.inferRow net x)) |> ignore
+
+            match flag m "out" with
+            | Some outPath ->
+                File.WriteAllText(outPath, sb.ToString())
+                writeLine ("lsforward: wrote " + outPath)
+            | None -> Console.Out.Write(sb.ToString())
+
+            0
+    | _ ->
+        errLine "lsforward requires --lsnet <eongls> --in <featrows.tsv> [--out <file>]"
+        1

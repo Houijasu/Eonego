@@ -54,6 +54,7 @@
     <Compile Include="MovePick.fs" />
     <Compile Include="Transposition.fs" />
     <Compile Include="Search.fs" />
+    <Compile Include="LearnedSearch.fs" />
     <Compile Include="Tooling.fs" />
     <Compile Include="UCI.fs" />
     <Compile Include="Program.fs" />
@@ -65,6 +66,12 @@
        builds embed it as before. -->
   <ItemGroup Condition="Exists('..\nets\nn-f8a759c05f9f.nnue')">
     <EmbeddedResource Include="..\nets\nn-f8a759c05f9f.nnue" LogicalName="sf16.nnue" />
+  </ItemGroup>
+
+  <!-- Embed the LearnedSearch priority net (phase_b3). Conditional/gitignored like the SF net; loaded via
+       GetManifestResourceStream("ls.lsnet") and threaded per-search (no global static). -->
+  <ItemGroup Condition="Exists('..\nets\ls.lsnet')">
+    <EmbeddedResource Include="..\nets\ls.lsnet" LogicalName="ls.lsnet" />
   </ItemGroup>
 
 </Project>

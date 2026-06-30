@@ -604,10 +604,10 @@ let evalInternal (net: SfNetwork) (pos: Position) (useAvx2: bool) (useVnni: bool
     if pos.SfActive then
         // Incremental hot path: materialize BOTH perspectives in one frame walk, then read them in place.
         pos.SfEnsureBothComputed()
-        let accW = pos.SfAccSpan White
-        let accB = pos.SfAccSpan Black
-        let psqW = pos.SfPsqtSpan White
-        let psqB = pos.SfPsqtSpan Black
+        let accW = pos.SfAccSpanComputed White
+        let accB = pos.SfAccSpanComputed Black
+        let psqW = pos.SfPsqtSpanComputed White
+        let psqB = pos.SfPsqtSpanComputed Black
         evalFromAcc net pos accW accB psqW psqB useAvx2 useVnni
     else
         // From-scratch path (tests / unbound positions): int16 accumulator (PSQT int32), built via buildAccProd.

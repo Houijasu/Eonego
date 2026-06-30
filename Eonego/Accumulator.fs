@@ -102,7 +102,7 @@ let addFeatureAt
     =
     let wb = idx * L1
 
-    if useAvx2 && Avx2.IsSupported then
+    if useAvx2 then
         // Base-ref + element-offset loads/stores skip the per-iteration array bounds checks the JIT can't elide
         // when accOff/wb are runtime values. 16 int16 lanes/iter (vpaddw/vpsubw); bit-identical to scalar.
         let accBase = &MemoryMarshal.GetArrayDataReference acc
@@ -130,6 +130,46 @@ let addFeatureAt
         let k = psqtOff + b
         psqt.[k] <- psqt.[k] + sign * ftPsqt.[pb + b]
 
+/// acc += ftWeights[addIdx] - ftWeights[subIdx]. Common real-move case: same piece moves from one square to
+/// another, so applying the remove+add as one vector pass halves accumulator load/store traffic.
+[<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+let addFeaturePairAt
+    (acc: int16[])
+    (accOff: int)
+    (psqt: int[])
+    (psqtOff: int)
+    (ftWeights: int16[])
+    (ftPsqt: int[])
+    (subIdx: int)
+    (addIdx: int)
+    (useAvx2: bool)
+    =
+    let subBase = subIdx * L1
+    let addBase = addIdx * L1
+
+    if useAvx2 then
+        let accBase = &MemoryMarshal.GetArrayDataReference acc
+        let wBase = &MemoryMarshal.GetArrayDataReference ftWeights
+        let mutable j = 0
+
+        while j < L1 do
+            let cur = Vector256.LoadUnsafe(&accBase, unativeint (accOff + j))
+            let addv = Vector256.LoadUnsafe(&wBase, unativeint (addBase + j))
+            let subv = Vector256.LoadUnsafe(&wBase, unativeint (subBase + j))
+            Vector256.StoreUnsafe(Avx2.Subtract(Avx2.Add(cur, addv), subv), &accBase, unativeint (accOff + j))
+            j <- j + 16
+    else
+        for j in 0 .. L1 - 1 do
+            let k = accOff + j
+            acc.[k] <- acc.[k] + ftWeights.[addBase + j] - ftWeights.[subBase + j]
+
+    let subPsq = subIdx * PsqtBuckets
+    let addPsq = addIdx * PsqtBuckets
+
+    for b in 0 .. PsqtBuckets - 1 do
+        let k = psqtOff + b
+        psqt.[k] <- psqt.[k] + ftPsqt.[addPsq + b] - ftPsqt.[subPsq + b]
+
 /// Zero-offset compatibility wrapper.
 [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
 let addFeature (acc: int16[]) (psqt: int[]) (ftWeights: int16[]) (ftPsqt: int[]) (idx: int) (sign: int) (useAvx2: bool) =
@@ -150,7 +190,7 @@ let addThreatAt
     =
     let wb = idx * L1
 
-    if useAvx2 && Avx2.IsSupported then
+    if useAvx2 then
         // sign-extend int8 weights to int16 (vpmovsxbw) and add/subtract 16 int16 lanes at a time; base-ref +
         // offset loads/stores skip the per-iteration bounds checks (bit-identical to the scalar form).
         let accBase = &MemoryMarshal.GetArrayDataReference acc
@@ -179,6 +219,108 @@ let addThreatAt
     for b in 0 .. PsqtBuckets - 1 do
         let k = psqtOff + b
         psqt.[k] <- psqt.[k] + sign * threatPsqt.[pb + b]
+
+/// acc += threatWeights[addIdx] - threatWeights[subIdx]. Pairs one removed and one added FullThreats row
+/// into a single accumulator pass, avoiding a second load/store of the destination accumulator.
+[<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+let addThreatPairAt
+    (acc: int16[])
+    (accOff: int)
+    (psqt: int[])
+    (psqtOff: int)
+    (threatWeights: sbyte[])
+    (threatPsqt: int[])
+    (subIdx: int)
+    (addIdx: int)
+    (useAvx2: bool)
+    =
+    let subBase = subIdx * L1
+    let addBase = addIdx * L1
+
+    if useAvx2 then
+        let accBase = &MemoryMarshal.GetArrayDataReference acc
+        let wBase = &MemoryMarshal.GetArrayDataReference threatWeights
+        let mutable j = 0
+
+        while j < L1 do
+            let cur = Vector256.LoadUnsafe(&accBase, unativeint (accOff + j))
+            let addv = Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&wBase, unativeint (addBase + j)))
+            let subv = Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&wBase, unativeint (subBase + j)))
+            Vector256.StoreUnsafe(Avx2.Subtract(Avx2.Add(cur, addv), subv), &accBase, unativeint (accOff + j))
+            j <- j + 16
+    else
+        for j in 0 .. L1 - 1 do
+            let k = accOff + j
+            acc.[k] <- acc.[k] + int16 (int threatWeights.[addBase + j] - int threatWeights.[subBase + j])
+
+    let subPsq = subIdx * PsqtBuckets
+    let addPsq = addIdx * PsqtBuckets
+
+    for b in 0 .. PsqtBuckets - 1 do
+        let k = psqtOff + b
+        psqt.[k] <- psqt.[k] + threatPsqt.[addPsq + b] - threatPsqt.[subPsq + b]
+
+/// acc += (add0 - sub0) + (add1 - sub1) for two FullThreats row pairs. This keeps the destination
+/// accumulator hot for one pass when a frame has multiple balanced threat changes.
+[<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+let addThreatPair2At
+    (acc: int16[])
+    (accOff: int)
+    (psqt: int[])
+    (psqtOff: int)
+    (threatWeights: sbyte[])
+    (threatPsqt: int[])
+    (subIdx0: int)
+    (addIdx0: int)
+    (subIdx1: int)
+    (addIdx1: int)
+    (useAvx2: bool)
+    =
+    let subBase0 = subIdx0 * L1
+    let addBase0 = addIdx0 * L1
+    let subBase1 = subIdx1 * L1
+    let addBase1 = addIdx1 * L1
+
+    if useAvx2 then
+        let accBase = &MemoryMarshal.GetArrayDataReference acc
+        let wBase = &MemoryMarshal.GetArrayDataReference threatWeights
+        let mutable j = 0
+
+        while j < L1 do
+            let cur = Vector256.LoadUnsafe(&accBase, unativeint (accOff + j))
+            let add0 = Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&wBase, unativeint (addBase0 + j)))
+            let sub0 = Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&wBase, unativeint (subBase0 + j)))
+            let add1 = Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&wBase, unativeint (addBase1 + j)))
+            let sub1 = Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&wBase, unativeint (subBase1 + j)))
+            let delta = Avx2.Subtract(Avx2.Add(add0, add1), Avx2.Add(sub0, sub1))
+            Vector256.StoreUnsafe(Avx2.Add(cur, delta), &accBase, unativeint (accOff + j))
+            j <- j + 16
+    else
+        for j in 0 .. L1 - 1 do
+            let k = accOff + j
+            acc.[k] <-
+                acc.[k]
+                + int16 (
+                    int threatWeights.[addBase0 + j]
+                    - int threatWeights.[subBase0 + j]
+                    + int threatWeights.[addBase1 + j]
+                    - int threatWeights.[subBase1 + j]
+                )
+
+    let subPsq0 = subIdx0 * PsqtBuckets
+    let addPsq0 = addIdx0 * PsqtBuckets
+    let subPsq1 = subIdx1 * PsqtBuckets
+    let addPsq1 = addIdx1 * PsqtBuckets
+
+    for b in 0 .. PsqtBuckets - 1 do
+        let k = psqtOff + b
+
+        psqt.[k] <-
+            psqt.[k]
+            + threatPsqt.[addPsq0 + b]
+            - threatPsqt.[subPsq0 + b]
+            + threatPsqt.[addPsq1 + b]
+            - threatPsqt.[subPsq1 + b]
 
 /// Zero-offset compatibility wrapper.
 [<MethodImpl(MethodImplOptions.AggressiveInlining)>]

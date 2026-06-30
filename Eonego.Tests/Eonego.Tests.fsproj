@@ -25,6 +25,7 @@
     <Compile Include="TranspositionTests.fs" />
     <Compile Include="PliesFromNullTests.fs" />
     <Compile Include="SearchTests.fs" />
+    <Compile Include="LearnedSearchTests.fs" />
     <Compile Include="DrawDetectionTests.fs" />
     <Compile Include="LazySmpTests.fs" />
     <Compile Include="ProbCutTests.fs" />
