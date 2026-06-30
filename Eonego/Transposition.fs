@@ -1,11 +1,11 @@
-/// Eonego — lock-free shared transposition table (the ONLY shared writable structure in the engine).
+/// Eonego - lock-free shared transposition table.
 ///
 /// Hyatt XOR-lockless entries: each 16-byte entry is two naturally-aligned uint64 (`Key`, `Data`) with
 /// `Key = realKey ^^^ Data`. A probe accepts an entry iff `Key ^^^ Data = realKey`; a torn read (one field
 /// written by another thread between the reader's two reads) breaks that equality and is rejected as a MISS.
-/// Aligned 64-bit reads/writes are atomic on the 64-bit runtime, so each field is individually torn-free and
-/// the XOR ties the two together. Probes are advisory: a racing or reordered read that does not reconstruct
-/// the requested key is rejected as a miss, which is acceptable for the search table.
+/// Aligned 64-bit `Volatile` reads/writes are atomic on the 64-bit runtime, so each field is torn-free
+/// individually and the XOR ties the two together. Probes are advisory: a racing or reordered read that does
+/// not reconstruct the requested key is rejected as a miss, which is acceptable for the search table.
 ///
 /// `Data` packing (LSB->MSB): move:16 | score:int16 | eval:int16 | depth:uint8 | genBound:uint8 ,
 /// where genBound = (generation5 << 3) | (ttPv << 2) | bound. generation is therefore only 5 bits
@@ -19,6 +19,7 @@
 module Eonego.Transposition
 
 open System
+open System.Threading
 open Eonego.Move
 
 [<assembly: System.Runtime.CompilerServices.InternalsVisibleTo("Eonego.Tests")>]
@@ -107,29 +108,29 @@ type TranspositionTable(mb: int) =
     /// bound, ttPv).
     member this.Probe(key: uint64) : struct (bool * Move * int * int * int * int * bool) =
         let b = this.Base key
-        let k0 = entries.[b].Key
-        let d0 = entries.[b].Data
+        let k0 = Volatile.Read(&entries.[b].Key)
+        let d0 = Volatile.Read(&entries.[b].Data)
         let gb0 = dGenBound d0
 
         if (k0 ^^^ d0) = key && (gb0 &&& 3) <> BoundNone then
             struct (true, dMove d0, dScore d0, dEval d0, dDepth d0, gb0 &&& 3, ((gb0 >>> 2) &&& 1) = 1)
         else
-            let k1 = entries.[b + 1].Key
-            let d1 = entries.[b + 1].Data
+            let k1 = Volatile.Read(&entries.[b + 1].Key)
+            let d1 = Volatile.Read(&entries.[b + 1].Data)
             let gb1 = dGenBound d1
 
             if (k1 ^^^ d1) = key && (gb1 &&& 3) <> BoundNone then
                 struct (true, dMove d1, dScore d1, dEval d1, dDepth d1, gb1 &&& 3, ((gb1 >>> 2) &&& 1) = 1)
             else
-                let k2 = entries.[b + 2].Key
-                let d2 = entries.[b + 2].Data
+                let k2 = Volatile.Read(&entries.[b + 2].Key)
+                let d2 = Volatile.Read(&entries.[b + 2].Data)
                 let gb2 = dGenBound d2
 
                 if (k2 ^^^ d2) = key && (gb2 &&& 3) <> BoundNone then
                     struct (true, dMove d2, dScore d2, dEval d2, dDepth d2, gb2 &&& 3, ((gb2 >>> 2) &&& 1) = 1)
                 else
-                    let k3 = entries.[b + 3].Key
-                    let d3 = entries.[b + 3].Data
+                    let k3 = Volatile.Read(&entries.[b + 3].Key)
+                    let d3 = Volatile.Read(&entries.[b + 3].Data)
                     let gb3 = dGenBound d3
 
                     if (k3 ^^^ d3) = key && (gb3 &&& 3) <> BoundNone then
@@ -148,8 +149,8 @@ type TranspositionTable(mb: int) =
 
         while not matched && i < ClusterSize do
             let idx = b + i
-            let k = entries.[idx].Key
-            let d = entries.[idx].Data
+            let k = Volatile.Read(&entries.[idx].Key)
+            let d = Volatile.Read(&entries.[idx].Data)
 
             if (k ^^^ d) = key && dBound d <> BoundNone then
                 slot <- idx
@@ -171,8 +172,8 @@ type TranspositionTable(mb: int) =
 
                 i <- i + 1
 
-        let ek = entries.[slot].Key
-        let ed = entries.[slot].Data
+        let ek = Volatile.Read(&entries.[slot].Key)
+        let ed = Volatile.Read(&entries.[slot].Data)
         let isMatch = (ek ^^^ ed) = key && dBound ed <> BoundNone
         // Keep the existing move when overwriting the same position with MoveNone (SF behaviour).
         let mv = if move <> MoveNone || not isMatch then move else dMove ed
@@ -186,8 +187,8 @@ type TranspositionTable(mb: int) =
         let pvOut = ttPv || (isMatch && dTtPv ed)
         let pvBit = if pvOut then 1 else 0
         let data = packData mv sc ev dpt ((generation <<< 3) ||| (pvBit <<< 2) ||| bd)
-        entries.[slot].Data <- data
-        entries.[slot].Key <- key ^^^ data
+        Volatile.Write(&entries.[slot].Data, data)
+        Volatile.Write(&entries.[slot].Key, key ^^^ data)
 
     // --- internals for the test assembly (torn-read injection / inspection) ------------------------
     member internal _.RawEntries: TtEntry[] = entries

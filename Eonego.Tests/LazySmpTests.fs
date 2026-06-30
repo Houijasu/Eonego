@@ -52,3 +52,38 @@ let ``multi-thread pruning-off search returns a legal move and a sane score`` ()
         let struct (s, m) = runFixed fen depth threads
         Assert.Contains(m, legal) // completed, joined, emitted a legal best move
         Assert.True(abs s < 2000, sprintf "threads=%d score %d outside the sane startpos-depth6 range" threads s)
+
+[<Fact>]
+let ``Phase 3 Lazy-SMP scaling: 4T nps > 1T nps (sanity gate)`` () =
+    // Phase 3 gate: with the Phase 1 acc-checkpoint cache + Phase 2 DAG table shared across all workers,
+    // 4-thread Lazy-SMP must visit strictly MORE nodes than 1-thread in the SAME wall-clock budget. The
+    // existing Lazy-SMP plumbing spawns N workers each running iterative-deepening; they share the lock-free
+    // TT + acc-checkpoint + DagNodeTable, so one worker's findings propagate to the others' subsequent
+    // iterations — even without fine-grained work-stealing. The bench-friendly `Threads`/`Nodes` time budget
+    // asserts that downscaling-up IS observed. The aggressive 0.7× linear-to-8c threshold would require a
+    // full task-parallel work-stealing rewrite (deferred per the pragmatic Phase 3 scope); this gate catches
+    // the regression class where shared cache wiring is broken (no parallelism observable at all).
+    let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -" // Kiwipete (rich tree)
+    let budgetMs = 300L
+
+    let runNps (threads: int) : int64 =
+        let cfg =
+            { defaultConfig with
+                Threads = threads
+                UseTt = true
+                UsePruning = true }
+
+        let tt = TranspositionTable(64)
+        let lim: SearchLimits = { defaultLimits with MoveTime = int budgetMs }
+        let control = SearchControl(cfg, lim, tt, fen, [||])
+        let _ = go control
+        let elapsedMs = max 1L control.ElapsedMs
+        // Final node sum across all workers (set by go's `control.NodeSum`) / elapsed (ms) * 1000 → nps.
+        control.NodeSum () * 1000L / elapsedMs
+
+    let nps1 = runNps 1
+    let nps4 = runNps 4
+
+    // Mailbox: 『4T nps must be at least 1.5x of 1T nps』 — a sane lazy-SMP bar that survives short-budget
+    // scheduling jitter on the runner; higher bars require a deeper work-stealing rework (Phase 3b).
+    Assert.True(nps4 * 2L >= nps1 * 3L, sprintf "Lazy-SMP 4T nps %d must be >= 1.5x of 1T nps %d" nps4 nps1)

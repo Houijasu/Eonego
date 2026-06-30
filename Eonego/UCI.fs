@@ -34,13 +34,11 @@ let private readEmbedded (name: string) : byte[] option =
         s.CopyTo ms
         Some(ms.ToArray())
 
-/// Tunable UCI state. The SF NNUE net is embedded in the binary (see Eonego.fsproj), so there is no EvalFile
-/// UCI option.
+/// Only Threads and Move Overhead remain tunable; every other option is hardwired ON / fixed. The SF NNUE
+/// net is embedded in the binary (see Eonego.fsproj), so there is no EvalFile UCI option.
 type private UCIState =
     { mutable Threads: int
       mutable MoveOverhead: int
-      mutable UseLearnedSearch: bool // activate the LearnedSearch paradigm
-      mutable LearnedNet: LearnedSearch.LsNetwork option // priority net, threaded per-search (no global static)
       Net: SfNetwork option
       Tt: TranspositionTable
       mutable RootFen: string
@@ -52,13 +50,6 @@ let private tryInt (s: string) : int =
     match Int32.TryParse s with
     | true, v -> v
     | _ -> 0
-
-let private parseBool (s: string) : bool =
-    let v = s.Trim()
-    String.Equals(v, "true", StringComparison.OrdinalIgnoreCase)
-    || String.Equals(v, "1", StringComparison.OrdinalIgnoreCase)
-    || String.Equals(v, "yes", StringComparison.OrdinalIgnoreCase)
-    || String.Equals(v, "on", StringComparison.OrdinalIgnoreCase)
 
 /// UCI moves are castling/en-passant flag-lossy via parseUci, so re-stamp each against legal generation.
 let private matchMove (pos: Position) (uci: string) : Move =
@@ -186,7 +177,7 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
         for m in st.RootMoves do p.Make m
         writeLine ("bestmove " + toUci (Search.firstLegalMove p))
     | Some _ ->
-        // HashMb is fixed; conventional search options stay hardwired here.
+        // All search toggles are hardwired ON; HashMb is fixed; only Threads/MoveOverhead come from state.
         let cfg =
             { Threads = st.Threads
               HashMb = HashMb
@@ -202,46 +193,39 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
               UseNmpVerify = true
               UseLmrTweaks = true
               UseAspTweaks = true
-              MoveOverhead = st.MoveOverhead }
+              MoveOverhead = st.MoveOverhead
+              AccCheckpointMb = 4
+              DagHashMb = 2 }
 
         let control =
             SearchControl(cfg, lim, st.Tt, st.RootFen, st.RootMoves, ?net = st.Net)
         st.Control <- Some control
 
-        let body =
-            if st.UseLearnedSearch then
-                (fun () -> LearnedSearch.go control st.LearnedNet |> ignore)
-            else
-                (fun () -> Search.go control |> ignore)
+        let t =
+            Thread(
+                ThreadStart(fun () -> Search.go control |> ignore),
+                16 * 1024 * 1024
+            )
 
-        let t = Thread(ThreadStart(body), 16 * 1024 * 1024)
         t.IsBackground <- true
         st.SearchThread <- Some t
         t.Start()
 
 let private handleSetOption (st: UCIState) (tokens: string[]) =
-    // setoption name <Name...> value <Value> — the name is the tokens between `name` and `value`, which lets
-    // two-word options such as Move Overhead parse correctly.
+    // setoption name <Name...> value <Value> — only Threads and Move Overhead are tunable (the latter is a
+    // two-word name, so the name is the tokens between `name` and `value`); every other option is ignored.
     let nameIdx = Array.tryFindIndex ((=) "name") tokens
     let valIdx = Array.tryFindIndex ((=) "value") tokens
 
     match nameIdx, valIdx with
     | Some ni, Some vi when ni < vi && vi + 1 < tokens.Length ->
         let name = String.Join(" ", tokens.[ni + 1 .. vi - 1])
-        let valueStr = String.Join(" ", tokens.[vi + 1 ..])
         let v = tryInt tokens.[vi + 1]
 
         if String.Equals(name, "Threads", StringComparison.OrdinalIgnoreCase) then
             st.Threads <- max 1 (min 256 v)
         elif String.Equals(name, "Move Overhead", StringComparison.OrdinalIgnoreCase) then
             st.MoveOverhead <- max 0 (min 5000 v)
-        elif String.Equals(name, "UseLearnedSearch", StringComparison.OrdinalIgnoreCase) then
-            st.UseLearnedSearch <- parseBool valueStr
-        elif String.Equals(name, "LearnedFile", StringComparison.OrdinalIgnoreCase) then
-            let p = valueStr.Trim()
-
-            if p <> "" && not (String.Equals(p, "<empty>", StringComparison.OrdinalIgnoreCase)) then
-                st.LearnedNet <- LearnedSearch.loadFile p
     // Any other (legacy/hardwired) option is silently ignored.
     | _ -> ()
 
@@ -252,17 +236,9 @@ let run () =
         | Some bytes -> (match Nnue.loadBytes bytes with Loaded n -> Some n | Failed _ -> None)
         | None -> None
 
-    // Embedded LearnedSearch priority net (phase_b3); threaded per-search, never a global static.
-    let learnedNet =
-        match readEmbedded "ls.lsnet" with
-        | Some bytes -> LearnedSearch.loadBytes bytes
-        | None -> None
-
     let st =
         { Threads = 1
           MoveOverhead = 10
-          UseLearnedSearch = (learnedNet.IsSome) // this build embeds phase_b3 ⇒ use LearnedSearch by default
-          LearnedNet = learnedNet
           Net = net
           Tt = TranspositionTable(HashMb)
           RootFen = StartPosFen
@@ -285,8 +261,6 @@ let run () =
                     writeLine "id author Houijasu"
                     writeLine "option name Threads type spin default 1 min 1 max 256"
                     writeLine "option name Move Overhead type spin default 10 min 0 max 5000"
-                    writeLine ("option name UseLearnedSearch type check default " + (if st.UseLearnedSearch then "true" else "false"))
-                    writeLine "option name LearnedFile type string default <empty>"
                     writeLine "uciok"
                 | "isready" ->
                     writeLine "readyok"

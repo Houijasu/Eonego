@@ -22,6 +22,7 @@ module Eonego.Position
 
 open System.Diagnostics
 open System.Runtime.CompilerServices
+open Eonego.AccCheckpoint
 open Eonego.Bitboard
 open Eonego.Move
 open Eonego.Zobrist
@@ -185,6 +186,11 @@ type Position() =
 
     let mutable sfActive = false
     let mutable sfTop = 0
+    // Phase 1 — optional lock-free NNUE accumulator checkpoint cache. When non-null, `SfEnsureBothComputed`
+    // consults it as a fast-path before walking the lazy frame stack, and populates it on a successful
+    // materialization. Owned by `SearchControl`, bound per-worker via `SfBindCheckpoint`; cleared via the
+    // owning table's `Clear()` between searches (NOT here — the position may outlive multiple searches).
+    let mutable sfCheckpoint: AccCheckpointTable = null
     let mutable sfAccW: int16[] = Array.empty
     let mutable sfAccB: int16[] = Array.empty
     let mutable sfPsqW: int[] = Array.empty
@@ -906,6 +912,61 @@ type Position() =
     // merged path only when the two perspectives' back-walks agree (the common no-king-move/no-overflow
     // case); falls back to the per-perspective SfEnsureComputed otherwise (byte-identical to that path).
     member this.SfEnsureBothComputed() =
+        if sfActive && not (sfComputedW.[sfTop] && sfComputedB.[sfTop]) then
+            // Phase 1 fast-path: best-effort checkpoint cache. A validated hit pays an O(1) snapshot copy
+            // instead of the O(distance) frame-delta walk below. Stored snapshots are bit-exact for any given
+            // position regardless of the make/unmake path that reached it, so a hit is provably equivalent
+            // to re-running the lazy walk.
+            let accOff = this.SfAccOff sfTop
+            let psqOff = this.SfPsqOff sfTop
+
+            let cached =
+                match sfCheckpoint with
+                | null -> false
+                | cache ->
+                    cache.TryProbe(this.Key, sfAccW, accOff, sfAccB, accOff, sfPsqW, psqOff, sfPsqB, psqOff)
+
+            if cached then
+                sfComputedW.[sfTop] <- true
+                sfComputedB.[sfTop] <- true
+            else
+                this.SfEnsureBothComputedCore()
+
+                // Best-effort populate. Checking both flags post-materialization guarantees we never cache a
+                // partial snapshot, even on the mixed-rebuild branch + the per-perspective fallback path.
+                if sfComputedW.[sfTop] && sfComputedB.[sfTop] then
+                    match sfCheckpoint with
+                    | null -> ()
+                    | cache ->
+                        cache.Store(this.Key, sfAccW, accOff, sfAccB, accOff, sfPsqW, psqOff, sfPsqB, psqOff)
+
+    /// Bind the per-worker checkpoint cache. Pass `null` to disable (tests, from-scratch eval, etc.).
+    /// `SearchControl` owns the table lifecycle; this Position merely holds a borrowed reference for the
+    /// duration of a search.
+    member _.SfBindCheckpoint(cache: AccCheckpointTable) : unit = sfCheckpoint <- cache
+
+    /// Detach the cache (no-op if already detached). Called by `SearchControl` once the search has joined to
+    /// release the worker's borrowed reference; the position can continue to be reused by tests/tools.
+    member _.SfUnbindCheckpoint() : unit = sfCheckpoint <- null
+
+    /// Unconditionally publish the current frame's computed accumulator snapshot to the bound checkpoint
+    /// cache, if any. Used by `Worker.SetupRoot` to seed the root after `EnableNnue` has already set the
+    /// `sfComputed` flags (so the early-return path inside `SfEnsureBothComputed` skips the populate).
+    /// No-op when the accumulator is inactive, the current frame is not yet materialized, or no cache is bound.
+    member this.SfSeedCheckpoint() : unit =
+        if sfActive && sfComputedW.[sfTop] && sfComputedB.[sfTop] then
+            match sfCheckpoint with
+            | null -> ()
+            | cache ->
+                let accOff = this.SfAccOff sfTop
+                let psqOff = this.SfPsqOff sfTop
+                cache.Store(this.Key, sfAccW, accOff, sfAccB, accOff, sfPsqW, psqOff, sfPsqB, psqOff)
+
+    /// Phase 1 — the unchanged frame-walk materialization used when the checkpoint cache misses (or is
+    /// null). Byte-for-byte identical to the pre-Phase-1 `SfEnsureBothComputed`; retained verbatim so that
+    /// benchmarks + parity tests can isolate Phase 1's perf contribution empirically (toggle the UCI option
+    /// `EnableAccCheckpoint` off — Phase 1 Step 5 — to route all calls through this core).
+    member private this.SfEnsureBothComputedCore() =
         if sfActive && not (sfComputedW.[sfTop] && sfComputedB.[sfTop]) then
             let mutable baseW = sfTop
             let mutable blockedW = false

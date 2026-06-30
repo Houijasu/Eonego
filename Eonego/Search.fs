@@ -1,7 +1,7 @@
-/// Eonego — alpha-beta / PVS search (Phase 3). LazySMP: N independent iterative-deepening searches, each
-/// over its OWN Position + History.Tables + stack/PV/buffers/node counter. The ONLY shared writable state
-/// is the lock-free TT plus the atomic stop flag (SearchControl); everything else is per-worker, rebuilt
-/// from the immutable root. Fail-soft. With UsePruning=false the search is plain full-window alpha-beta
+/// Eonego - alpha-beta / PVS search (Phase 3). LazySMP: N independent iterative-deepening searches, each
+/// over its OWN Position + History.Tables + stack/PV/buffers/node counter. Shared writable search state is
+/// centralized in SearchControl: stop/timing, the TT, and the optional accumulator checkpoint + DAG tables;
+/// everything else is per-worker, rebuilt from the immutable root. Fail-soft. With UsePruning=false the search is plain full-window alpha-beta
 /// (PVS/LMR/extensions/null/mate-distance/qsearch-SEE/history-writes all disabled) — the correctness oracle.
 ///
 /// AOT/F#: no printfn (Console.Out.WriteLine only); the byref-like MovePick is built per node and never
@@ -23,6 +23,8 @@ open Eonego.MoveGeneration
 open Eonego.History
 open Eonego.MovePick
 open Eonego.Transposition
+open Eonego.AccCheckpoint
+open Eonego.DagNode
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -94,7 +96,17 @@ type SearchConfig =
       UseNmpVerify: bool
       UseLmrTweaks: bool
       UseAspTweaks: bool
-      MoveOverhead: int }
+      MoveOverhead: int
+      // Phase 1: NNUE accumulator checkpoint cache. Set to 0 to disable; ~4 MiB is the recommended default
+      // (1024 slots, ~4.1 KiB/slot). Cleared per search by `SearchControl.NewSearch` (alongside the TT gen
+      // bump). Probes are best-effort lock-free (matching the TT); populates on each successful
+      // `Position.SfEnsureBothComputed` materialization.
+      AccCheckpointMb: int
+      // Phase 2: DAG node table. Set to 0 to disable; ~2 MiB is the default (the table carries in-flight
+      // partial-result + alpha/beta-window metadata the TT cannot encode). Worker search routes through the DAG
+      // claim/probe/complete lifecycle for nodes within the split-ply window; fallback to plain recursion
+      // outside that window or when the table is full.
+      DagHashMb: int }
 
 type SearchLimits =
     { MoveTime: int
@@ -124,7 +136,9 @@ let defaultConfig =
       UseNmpVerify = true
       UseLmrTweaks = true
       UseAspTweaks = true
-      MoveOverhead = 10 }
+      MoveOverhead = 10
+      AccCheckpointMb = 4
+      DagHashMb = 2 }
 
 let defaultLimits =
     { MoveTime = 0
@@ -241,26 +255,57 @@ let isLegalRoot (pos: Position) (m: Move) : bool =
         found
 
 // ---------------------------------------------------------------------------
-// Shared control: the ONLY cross-thread writable state (atomic stop flag) + clock + immutable inputs.
+// Shared control: atomically-published stop/timing plus shared best-effort caches.
 // ---------------------------------------------------------------------------
+[<Literal>]
+let private PonderIdle = 0
+
+[<Literal>]
+let private PonderBudgetStored = 1
+
+[<Literal>]
+let private PonderHitPending = 2
+
+[<Literal>]
+let private PonderArmed = 3
+
 [<Sealed>]
 type SearchControl
     (config: SearchConfig, limits: SearchLimits, tt: TranspositionTable, rootFen: string, rootMoves: Move[], ?net: SfNetwork) =
     let mutable stopFlag = 0
-    let sw = System.Diagnostics.Stopwatch()
+    let mutable startTick = System.Diagnostics.Stopwatch.GetTimestamp()
     let mutable softMs = 0L
     let mutable hardMs = 0L
     let mutable baseSoftMs = 0L // the un-scaled optimum; the per-iteration manager rescales softMs from it
     let mutable ponderSoft = 0L // real budget remembered during a ponder search; armed by PonderHit
     let mutable ponderHard = 0L
-    let mutable ponderHitPending = false // ponderhit that arrived before the search stored its budget
-    let ponderLock = obj () // guards the ponder fields, shared between the UCI thread and the search thread
+    let mutable ponderState = PonderIdle
+
+    let elapsedMs () =
+        let start = Volatile.Read(&startTick)
+        let delta = System.Diagnostics.Stopwatch.GetTimestamp() - start
+        (delta * 1000L) / System.Diagnostics.Stopwatch.Frequency
+
+    // Phase 1: per-search NNUE accumulator checkpoint cache. `null` when the config disables it (zero MiB).
+    // Owned here, bound to each worker's `Position` via `SfBindCheckpoint` in `Worker.SetupRoot`; cleared in
+    // `NewSearch` alongside `tt.newSearch`.
+    let accCheckpoint: AccCheckpointTable =
+        if config.AccCheckpointMb <= 0 then null else AccCheckpointTable(config.AccCheckpointMb)
+    // Phase 2: per-search DAG node table. `null` when disabled in config. Carries in-flight partial-result
+    // + alpha/beta-window metadata the TT cannot encode; the worker search's claim->expand->complete lifecycle
+    // routes through it (Phase 2+). Cleared per search alongside the TT and the accumulator cache.
+    let dagTable: DagNodeTable =
+        if config.DagHashMb <= 0 then null else DagNodeTable(config.DagHashMb)
     member _.Config = config
     member _.Limits = limits
     member _.Tt = tt
     member _.RootFen = rootFen
     member _.RootMoves = rootMoves
     member _.Net: SfNetwork option = net
+    /// Borrowed reference to the per-search accumulator checkpoint cache; `null` when disabled in config.
+    member _.AccCheckpoint: AccCheckpointTable = accCheckpoint
+    /// Borrowed reference to the per-search DAG node table; `null` when disabled in config.
+    member _.DagTable: DagNodeTable = dagTable
     member val LastBest: Move = MoveNone with get, set // result of the most recent go()
     member val LastScore: int = 0 with get, set
     /// Aggregate live node count across all workers (relaxed reads — reporting only, set by go()).
@@ -268,32 +313,47 @@ type SearchControl
     member _.Stopped: bool = Volatile.Read(&stopFlag) <> 0
     member _.Stop() = Volatile.Write(&stopFlag, 1)
     member _.Reset() = Volatile.Write(&stopFlag, 0)
-    member _.ElapsedMs: int64 = sw.ElapsedMilliseconds
-    member _.SoftTimeUp: bool = softMs > 0L && sw.ElapsedMilliseconds >= softMs
-    member _.BaseSoftMs: int64 = baseSoftMs
-    member _.SetSoft(v: int64) = softMs <- v
+    /// Per-search reset shared between `tt.NewSearch` and the checkpoint cache; safe to call only between
+    /// searches (no live Workers probing). `go` invokes this once before spawning workers.
+    member this.NewSearch() : unit =
+        tt.NewSearch()
+        match accCheckpoint with
+        | null -> ()
+        | cache -> cache.Clear()
+        match dagTable with
+        | null -> ()
+        | dag -> dag.NewSearch()
+    member _.ElapsedMs: int64 = elapsedMs ()
+
+    member _.SoftTimeUp: bool =
+        let soft = Volatile.Read(&softMs)
+        soft > 0L && elapsedMs () >= soft
+
+    member _.BaseSoftMs: int64 = Volatile.Read(&baseSoftMs)
+    member _.SetSoft(v: int64) = Volatile.Write(&softMs, v)
 
     member _.StartClock (soft: int64) (hard: int64) =
-        softMs <- soft
-        baseSoftMs <- soft
-        hardMs <- hard
-        sw.Restart()
+        Volatile.Write(&startTick, System.Diagnostics.Stopwatch.GetTimestamp())
+        Volatile.Write(&baseSoftMs, soft)
+        Volatile.Write(&hardMs, hard)
+        Volatile.Write(&softMs, soft)
 
     /// Ponder: search unbounded now and remember the real budget; PonderHit arms it (the clock starts then,
     /// so the time used while pondering on the opponent's clock is free). If a ponderhit already raced ahead
     /// (arrived before this stored the budget), arm immediately here.
     member this.StartClockPonder (soft: int64) (hard: int64) (ponder: bool) =
         if ponder then
-            // The lock (vs bare volatile) also closes the store-load / Dekker window if a ponderhit runs on
-            // the UCI thread at the same instant — one of the two methods always arms the budget.
-            lock ponderLock (fun () ->
-                ponderSoft <- soft
-                ponderHard <- hard
+            Volatile.Write(&ponderSoft, soft)
+            Volatile.Write(&ponderHard, hard)
+            // Start unbounded before publishing the stored-budget state; this prevents a racing PonderHit
+            // from arming the real clock only to be overwritten back to unbounded.
+            this.StartClock 0L 0L
 
-                if ponderHitPending then
+            let prev = Interlocked.CompareExchange(&ponderState, PonderBudgetStored, PonderIdle)
+
+            if prev = PonderHitPending then
+                if Interlocked.CompareExchange(&ponderState, PonderArmed, PonderHitPending) = PonderHitPending then
                     this.StartClock soft hard
-                else
-                    this.StartClock 0L 0L)
         else
             this.StartClock soft hard
 
@@ -301,15 +361,27 @@ type SearchControl
     /// search (spurious ponderhit); if the budget is not stored yet, StartClockPonder arms it when it runs.
     member this.PonderHit() =
         if limits.Ponder then
-            lock ponderLock (fun () ->
-                ponderHitPending <- true
+            let mutable done' = false
 
-                if ponderSoft > 0L || ponderHard > 0L then
-                    this.StartClock ponderSoft ponderHard)
+            while not done' do
+                let state = Volatile.Read(&ponderState)
+
+                if state = PonderIdle then
+                    done' <- Interlocked.CompareExchange(&ponderState, PonderHitPending, PonderIdle) = PonderIdle
+                elif state = PonderBudgetStored then
+                    if Interlocked.CompareExchange(&ponderState, PonderArmed, PonderBudgetStored) = PonderBudgetStored then
+                        let soft = Volatile.Read(&ponderSoft)
+                        let hard = Volatile.Read(&ponderHard)
+                        this.StartClock soft hard
+                        done' <- true
+                else
+                    done' <- true
 
     /// Main worker only: convert a time/node budget overrun into the shared stop flag.
     member _.CheckTime(nodes: int64) =
-        if (hardMs > 0L && sw.ElapsedMilliseconds >= hardMs) || (limits.Nodes > 0L && nodes >= limits.Nodes) then
+        let hard = Volatile.Read(&hardMs)
+
+        if (hard > 0L && elapsedMs () >= hard) || (limits.Nodes > 0L && nodes >= limits.Nodes) then
             Volatile.Write(&stopFlag, 1)
 
 // ---------------------------------------------------------------------------
@@ -391,6 +463,13 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
 
         for m in control.RootMoves do
             pos.Make m
+
+        // Phase 1: borrow the per-search checkpoint cache so `SfEnsureBothComputed` can probe/store snapshots
+        // during the upcoming search. `null` disables the fast-path entirely. Seed the root snapshot now —
+        // `EnableNnue` just materialized frame 0 and set the computed flags, so the early-return path inside
+        // `SfEnsureBothComputed` would otherwise skip the populate on the first eval at the root.
+        pos.SfBindCheckpoint control.AccCheckpoint
+        pos.SfSeedCheckpoint()
 
         tables.Clear()
         nodes <- 0L
@@ -605,6 +684,13 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
         let mutable ttEval = VALUE_NONE
         let mutable ttDepth = 0
         let mutable ttBound = BoundNone
+        // Phase 2: claim->expand->complete lifecycle. `dagClaim` is the table slot token returned by
+        // `TryClaim`; it must be passed back to Complete/Cancel so only the claimant can publish or release
+        // the node. The claim window is captured before alpha mutates during the move loop.
+        let mutable dagClaim = NoClaim
+        let mutable dagClaimAlpha = 0
+        let mutable dagClaimBeta = 0
+        let mutable dagCompleted = false
         // ttPv: this node is (or was) on a PV. Sticky — start from isPv, OR in a probed former-PV mark.
         let mutable ttPv = isPv
 
@@ -641,6 +727,33 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                     then
                         result <- ttScore
                         produced <- true
+
+        // 2b. DAG probe + claim (Phase 2). The DAG carries the alpha/beta-window context the TT cannot encode: a
+        // hit with `status = Done` AND `windowContains(storedAlpha, storedBeta, alpha, beta)` permits a verbatim
+        // cutoff (the original search was under a window that *contains* ours, so its bound applies here —
+        // the alpha-beta transposition soundness theorem). The TT may have a looser or unrelated bound, so
+        // the DAG can cutoff where the TT cannot. Claim is best-effort: on race/cluster-full the caller
+        // silently proceeds to plain recursion (semantically identical), exactly like a TT miss. Both the
+        // probe and the claim gate on `excludedMove = MoveNone` to avoid recording singular-extension nodes
+        // whose key is identical to a normal search's.
+        if not produced && useTt && excludedMove = MoveNone then
+            match w.Control.DagTable with
+            | null -> ()
+            | dag ->
+                let struct (st, dm, ds, da, db, dd) = dag.Probe pos.Key
+
+                if st = StatusDone && dd >= depthIn && windowContains da db alpha beta then
+                    // Mirror the TT cutoff gate: non-PV nodes only (PV nodes must re-examine the full PV
+                    // to populate `w.Pv`. The TT cutoff applies the same `not isPv` rule).
+                    if not isPv then
+                        result <- valueFromTt ds ply
+                        produced <- true
+                elif st = StatusEmpty then
+                    let claim = dag.TryClaim pos.Key alpha beta depthIn
+                    if claim <> NoClaim then
+                        dagClaim <- claim
+                        dagClaimAlpha <- alpha
+                        dagClaimBeta <- beta
 
         // 3. static eval (+ "improving": static eval higher than 2 plies ago — hoisted up so ProbCut/pruning
         //    can read it; prunes less when our position is improving)
@@ -1055,7 +1168,22 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
                     w.Control.Tt.Store pos.Key depth bound (valueToTt best ply) staticEval bestMove ttPv
 
+                    // Phase 2: publish the result under the original claimed window. `alpha` is mutated by
+                    // searched moves, so using it here would make the reusable window narrower than the
+                    // actual search window.
+                    if dagClaim <> NoClaim then
+                        match w.Control.DagTable with
+                        | null -> () // claimed against a since-disabled table; ignore
+                        | dag ->
+                            dagCompleted <-
+                                dag.Complete dagClaim pos.Key bestMove (valueToTt best ply) dagClaimAlpha dagClaimBeta depth
+
                 result <- best
+
+        if dagClaim <> NoClaim && not dagCompleted then
+            match w.Control.DagTable with
+            | null -> ()
+            | dag -> dag.Cancel(dagClaim, pos.Key) |> ignore
 
         result
 
@@ -1202,7 +1330,7 @@ let computeTimes (moveOverhead: int) (l: SearchLimits) (stm: Color) : int64 * in
 // ---------------------------------------------------------------------------
 let go (control: SearchControl) : Move =
     control.Reset()
-    control.Tt.NewSearch()
+    control.NewSearch()
     let n = max 1 control.Config.Threads
     let workers = Array.init n (fun i -> Worker(i, (i = 0), control))
 
@@ -1274,9 +1402,10 @@ let searchToDepthNet (fen: string) (rootMoves: Move[]) (depth: int) (cfg: Search
     let control =
         SearchControl(cfg, { defaultLimits with Depth = depth }, tt, fen, rootMoves, ?net = net)
 
+    control.Reset()
+    control.NewSearch()
     let w = Worker(0, true, control)
     w.SetupRoot()
-    control.Reset()
     control.StartClock 0L 0L
     let score = negamax w w.Pos (-INF) INF depth 0 true false
     struct (score, w.Nodes, w.Pv.[0])
@@ -1289,10 +1418,10 @@ let searchToNodesNet (fen: string) (rootMoves: Move[]) (nodes: int64) (cfg: Sear
     let control =
         SearchControl(cfg, limits, tt, fen, rootMoves, ?net = net)
 
+    control.Reset()
+    control.NewSearch()
     let w = Worker(0, true, control)
     w.SetupRoot()
-    control.Reset()
-    control.Tt.NewSearch()
     control.NodeSum <- (fun () -> w.Nodes)
     control.StartClock 0L 0L
     iterativeDeepening w (MaxSearchPly - 1)

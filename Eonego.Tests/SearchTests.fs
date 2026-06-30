@@ -25,6 +25,39 @@ let private makeWorker (fen: string) (cfg: SearchConfig) : Worker =
     control.StartClock 0L 0L
     w
 
+let private makePonderControl () =
+    let limits = { defaultLimits with Ponder = true }
+    SearchControl(defaultConfig, limits, TranspositionTable(1), StartPosFen, [||])
+
+[<Fact>]
+let ``ponderhit before budget storage arms remembered budget`` () =
+    let control = makePonderControl ()
+    control.PonderHit()
+    control.StartClockPonder 1000L 2000L true
+    Assert.Equal(1000L, control.BaseSoftMs)
+    Assert.False(control.SoftTimeUp)
+
+[<Fact>]
+let ``ponder search stays unbounded until ponderhit`` () =
+    let control = makePonderControl ()
+    control.StartClockPonder 1L 2L true
+    Assert.Equal(0L, control.BaseSoftMs)
+    System.Threading.Thread.Sleep(5)
+    Assert.False(control.SoftTimeUp)
+    control.PonderHit()
+    Assert.Equal(1L, control.BaseSoftMs)
+
+[<Fact>]
+let ``ponder handoff is race-safe when hit and budget storage overlap`` () =
+    for _ in 1..500 do
+        let control = makePonderControl ()
+
+        let hit = System.Threading.Tasks.Task.Run(fun () -> control.PonderHit())
+        let start = System.Threading.Tasks.Task.Run(fun () -> control.StartClockPonder 1000L 2000L true)
+
+        System.Threading.Tasks.Task.WaitAll(hit, start)
+        Assert.Equal(1000L, control.BaseSoftMs)
+
 /// Reference: exhaustive negamax (NO alpha-beta, NO TT, NO ordering) that tops each depth-0 node with the
 /// engine's OWN qsearch (full window) and uses identical draw/terminal/mate semantics. Full-window fail-soft
 /// alpha-beta must return the same score.

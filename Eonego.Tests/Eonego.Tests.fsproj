@@ -8,6 +8,7 @@
   <ItemGroup>
     <Compile Include="TestFixtures.fs" />
     <Compile Include="AccumulatorTests.fs" />
+    <Compile Include="AccCheckpointTests.fs" />
     <Compile Include="ThreatsTests.fs" />
     <Compile Include="NnueTests.fs" />
     <Compile Include="GoldenEvalTests.fs" />
@@ -23,9 +24,10 @@
     <Compile Include="MovePickTests.fs" />
     <Compile Include="MovePickProbeTests.fs" />
     <Compile Include="TranspositionTests.fs" />
+    <Compile Include="DagNodeTests.fs" />
+    <Compile Include="DagWorkQueueTests.fs" />
     <Compile Include="PliesFromNullTests.fs" />
     <Compile Include="SearchTests.fs" />
-    <Compile Include="LearnedSearchTests.fs" />
     <Compile Include="DrawDetectionTests.fs" />
     <Compile Include="LazySmpTests.fs" />
     <Compile Include="ProbCutTests.fs" />
