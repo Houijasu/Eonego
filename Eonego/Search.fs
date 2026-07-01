@@ -682,6 +682,7 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
                 if legal && not prune then
                     movesPlayed <- movesPlayed + 1
                     pos.Make m
+                    w.Control.Tt.Prefetch pos.Key // child probes this exact key at entry
                     let v = -(qsearch w pos (-beta) (-alpha) (ply + 1))
                     pos.Unmake m
 
@@ -878,6 +879,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                 w.Stack.[ssCur].CurrentMove <- MoveNull
                 w.Stack.[ssCur].MovedPiece <- NoPiece
                 pos.MakeNull()
+                w.Control.Tt.Prefetch pos.Key // child probes this exact key at entry
                 let v = -(negamax w pos (-beta) (-beta + 1) (depthIn - r) (ply + 1) false false)
                 pos.UnmakeNull()
 
@@ -935,6 +937,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                         w.Stack.[ssCur].CurrentMove <- pcMove
                         w.Stack.[ssCur].MovedPiece <- pos.PieceOn(fromSq pcMove)
                         pos.Make pcMove
+                        w.Control.Tt.Prefetch pos.Key // child probes this exact key at entry
                         let mutable v = -(qsearch w pos (-probCutBeta) (-probCutBeta + 1) (ply + 1))
 
                         if v >= probCutBeta then
@@ -1161,6 +1164,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                             nQuiets <- nQuiets + 1
 
                         pos.Make m
+                        w.Control.Tt.Prefetch pos.Key // child probes this exact key at entry
                         let mutable v = 0
 
                         if moveCount = 1 then

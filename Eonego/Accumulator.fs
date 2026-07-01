@@ -342,6 +342,11 @@ let addThreat (acc: int16[]) (psqt: int[]) (threatWeights: sbyte[]) (threatPsqt:
 // frame materialization, finny-entry -> frame fold).
 // ---------------------------------------------------------------------------
 
+// NOTE (2026-07-02): a threat weight-row prefetch at index-gather time (Sse.Prefetch1 of the row head,
+// issued in EnsureChangedThreats for both perspectives) was implemented and A/B-measured NEUTRAL at
+// depth-14/15 benches (A 431-436k vs B 414-429k nps means, inside the thermal noise band) — the hot rows
+// of the ~60 MB threat table fit L3 in that regime. Reverted; retry only with long-TC evidence.
+
 /// Max weight rows folded into one accumulator pass. Larger row sets are split into multiple passes
 /// (first pass src->dst, remainder in-place on dst): L2 hardware prefetchers track only ~16-32 streams,
 /// and each pass adds just 4 KB of L1-resident accumulator traffic. Benchmark knob.

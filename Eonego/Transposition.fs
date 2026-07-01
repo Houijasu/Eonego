@@ -16,10 +16,12 @@
 /// Probe/Store are lock-free and best-effort under concurrency, but MUST NOT run concurrently with
 /// Resize/Clear — the UCI driver guarantees this by stopping+joining any active search before setoption
 /// Hash / ucinewgame.
+#nowarn "9" // NativePtr/fixed in Prefetch (address-of only; never dereferenced from managed code)
 module Eonego.Transposition
 
 open System
 open System.Threading
+open Microsoft.FSharp.NativeInterop
 open Eonego.Move
 
 [<assembly: System.Runtime.CompilerServices.InternalsVisibleTo("Eonego.Tests")>]
@@ -103,6 +105,15 @@ type TranspositionTable(mb: int) =
 
     /// Size in MiB actually allocated.
     member _.SizeMb: int = (entries.Length * 16) / (1024 * 1024)
+
+    /// Prefetch the cluster for `key` into L1 (its 4 entries = one 64 B cache line). Called by the search
+    /// right after Make, before descending — the child probes this exact key at entry, and the random-index
+    /// TT load is otherwise a guaranteed cache miss stall. No-op on non-SSE hardware (constant-folded).
+    member this.Prefetch(key: uint64) : unit =
+        if System.Runtime.Intrinsics.X86.Sse.IsSupported then
+            let b = this.Base key
+            use p = fixed &entries.[b].Key
+            System.Runtime.Intrinsics.X86.Sse.Prefetch0(NativePtr.toVoidPtr p)
 
     /// Approximate occupancy in permille for `info hashfull`, sampled over the first 1000 clusters.
     /// Counts only entries written during the current generation (the conventional definition), so the
