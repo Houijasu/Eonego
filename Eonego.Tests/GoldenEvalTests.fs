@@ -71,7 +71,7 @@ let private golden: int list =
 [<Fact>]
 let ``golden evalInternal is stable across perf phases`` () =
     withNet (fun net ->
-        let vals = fens |> List.map (fun fen -> evalInternal net (Position.OfFen fen) UseAvx2 UseVnni)
+        let vals = fens |> List.map (fun fen -> evalInternal net (Position.OfFen fen) UseAvx2 UseVnni UseSparse)
 
         if golden.Length = vals.Length then
             Assert.Equal<int list>(golden, vals)

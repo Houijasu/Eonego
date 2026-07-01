@@ -79,10 +79,23 @@ let UseVnni =
     && Environment.GetEnvironmentVariable("EONEGO_FORCE_SCALAR") <> "1"
     && Environment.GetEnvironmentVariable("EONEGO_FORCE_NOVNNI") <> "1"
 
+/// Sparse fc0 propagation: the FT's squared-clipped pairwise products are mostly ZERO, so fc0 skips input
+/// chunks (4 u8 inputs) whose dword is zero, using an nnz bitset recorded while the FT output is written.
+/// Requires AVX2 (the sparse kernel broadcasts dwords); EONEGO_FORCE_DENSE=1 forces the dense GEMV so
+/// dense==sparse parity can be asserted in one process. Bit-exact by construction: zero chunks contribute
+/// exactly 0 and int32 accumulation order is irrelevant.
+let UseSparse =
+    Avx2.IsSupported
+    && Environment.GetEnvironmentVariable("EONEGO_FORCE_SCALAR") <> "1"
+    && Environment.GetEnvironmentVariable("EONEGO_FORCE_DENSE") <> "1"
+
 /// One per-bucket fc stack: fc0 (L1->32), fc1 (62->32), fc2 (32->1). Weights int8 (natural [out][padded_in]),
-/// biases int32.
+/// biases int32. `Fc0WSparse` is the load-time chunk-scrambled copy of Fc0W for the sparse kernel: input
+/// chunk c (4 inputs) stores all 32 outputs' 4 weights contiguously (128 B per chunk), so one nnz chunk =
+/// one dword broadcast + four 32 B weight loads.
 type LayerStack =
-    { Fc0W: sbyte[] // Fc0Out * L1
+    { Fc0W: sbyte[] // Fc0Out * L1  (natural [out][in] — dense kernel + scalar oracle)
+      Fc0WSparse: sbyte[] // (L1/4) * (Fc0Out*4)  (chunk-scrambled — sparse kernel)
       Fc0B: int[] // Fc0Out
       Fc1W: sbyte[] // Fc1Out * Fc1In
       Fc1B: int[] // Fc1Out
@@ -227,7 +240,16 @@ let private readStack (c: Cursor) : LayerStack =
     let fc2b = readI32 c 1
     let fc2w = readI8 c (1 * Fc2In)
 
+    // Chunk-scramble for the sparse kernel: sparse[c*128 + o*4 + j] = dense[o*L1 + c*4 + j].
+    let fc0wSparse = Array.zeroCreate<sbyte> (Fc0Out * L1)
+
+    for o in 0 .. Fc0Out - 1 do
+        for ch in 0 .. L1 / 4 - 1 do
+            for j in 0 .. 3 do
+                fc0wSparse.[ch * (Fc0Out * 4) + o * 4 + j] <- fc0w.[o * L1 + ch * 4 + j]
+
     { Fc0W = fc0w
+      Fc0WSparse = fc0wSparse
       Fc0B = fc0b
       Fc1W = fc1w
       Fc1B = fc1b
@@ -382,27 +404,43 @@ let private ftClampProd16 (acc: Span<int16>) (k: int) : Vector256<int16> =
 
 /// Narrow 32 FT products from `acc` (offset `off`) to 32 linear-order bytes at `ft[dst]`. One vpackuswb packs
 /// the two int16 halves (bytes [a0-7,b0-7,a8-15,b8-15]); vpermq 0xD8 (qwords 0,2,1,3) restores linear order.
+/// Also records the block's nnz mask: bit k of `nnz[dst/32]` = 1 iff dword k of the stored 32 bytes is
+/// nonzero (the sparse fc0 chunk granularity) — two extra ops per 32 outputs.
 [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-let private ftNarrow32 (ft: Span<byte>) (acc: Span<int16>) (off: int) (dst: int) =
+let private ftNarrow32 (ft: Span<byte>) (nnz: Span<byte>) (acc: Span<int16>) (off: int) (dst: int) =
     let packed = Avx2.PackUnsignedSaturate(ftClampProd16 acc off, ftClampProd16 acc (off + 16))
+    let final = Avx2.Permute4x64(packed.AsInt64(), 0xD8uy).AsByte()
     let ftBase = &MemoryMarshal.GetReference ft
-    Vector256.StoreUnsafe(Avx2.Permute4x64(packed.AsInt64(), 0xD8uy).AsByte(), &ftBase, unativeint dst)
+    Vector256.StoreUnsafe(final, &ftBase, unativeint dst)
+    // vpcmpeqd vs zero -> movmskps: bit k set for ZERO dword k; invert to get nonzero chunks.
+    let zeroMask = Avx.MoveMask(Avx2.CompareEqual(final.AsInt32(), Vector256<int>.Zero).AsSingle())
+    nnz.[dst >>> 5] <- byte (~~~zeroMask &&& 0xFF)
 
 /// Feature-transformer pairwise product into a u8 buffer: ft[j] = clamp(a,0,255)*clamp(b,0,255)/512.
 /// AVX2: clamp via Min/Max, vpmulld, >>9, narrow to byte. Bit-exact with scalar (product <= 65025, /512).
-let private ftProductInto (accUs: Span<int16>) (accThem: Span<int16>) (ft: Span<byte>) (useAvx2: bool) =
+/// `nnz` (L1/32 = 32 bytes) receives one nonzero-dword mask byte per 32-byte output block (see ftNarrow32);
+/// both paths fill it so the sparse fc0 kernel can be paired with either FT path.
+let private ftProductInto (accUs: Span<int16>) (accThem: Span<int16>) (ft: Span<byte>) (nnz: Span<byte>) (useAvx2: bool) =
     if useAvx2 then
         // 32 u8 outputs/iter via ftNarrow32 (vpackusdw x2 -> vpackuswb -> vpermd). Half (512) is a multiple of 32.
         let mutable j = 0
 
         while j < Half do
-            ftNarrow32 ft accUs j j
-            ftNarrow32 ft accThem j (Half + j)
+            ftNarrow32 ft nnz accUs j j
+            ftNarrow32 ft nnz accThem j (Half + j)
             j <- j + 32
     else
         for j in 0 .. Half - 1 do
             ft.[j] <- byte ((clampFt (int accUs.[j]) * clampFt (int accUs.[j + Half])) / 512)
             ft.[Half + j] <- byte ((clampFt (int accThem.[j]) * clampFt (int accThem.[j + Half])) / 512)
+
+        for c in 0 .. L1 / 4 - 1 do
+            let b = c * 4
+
+            if (int ft.[b] ||| int ft.[b + 1] ||| int ft.[b + 2] ||| int ft.[b + 3]) <> 0 then
+                nnz.[c >>> 3] <- nnz.[c >>> 3] ||| byte (1 <<< (c &&& 7))
+            else
+                nnz.[c >>> 3] <- nnz.[c >>> 3] &&& ~~~(byte (1 <<< (c &&& 7)))
 
 /// fc_0 GEMV (1024 -> 32): vpmaddubsw(u8 ft, i8 w) -> i16 pairs, vpmaddwd(_, ones) -> i32. Bit-exact:
 /// max |ft|*|w|*2 = 126*127*2 = 32004 < 32767 (no i16 saturation); int32 accumulation order-independent.
@@ -479,6 +517,56 @@ let private fc0Gemv (ft: Span<byte>) (fc0w: sbyte[]) (fc0b: int[]) (fc0: Span<in
                 s <- s + int fc0w.[wb + j] * int ft.[j]
 
             fc0.[o] <- s
+
+/// Sparse fc_0 GEMV (1024 -> 32): process ONLY the nonzero 4-input chunks recorded in `nnz` by the FT step.
+/// Post-ReLU-squared FT activations are mostly zero (~80-90%), so this replaces the dense 32x1024 GEMV with
+/// ~dozens of chunk updates. Per nnz chunk c: vpbroadcastd ft dword c, then one vpdpbusd (VNNI) or
+/// vpmaddubsw+vpmaddwd (AVX2) against the 4 chunk-scrambled weight rows (32 outputs x 4 B = 128 B), into 4
+/// int32 ymm accumulators (outputs 0..7 / 8..15 / 16..23 / 24..31). Bit-exact vs the dense kernel: skipped
+/// chunks contribute exactly 0, int32 accumulation is order-independent, and the AVX2 pair product bound
+/// (127*128*2 = 32512 < 32767) rules out i16 saturation exactly as in the dense path.
+let private fc0GemvSparse
+    (ft: Span<byte>)
+    (nnz: Span<byte>)
+    (fc0wSparse: sbyte[])
+    (fc0b: int[])
+    (fc0: Span<int>)
+    (useVnni: bool)
+    =
+    let ftInts = MemoryMarshal.Cast<byte, int>(ft) // dword view: chunk c = ft[4c..4c+3]
+    let nnzWords = MemoryMarshal.Cast<byte, uint64>(nnz) // 4 x 64 chunks
+    let wBase = &MemoryMarshal.GetArrayDataReference fc0wSparse
+    let mutable a0 = Vector256<int>.Zero
+    let mutable a1 = Vector256<int>.Zero
+    let mutable a2 = Vector256<int>.Zero
+    let mutable a3 = Vector256<int>.Zero
+
+    for w in 0 .. 3 do
+        let mutable bits = nnzWords.[w]
+
+        while bits <> 0UL do
+            let c = (w <<< 6) + System.Numerics.BitOperations.TrailingZeroCount bits
+            bits <- bits &&& (bits - 1UL)
+            let u = Vector256.Create(ftInts.[c]).AsByte()
+            let rb = c * (Fc0Out * 4)
+
+            if useVnni then
+                a0 <- AvxVnni.MultiplyWideningAndAdd(a0, u, (Vector256.LoadUnsafe(&wBase, unativeint rb): Vector256<sbyte>))
+                a1 <- AvxVnni.MultiplyWideningAndAdd(a1, u, (Vector256.LoadUnsafe(&wBase, unativeint (rb + 32)): Vector256<sbyte>))
+                a2 <- AvxVnni.MultiplyWideningAndAdd(a2, u, (Vector256.LoadUnsafe(&wBase, unativeint (rb + 64)): Vector256<sbyte>))
+                a3 <- AvxVnni.MultiplyWideningAndAdd(a3, u, (Vector256.LoadUnsafe(&wBase, unativeint (rb + 96)): Vector256<sbyte>))
+            else
+                a0 <- Avx2.Add(a0, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u, (Vector256.LoadUnsafe(&wBase, unativeint rb): Vector256<sbyte>)), VOnes16))
+                a1 <- Avx2.Add(a1, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u, (Vector256.LoadUnsafe(&wBase, unativeint (rb + 32)): Vector256<sbyte>)), VOnes16))
+                a2 <- Avx2.Add(a2, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u, (Vector256.LoadUnsafe(&wBase, unativeint (rb + 64)): Vector256<sbyte>)), VOnes16))
+                a3 <- Avx2.Add(a3, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u, (Vector256.LoadUnsafe(&wBase, unativeint (rb + 96)): Vector256<sbyte>)), VOnes16))
+
+    let bBase = &MemoryMarshal.GetArrayDataReference fc0b
+    let oBase = &MemoryMarshal.GetReference fc0
+    Vector256.StoreUnsafe(Avx2.Add(a0, Vector256.LoadUnsafe(&bBase, 0un)), &oBase, 0un)
+    Vector256.StoreUnsafe(Avx2.Add(a1, Vector256.LoadUnsafe(&bBase, 8un)), &oBase, 8un)
+    Vector256.StoreUnsafe(Avx2.Add(a2, Vector256.LoadUnsafe(&bBase, 16un)), &oBase, 16un)
+    Vector256.StoreUnsafe(Avx2.Add(a3, Vector256.LoadUnsafe(&bBase, 24un)), &oBase, 24un)
 
 /// fc_1 GEMV (64 -> 32) over u8 activations: same vpmaddubsw/vpmaddwd pattern as fc0Gemv. Bit-exact: conc in
 /// [0,127], w in [-128,127] => |pair| <= 127*128*2 = 32512 < 32767 (no i16 saturation); int32 sum is
@@ -567,6 +655,7 @@ let private evalFromAcc
     (psqB: Span<int>)
     (useAvx2: bool)
     (useVnni: bool)
+    (useSparse: bool)
     : int =
     let stm = pos.SideToMove
     let accUs = if stm = White then accW else accB
@@ -589,10 +678,17 @@ let private evalFromAcc
     let fc1 = Span<int>(NativePtr.toVoidPtr fc1Ptr, Fc1Out)
     let a1Ptr = NativePtr.stackalloc<byte> Fc2In
     let a1 = Span<byte>(NativePtr.toVoidPtr a1Ptr, Fc2In)
+    let nnzPtr = NativePtr.stackalloc<byte> (L1 / 32)
+    let nnz = Span<byte>(NativePtr.toVoidPtr nnzPtr, L1 / 32)
 
-    // Feature transformer (u8 ft) + fc_0 GEMV (1024 -> 32).
-    ftProductInto accUs accThem ft useAvx2
-    fc0Gemv ft stack.Fc0W stack.Fc0B fc0 useAvx2 useVnni
+    // Feature transformer (u8 ft, nnz chunk masks) + fc_0 (1024 -> 32): sparse chunk-skipping kernel when
+    // enabled (requires AVX2 for the dword broadcasts), else the dense GEMV.
+    ftProductInto accUs accThem ft nnz useAvx2
+
+    if useSparse then
+        fc0GemvSparse ft nnz stack.Fc0WSparse stack.Fc0B fc0 useVnni
+    else
+        fc0Gemv ft stack.Fc0W stack.Fc0B fc0 useAvx2 useVnni
 
     // conc: sqr(fc0[0..30]) in [0..30], lin(fc0[0..30]) in [31..61], [62..63]=0. fc0[31] is skip-only.
     for o in 0 .. 30 do
@@ -624,7 +720,7 @@ let private evalFromAcc
     (125 * psqtV + 131 * posV) / 128
 
 [<System.Runtime.CompilerServices.SkipLocalsInit>]
-let evalInternal (net: Network) (pos: Position) (useAvx2: bool) (useVnni: bool) : int =
+let evalInternal (net: Network) (pos: Position) (useAvx2: bool) (useVnni: bool) (useSparse: bool) : int =
     if pos.Active then
         // Incremental hot path: materialize BOTH perspectives in one frame walk, then read them in place.
         pos.EnsureBothComputed()
@@ -632,7 +728,7 @@ let evalInternal (net: Network) (pos: Position) (useAvx2: bool) (useVnni: bool) 
         let accB = pos.AccSpanComputed Black
         let psqW = pos.PsqtSpanComputed White
         let psqB = pos.PsqtSpanComputed Black
-        evalFromAcc net pos accW accB psqW psqB useAvx2 useVnni
+        evalFromAcc net pos accW accB psqW psqB useAvx2 useVnni useSparse
     else
         // From-scratch path (tests / unbound positions): int16 accumulator (PSQT int32), built via buildAccProd.
         let accWP = NativePtr.stackalloc<int16> L1
@@ -646,11 +742,11 @@ let evalInternal (net: Network) (pos: Position) (useAvx2: bool) (useVnni: bool) 
 
         buildAccProd net pos White accW psqW
         buildAccProd net pos Black accB psqB
-        evalFromAcc net pos accW accB psqW psqB useAvx2 useVnni
+        evalFromAcc net pos accW accB psqW psqB useAvx2 useVnni useSparse
 
 /// Side-to-move-relative centipawns, clamped to +/-EvalMax.
 let evalCp (net: Network) (pos: Position) : int =
-    let cp = int (int64 (evalInternal net pos UseAvx2 UseVnni) * 100L / int64 NormalizeToPawnValue)
+    let cp = int (int64 (evalInternal net pos UseAvx2 UseVnni UseSparse) * 100L / int64 NormalizeToPawnValue)
     max -EvalMax (min EvalMax cp)
 
 /// Bind the net into the Position's incremental accumulator (root only). The threat enumerator is passed as

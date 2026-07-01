@@ -501,7 +501,7 @@ type EvalBench() =
     [<Benchmark>]
     member _.ForwardAvx2() =
         match net with
-        | Some n -> evalInternal n bound true false
+        | Some n -> evalInternal n bound true false false
         | None -> 0
 
     /// Forward pass via the AVX-VNNI (vpdpbusd) GEMV path. Compare to ForwardAvx2 IN THE SAME RUN (cross-run
@@ -509,7 +509,7 @@ type EvalBench() =
     [<Benchmark>]
     member _.ForwardVnni() =
         match net with
-        | Some n -> evalInternal n bound true true
+        | Some n -> evalInternal n bound true true UseSparse
         | None -> 0
 
     /// Pure make-time threat tracking (UpdatePieceThreats / RayBeyond + dirty recording), no eval.

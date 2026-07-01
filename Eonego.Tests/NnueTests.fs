@@ -347,11 +347,14 @@ let ``forward AVX2 path equals scalar path bit-exactly`` () =
                   "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1" ] // sparse endgame
 
             let rec walk (b: Position) (depth: int) =
-                let scalar = evalInternal net b false false
-                Assert.Equal(scalar, evalInternal net b true false) // scalar == AVX2
+                let scalar = evalInternal net b false false false
+                Assert.Equal(scalar, evalInternal net b true false false) // scalar == AVX2 dense
+                Assert.Equal(scalar, evalInternal net b true false true) // scalar == AVX2 sparse fc0
+                Assert.Equal(scalar, evalInternal net b false false true) // scalar FT + sparse fc0
 
                 if System.Runtime.Intrinsics.X86.AvxVnni.IsSupported then
-                    Assert.Equal(scalar, evalInternal net b true true) // scalar == AVX2 + VNNI (vpdpbusd)
+                    Assert.Equal(scalar, evalInternal net b true true false) // scalar == VNNI dense
+                    Assert.Equal(scalar, evalInternal net b true true true) // scalar == VNNI sparse fc0
 
                 if depth > 0 then
                     for m in collectLegal b do
