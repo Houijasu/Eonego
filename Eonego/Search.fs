@@ -149,7 +149,7 @@ let defaultConfig =
       UseAspTweaks = true
       MoveOverhead = 10
       AccCheckpointMb = 0
-      DagHashMb = 2
+      DagHashMb = 0
       UseWorkQueue = false
       MultiPv = 1 }
 

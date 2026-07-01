@@ -202,10 +202,12 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
               UseAspTweaks = true
               MoveOverhead = st.MoveOverhead
               AccCheckpointMb = 0
-              // DAG node table only for SMP: at Threads=1 it measurably costs nps (~4-5%) AND inflated the
-              // search tree (+15% nodes on the audit midgame; DAG-off tree == pre-DAG tree exactly). Its SMP
-              // value is unproven pending an SPRT-style match — see the 2026-07-01 audit.
-              DagHashMb = (if st.Threads > 1 then 2 else 0)
+              // DAG node table disabled at every thread count: at 1T it measurably cost nps (~4-5%) AND
+              // inflated the tree (+15% nodes on the audit midgame); at SMP it probes+CASes every interior
+              // node without the ABDADA-style deferral (StatusExpanding is never acted on) that would let it
+              // pay for itself — and 8T time-to-depth measured at parity with 1T (2026-07-02 audit). Turn it
+              // back on only behind an SPRT-style match result.
+              DagHashMb = 0
               UseWorkQueue = st.UseWorkQueue
               MultiPv = st.MultiPv }
 
