@@ -1565,7 +1565,10 @@ let iterativeDeepeningRootPar (w: Worker) (maxDepth: int) (barrier: Threading.Ba
                 alpha <- score
                 prev <- score
                 w.RootScore <- score
-                w.RootBest <- w.Pv.[0]
+                // NOT w.Pv.[0]: root-par searches at ply 1, so PV row 0 is never written — reading it
+                // left RootBest = MoveNone whenever the incumbent stayed best, and go() then fell back
+                // to the first generated legal move (see the LazySmpTests regression test).
+                w.RootBest <- rootMoves.[0]
                 w.CompletedDepth <- depth
                 w.Control.SetSharedRootAlpha alpha
 
@@ -1611,9 +1614,12 @@ let iterativeDeepeningRootPar (w: Worker) (maxDepth: int) (barrier: Threading.Ba
                     let struct (hit, _, sc, _, dp, bd, _) = w.Control.Tt.Probe rootKeys.[i]
 
                     if hit && dp >= depth - 1 then
-                        let score = valueFromTt sc 1
+                        // The entry belongs to the position AFTER rootMoves.[i] (opponent to move): its
+                        // score is from the OPPONENT's perspective, so the root move is worth -score —
+                        // and the root move failing HIGH is the child failing LOW (BoundUpper).
+                        let score = -(valueFromTt sc 1)
 
-                        if (bd = BoundLower || bd = BoundExact) && score > alpha then
+                        if (bd = BoundUpper || bd = BoundExact) && score > alpha then
                             w.Pos.Make rootMoves.[i]
                             let v = -(negamax w w.Pos (-INF) (-alpha) (max 1 (depth - 1)) 1 true false)
                             w.Pos.Unmake rootMoves.[i]
