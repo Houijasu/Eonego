@@ -104,6 +104,22 @@ type TranspositionTable(mb: int) =
     /// Size in MiB actually allocated.
     member _.SizeMb: int = (entries.Length * 16) / (1024 * 1024)
 
+    /// Approximate occupancy in permille for `info hashfull`, sampled over the first 1000 clusters.
+    /// Counts only entries written during the current generation (the conventional definition), so the
+    /// number resets naturally each search. Racy relaxed reads are fine — this is reporting only.
+    member _.Hashfull() : int =
+        let sample = min 1000 (entries.Length / ClusterSize)
+        let mutable cnt = 0
+
+        for c in 0 .. sample - 1 do
+            for i in 0 .. ClusterSize - 1 do
+                let d = Volatile.Read(&entries.[c * ClusterSize + i].Data)
+
+                if dBound d <> BoundNone && dGen d = generation then
+                    cnt <- cnt + 1
+
+        cnt * 1000 / (sample * ClusterSize)
+
     /// XOR-validated probe. Returns struct(hit, move, score(raw — caller applies valueFromTt), eval, depth,
     /// bound, ttPv).
     member this.Probe(key: uint64) : struct (bool * Move * int * int * int * int * bool) =

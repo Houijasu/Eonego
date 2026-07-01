@@ -36,6 +36,15 @@ let AllPieces = 6 // index of the full-occupancy bitboard inside byTypeBB
 [<Literal>]
 let MaxPly = 1024 // undo-stack depth (search depth << this; Debug.Assert-guarded)
 
+/// Absolute accumulator-stack depth cap. A node whose `stPly` (root moves already played + search ply from
+/// root) reaches this MUST NOT enter its body / Make a child, or `Position.BeginFrame` overflows the
+/// `AccMaxPly`-sized per-frame arrays. The search's RELATIVE `ply` cap (`Search.MaxSearchPly`) alone is
+/// insufficient when the root position carries many played moves (UCI `position ... moves m1 m2 ...`), since
+/// `stPly = ply + rootMoveCount` and the accumulator frames are indexed by the ABSOLUTE `top`/`stPly`.
+/// MUST stay `<= AccMaxPly - 1` (the type-private `AccMaxPly` is 256); kept at 255 for a tight, safe bound.
+[<Literal>]
+let AccStackLimit = 255
+
 [<Literal>]
 let StartPosFen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 
@@ -1136,6 +1145,7 @@ type Position() =
     // Plies since the last null move (search-only; bounds the null-safe repetition walk). Mirrors Rule50.
     member _.PliesFromNull: int = let st = &states.[stPly] in st.PliesFromNull
     member _.Key: uint64 = let st = &states.[stPly] in st.Key
+    member _.StPly: int = stPly
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member _.CanCastle(right: int) : bool =

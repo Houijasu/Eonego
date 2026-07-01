@@ -25,6 +25,7 @@ open Eonego.MovePick
 open Eonego.Transposition
 open Eonego.AccCheckpoint
 open Eonego.DagNode
+open Eonego.DagWorkQueue
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -106,7 +107,17 @@ type SearchConfig =
       // partial-result + alpha/beta-window metadata the TT cannot encode). Worker search routes through the DAG
       // claim/probe/complete lifecycle for nodes within the split-ply window; fallback to plain recursion
       // outside that window or when the table is full.
-      DagHashMb: int }
+      DagHashMb: int
+      // Phase 3: root-move work distribution via the Vyukov MPMC work queue. OFF (default) = classic LazySMP
+      // (every worker independently searches the full tree, sharing only via TT/DAG). ON = root parallelism:
+      // the main worker searches the best root move (full PVS window) and pushes the rest to a shared
+      // DagWorkQueue; all workers pop root moves and search them with null windows. The TT carries the
+      // results back to the main worker's collection phase. Falls back to LazySMP when Threads <= 1.
+      UseWorkQueue: bool
+      // Number of principal variations to report (UCI MultiPV). 1 = classic single-PV search. >1 makes the
+      // main worker search each root line with the previous lines' best moves excluded at the root; helpers
+      // always run single-PV. Forces the classic LazySMP path (no root-move work queue).
+      MultiPv: int }
 
 type SearchLimits =
     { MoveTime: int
@@ -138,7 +149,9 @@ let defaultConfig =
       UseAspTweaks = true
       MoveOverhead = 10
       AccCheckpointMb = 0
-      DagHashMb = 2 }
+      DagHashMb = 2
+      UseWorkQueue = false
+      MultiPv = 1 }
 
 let defaultLimits =
     { MoveTime = 0
@@ -239,6 +252,11 @@ let firstLegalMove (pos: Position) : Move =
     let n = generateLegal pos buf
     if n > 0 then buf.[0] else MoveNone
 
+let private countLegalMoves (pos: Position) : int =
+    let p = NativePtr.stackalloc<Move> MaxMoves
+    let buf = Span<Move>(NativePtr.toVoidPtr p, MaxMoves)
+    generateLegal pos buf
+
 let isLegalRoot (pos: Position) (m: Move) : bool =
     if m = MoveNone then
         false
@@ -296,6 +314,13 @@ type SearchControl
     // routes through it (Phase 2+). Cleared per search alongside the TT and the accumulator cache.
     let dagTable: DagNodeTable =
         if config.DagHashMb <= 0 then null else DagNodeTable(config.DagHashMb)
+    // Phase 3: root-move work-distribution queue (Vyukov MPMC). `null` when UseWorkQueue is off or Threads <= 1.
+    // Recreated per search in `NewSearch` (drained + fresh). The main worker pushes unsearched root-move keys
+    // each iteration; all workers pop and search the corresponding subtree with a null PVS window.
+    let mutable workQueue: DagWorkQueue = null
+    // Shared alpha published by the main worker after its first-move PVS search, so helpers know the null-window
+    // bound. Volatile — read by helpers, written by main.
+    let mutable sharedRootAlpha = 0
     member _.Config = config
     member _.Limits = limits
     member _.Tt = tt
@@ -306,6 +331,11 @@ type SearchControl
     member _.AccCheckpoint: AccCheckpointTable = accCheckpoint
     /// Borrowed reference to the per-search DAG node table; `null` when disabled in config.
     member _.DagTable: DagNodeTable = dagTable
+    /// Borrowed reference to the per-search work-distribution queue; `null` when UseWorkQueue is off.
+    member _.WorkQueue: DagWorkQueue = workQueue
+    /// Shared root alpha for the null-window helper searches (published by the main worker).
+    member _.SharedRootAlpha: int = Volatile.Read(&sharedRootAlpha)
+    member _.SetSharedRootAlpha(v: int) = Volatile.Write(&sharedRootAlpha, v)
     member val LastBest: Move = MoveNone with get, set // result of the most recent go()
     member val LastScore: int = 0 with get, set
     /// Aggregate live node count across all workers (relaxed reads — reporting only, set by go()).
@@ -323,6 +353,11 @@ type SearchControl
         match dagTable with
         | null -> ()
         | dag -> dag.NewSearch()
+        // Phase 3: recreate the work queue fresh for each search (guarantees empty + resets Vyukov seqs).
+        if config.UseWorkQueue && config.Threads > 1 then
+            workQueue <- DagWorkQueue(256)
+        else
+            workQueue <- null
     member _.ElapsedMs: int64 = elapsedMs ()
 
     member _.SoftTimeUp: bool =
@@ -411,6 +446,10 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     let mutable completedDepth = 0
     let mutable nmpMinPly = 0 // NMP allowed only at ply >= this; set during an NMP-verification region (Feature 7)
     let mutable stopSeen = false
+    // MultiPV: best moves of the lines already searched this iteration, excluded at the root (ply 0) so the
+    // next line finds the next-best move. Empty (count 0) in single-PV play — the ply-0 check is then free.
+    let rootExcluded: Move[] = Array.zeroCreate 256
+    let mutable nRootExcluded = 0
     member _.Id = id
     member _.IsMain = isMain
     member _.Control = control
@@ -453,6 +492,28 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
         with get () = stopSeen
         and set v = stopSeen <- v
 
+    /// MultiPV: 0-based index of the line currently being searched (reporting: currmovenumber offset).
+    member val RootPvIdx = 0 with get, set
+
+    member _.ClearRootExclusions() = nRootExcluded <- 0
+
+    member _.AddRootExclusion(m: Move) =
+        if nRootExcluded < rootExcluded.Length then
+            rootExcluded.[nRootExcluded] <- m
+            nRootExcluded <- nRootExcluded + 1
+
+    member _.IsRootExcluded(m: Move) : bool =
+        let mutable i = 0
+        let mutable found = false
+
+        while not found && i < nRootExcluded do
+            if rootExcluded.[i] = m then
+                found <- true
+
+            i <- i + 1
+
+        found
+
     /// Rebuild this worker's Position from the immutable root (FEN + replayed moves) and reset per-search state.
     member _.SetupRoot() =
         pos.LoadFen control.RootFen
@@ -478,6 +539,7 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
         rootScore <- 0
         completedDepth <- 0
         stopSeen <- false
+        nRootExcluded <- 0
 
 let inline private pollStop (w: Worker) : bool =
     if w.StopSeen then
@@ -492,6 +554,8 @@ let inline private pollStop (w: Worker) : bool =
         stopped
     else
         false
+
+let private writeLine (s: string) = System.Console.Out.WriteLine(s)
 
 let evalPos (w: Worker) (pos: Position) : int =
     match w.Control.Net with
@@ -533,7 +597,7 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
         0
     elif ply > 0 && isImmediateDraw pos then
         0
-    elif ply >= MaxSearchPly then
+    elif ply >= MaxSearchPly || pos.StPly >= Position.AccStackLimit then
         (if pos.InCheck then 0 else evalPos w pos)
     else
         let cfg = w.Control.Config
@@ -660,10 +724,10 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
         0
     elif ply > 0 && isImmediateDraw pos then
         0
+    elif ply >= MaxSearchPly || pos.StPly >= Position.AccStackLimit then
+        (if pos.InCheck then 0 else evalPos w pos)
     elif depthIn <= 0 then
         qsearch w pos alphaIn betaIn ply
-    elif ply >= MaxSearchPly then
-        (if pos.InCheck then 0 else evalPos w pos)
     else
         let cfg = w.Control.Config
         let usePruning = cfg.UsePruning
@@ -962,8 +1026,24 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                 let needsCheck =
                     isEnPassant m || fromSq m = ksq || testBit usBlockers (fromSq m)
 
-                if m <> excludedMove && ((not needsCheck) || isLegal pos m) then
+                // MultiPV: at the root, skip the best moves of the lines already searched this iteration.
+                let rootSkip = ply = 0 && m <> MoveNone && w.IsRootExcluded m
+
+                if m <> excludedMove && not rootSkip && ((not needsCheck) || isLegal pos m) then
                     moveCount <- moveCount + 1
+
+                    // UCI currmove: only at the root of the main worker, and only once the search has run
+                    // long enough that a GUI actually benefits (avoids flooding stdout in fast games).
+                    // Not during a singular-exclusion re-search (same ply 0, reduced depth — not real progress).
+                    if ply = 0 && w.IsMain && excludedMove = MoveNone && w.Control.ElapsedMs > 3000L then
+                        writeLine (
+                            "info depth "
+                            + string depthIn
+                            + " currmove "
+                            + toUci m
+                            + " currmovenumber "
+                            + string (moveCount + w.RootPvIdx)
+                        )
 
                     let isQuiet =
                         (pos.PieceOn(toSq m) = NoPiece) && not (isEnPassant m) && not (isPromotion m)
@@ -1223,8 +1303,6 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 // ---------------------------------------------------------------------------
 // Reporting (Console only — never printfn)
 // ---------------------------------------------------------------------------
-let private writeLine (s: string) = System.Console.Out.WriteLine(s)
-
 let private scoreString (score: int) : string =
     if score >= MATE_IN_MAX_PLY then
         "mate " + string ((MATE - score + 1) / 2)
@@ -1233,7 +1311,9 @@ let private scoreString (score: int) : string =
     else
         "cp " + string score
 
-let private reportInfo (w: Worker) (depth: int) (score: int) =
+/// One `info ... multipv k ...` line. `bound` is "" or " lowerbound"/" upperbound" (aspiration fail
+/// high/low). The PV is read from `pv.[pvBase..]` (MoveNone-terminated); `fallback` covers an empty PV.
+let private reportLine (w: Worker) (depth: int) (pvNum: int) (score: int) (bound: string) (pv: Move[]) (pvBase: int) (fallback: Move) =
     let ms = w.Control.ElapsedMs
     let nodes = w.Control.NodeSum() // aggregate across all workers, not just the main one
     let nps = if ms > 0L then nodes * 1000L / ms else nodes
@@ -1244,12 +1324,17 @@ let private reportInfo (w: Worker) (depth: int) (score: int) =
         .Append(depth)
         .Append(" seldepth ")
         .Append(w.SelDepth)
+        .Append(" multipv ")
+        .Append(pvNum)
         .Append(" score ")
         .Append(scoreString score)
+        .Append(bound)
         .Append(" nodes ")
         .Append(nodes)
         .Append(" nps ")
         .Append(nps)
+        .Append(" hashfull ")
+        .Append(w.Control.Tt.Hashfull())
         .Append(" time ")
         .Append(ms)
         .Append(" pv")
@@ -1259,7 +1344,7 @@ let private reportInfo (w: Worker) (depth: int) (score: int) =
     let mutable cont = true
 
     while cont && i < MaxSearchPly do
-        let mv = w.Pv.[i]
+        let mv = pv.[pvBase + i]
 
         if mv = MoveNone then
             cont <- false
@@ -1267,66 +1352,291 @@ let private reportInfo (w: Worker) (depth: int) (score: int) =
             sb.Append(' ').Append(toUci mv) |> ignore
             i <- i + 1
 
-    if i = 0 && w.RootBest <> MoveNone then
-        sb.Append(' ').Append(toUci w.RootBest) |> ignore
+    if i = 0 && fallback <> MoveNone then
+        sb.Append(' ').Append(toUci fallback) |> ignore
 
     writeLine (sb.ToString())
+
+let private reportInfo (w: Worker) (depth: int) (score: int) =
+    reportLine w depth 1 score "" w.Pv 0 w.RootBest
 
 // ---------------------------------------------------------------------------
 // Iterative deepening (aspiration). All workers run it; only the main reports + sets the time stop.
 // ---------------------------------------------------------------------------
 let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
     let cfg = w.Control.Config
-    let mutable prev = evalPos w w.Pos
+    // MultiPV: only the main worker searches extra lines (they exist purely for reporting); helpers stay
+    // single-PV. Clamped to the number of legal root moves so every line has a distinct best move.
+    let multiPv =
+        if w.IsMain && cfg.MultiPv > 1 then
+            max 1 (min cfg.MultiPv (countLegalMoves w.Pos))
+        else
+            1
+
+    // Per-line state: previous score (aspiration centre), and this iteration's score/move/PV per line.
+    let prevScores = Array.create multiPv (evalPos w w.Pos)
+    let lineScores = Array.create multiPv 0
+    let lineMoves = Array.create multiPv MoveNone
+    let linePvs: Move[] = Array.zeroCreate (multiPv * MaxSearchPly)
+
+    // Swap two lines across every parallel array (insertion sort below keeps GUI output score-ordered).
+    let swapLines (i: int) (j: int) =
+        let ts = lineScores.[i] in
+        lineScores.[i] <- lineScores.[j]
+        lineScores.[j] <- ts
+        let tp = prevScores.[i] in
+        prevScores.[i] <- prevScores.[j]
+        prevScores.[j] <- tp
+        let tm = lineMoves.[i] in
+        lineMoves.[i] <- lineMoves.[j]
+        lineMoves.[j] <- tm
+
+        for k in 0 .. MaxSearchPly - 1 do
+            let t = linePvs.[i * MaxSearchPly + k]
+            linePvs.[i * MaxSearchPly + k] <- linePvs.[j * MaxSearchPly + k]
+            linePvs.[j * MaxSearchPly + k] <- t
+
     let mutable depth = 1
 
     while depth <= maxDepth && not w.Control.Stopped do
-        // Tweaked: initial window scaled by score magnitude (tighter near equal scores). OFF => flat 16.
-        let mutable delta =
-            if cfg.UseAspTweaks then 10 + prev * prev / 15000 else 16
+        w.ClearRootExclusions()
+        let mutable pvIdx = 0
+        let mutable iterationOk = true
 
-        let fullWindow = depth <= 4 || abs prev >= MATE_IN_MAX_PLY
-        let mutable alpha = if fullWindow then -INF else max (-INF) (prev - delta)
-        let mutable beta = if fullWindow then INF else min INF (prev + delta)
-        let mutable score = 0
-        let mutable searching = true
-        // Tweaked: drop the re-search depth by up to 3 plies on consecutive fail-highs (reported depth
-        // stays `depth`). OFF (or no fail-high) => attemptDepth = depth, i.e. the legacy behaviour.
-        let mutable attemptDepth = depth
+        while pvIdx < multiPv && iterationOk do
+            w.RootPvIdx <- pvIdx
+            let prev = prevScores.[pvIdx]
+            // Tweaked: initial window scaled by score magnitude (tighter near equal scores). OFF => flat 16.
+            let mutable delta =
+                if cfg.UseAspTweaks then 10 + prev * prev / 15000 else 16
 
-        while searching do
-            score <- negamax w w.Pos alpha beta (max 1 attemptDepth) 0 true false
+            let fullWindow = depth <= 4 || abs prev >= MATE_IN_MAX_PLY
+            let mutable alpha = if fullWindow then -INF else max (-INF) (prev - delta)
+            let mutable beta = if fullWindow then INF else min INF (prev + delta)
+            let mutable score = 0
+            let mutable searching = true
+            // Tweaked: drop the re-search depth by up to 3 plies on consecutive fail-highs (reported depth
+            // stays `depth`). OFF (or no fail-high) => attemptDepth = depth, i.e. the legacy behaviour.
+            let mutable attemptDepth = depth
+
+            while searching do
+                score <- negamax w w.Pos alpha beta (max 1 attemptDepth) 0 true false
+
+                if w.Control.Stopped then
+                    searching <- false
+                elif score <= alpha then
+                    // Root fail-low: tell the GUI the score is only an upper bound (long searches only,
+                    // matching the currmove threshold, so fast games don't flood stdout).
+                    if w.IsMain && w.Control.ElapsedMs > 3000L then
+                        reportLine w depth (pvIdx + 1) score " upperbound" w.Pv 0 w.RootBest
+
+                    beta <- (alpha + beta) / 2
+                    alpha <- max (-INF) (score - delta)
+                    delta <- delta * 2
+                    attemptDepth <- depth // a fail-low re-search runs at full depth again
+                elif score >= beta then
+                    if w.IsMain && w.Control.ElapsedMs > 3000L then
+                        reportLine w depth (pvIdx + 1) score " lowerbound" w.Pv 0 w.RootBest
+
+                    beta <- min INF (score + delta)
+                    delta <- delta * 2
+
+                    if cfg.UseAspTweaks && attemptDepth > depth - 3 && abs score < MATE_IN_MAX_PLY then
+                        attemptDepth <- attemptDepth - 1
+                else
+                    searching <- false
 
             if w.Control.Stopped then
-                searching <- false
-            elif score <= alpha then
-                beta <- (alpha + beta) / 2
-                alpha <- max (-INF) (score - delta)
-                delta <- delta * 2
-                attemptDepth <- depth // a fail-low re-search runs at full depth again
-            elif score >= beta then
-                beta <- min INF (score + delta)
-                delta <- delta * 2
-
-                if cfg.UseAspTweaks && attemptDepth > depth - 3 && abs score < MATE_IN_MAX_PLY then
-                    attemptDepth <- attemptDepth - 1
+                iterationOk <- false
             else
-                searching <- false
+                prevScores.[pvIdx] <- score
+                lineScores.[pvIdx] <- score
+                lineMoves.[pvIdx] <- w.Pv.[0]
+                Array.blit w.Pv 0 linePvs (pvIdx * MaxSearchPly) MaxSearchPly
+                // Exclude this line's best move at the root so the next line finds the next-best move.
+                w.AddRootExclusion w.Pv.[0]
+                pvIdx <- pvIdx + 1
 
-        if not w.Control.Stopped then
-            prev <- score
-            w.RootScore <- score
-            w.RootBest <- w.Pv.[0]
+        w.ClearRootExclusions()
+        w.RootPvIdx <- 0
+
+        if iterationOk then
+            // Order lines by score (descending) so multipv 1 is always the strongest line and each line's
+            // aspiration centre follows its move next iteration.
+            for i in 1 .. multiPv - 1 do
+                let mutable j = i
+
+                while j > 0 && lineScores.[j - 1] < lineScores.[j] do
+                    swapLines (j - 1) j
+                    j <- j - 1
+
+            // Keep w.Pv row 0 = the BEST line's PV (go()'s final report and RootBest read it).
+            if multiPv > 1 then
+                Array.blit linePvs 0 w.Pv 0 MaxSearchPly
+
+            w.RootScore <- lineScores.[0]
+            w.RootBest <- lineMoves.[0]
             w.CompletedDepth <- depth
 
             if w.IsMain then
-                reportInfo w depth score
+                for k in 0 .. multiPv - 1 do
+                    reportLine w depth (k + 1) lineScores.[k] "" linePvs (k * MaxSearchPly) lineMoves.[k]
+
+            // Stop on a proven mate: a forced mate score cannot be improved by deeper iterations, so
+            // deepening further only burns the clock (and, at extreme depth, pushes the search toward the
+            // ply cap). Stop the whole search (shared flag) the moment the main worker confirms one.
+            // MultiPV keeps deepening — the user is exploring alternatives, not just the mate line.
+            if w.IsMain && multiPv = 1 && abs lineScores.[0] >= MATE_IN_MAX_PLY then
+                w.Control.Stop()
 
         depth <- depth + 1
 
         // Between iterations the main worker stops once the soft (optimum) budget is spent; the hard budget
         // stops a running iteration mid-flight via CheckTime. (Best-move-stability / predictive scaling was
         // tried but over-conserved time without SPRT tuning — reverted; MoveOverhead is kept below.)
+        if w.IsMain && w.Control.SoftTimeUp then
+            w.Control.Stop()
+
+// ---------------------------------------------------------------------------
+// Root-move parallelism (Phase 3): the main worker searches the first (best) root
+// move with a full PVS window and pushes the rest to a shared DagWorkQueue. All
+// workers pop root-move keys and search the corresponding subtree with a null PVS
+// window. The TT carries results back to the main worker's collection phase, which
+// re-searches any fail-high moves with a full window. A Barrier synchronises the
+// three phases per depth: (1) main pushes, (2) all search, (3) main collects.
+// ---------------------------------------------------------------------------
+let iterativeDeepeningRootPar (w: Worker) (maxDepth: int) (barrier: Threading.Barrier)
+                              (rootMoves: Move[]) (rootKeys: uint64[]) =
+    let cfg = w.Control.Config
+    let queue = w.Control.WorkQueue
+    let mutable prev = evalPos w w.Pos
+    let mutable depth = 1
+
+    while depth <= maxDepth && not w.Control.Stopped do
+        let mutable bestMove = rootMoves.[0]
+        let mutable bestScore = -INF
+        let mutable alpha = -INF
+
+        if w.IsMain then
+            // Phase 1: search the first (best) root move with the aspiration window (same loop as ID).
+            let mutable delta = if cfg.UseAspTweaks then 10 + prev * prev / 15000 else 16
+            let fullWindow = depth <= 4 || abs prev >= MATE_IN_MAX_PLY
+            let mutable aspAlpha = if fullWindow then -INF else max (-INF) (prev - delta)
+            let mutable aspBeta = if fullWindow then INF else min INF (prev + delta)
+            let mutable score = 0
+            let mutable searching = true
+            let mutable attemptDepth = depth
+
+            while searching do
+                w.Pos.Make rootMoves.[0]
+                score <- -(negamax w w.Pos (-aspBeta) (-aspAlpha) (max 1 attemptDepth) 1 true false)
+                w.Pos.Unmake rootMoves.[0]
+
+                if w.Control.Stopped then
+                    searching <- false
+                elif score <= aspAlpha then
+                    aspBeta <- (aspAlpha + aspBeta) / 2
+                    aspAlpha <- max (-INF) (score - delta)
+                    delta <- delta * 2
+                    attemptDepth <- depth
+                elif score >= aspBeta then
+                    aspBeta <- min INF (score + delta)
+                    delta <- delta * 2
+                    if cfg.UseAspTweaks && attemptDepth > depth - 3 && abs score < MATE_IN_MAX_PLY then
+                        attemptDepth <- attemptDepth - 1
+                else
+                    searching <- false
+
+            if not w.Control.Stopped then
+                bestScore <- score
+                bestMove <- rootMoves.[0]
+                alpha <- score
+                prev <- score
+                w.RootScore <- score
+                w.RootBest <- w.Pv.[0]
+                w.CompletedDepth <- depth
+                w.Control.SetSharedRootAlpha alpha
+
+                // Phase 2: push remaining root-move keys to the work queue for helpers (and self).
+                for i in 1 .. rootMoves.Length - 1 do
+                    queue.TryPush rootKeys.[i] |> ignore
+
+        // Barrier 1: main has pushed (or stopped); all workers proceed to pop+search.
+        barrier.SignalAndWait()
+
+        // Phase 3: all workers pop root-move keys and search with a null PVS window.
+        if not w.Control.Stopped then
+            let mutable searching = true
+
+            while searching && not w.Control.Stopped do
+                match queue.TryPop() with
+                | Some key ->
+                    let mutable idx = -1
+                    let mutable i = 1
+
+                    while idx < 0 && i < rootMoves.Length do
+                        if rootKeys.[i] = key then idx <- i
+                        i <- i + 1
+
+                    if idx > 0 then
+                        let nullAlpha = w.Control.SharedRootAlpha
+                        w.Pos.Make rootMoves.[idx]
+                        let _ = negamax w w.Pos (-nullAlpha - 1) (-nullAlpha) (max 1 (depth - 1)) 1 false true
+                        w.Pos.Unmake rootMoves.[idx]
+                | None ->
+                    searching <- false
+
+        // Barrier 2: all workers done searching; main proceeds to collect.
+        barrier.SignalAndWait()
+
+        if w.IsMain then
+            // Drain leftovers (a worker stopped mid-pop leaves items; safe to discard — TT has partial data).
+            while (queue.TryPop() |> Option.isSome) do ()
+
+            if not w.Control.Stopped then
+                // Phase 4: collect results from TT, re-search fail-highs with full window.
+                for i in 1 .. rootMoves.Length - 1 do
+                    let struct (hit, _, sc, _, dp, bd, _) = w.Control.Tt.Probe rootKeys.[i]
+
+                    if hit && dp >= depth - 1 then
+                        let score = valueFromTt sc 1
+
+                        if (bd = BoundLower || bd = BoundExact) && score > alpha then
+                            w.Pos.Make rootMoves.[i]
+                            let v = -(negamax w w.Pos (-INF) (-alpha) (max 1 (depth - 1)) 1 true false)
+                            w.Pos.Unmake rootMoves.[i]
+
+                            if not w.Control.Stopped && v > alpha then
+                                alpha <- v
+                                bestScore <- v
+                                bestMove <- rootMoves.[i]
+                                w.RootScore <- v
+                                w.RootBest <- rootMoves.[i]
+                                w.Control.SetSharedRootAlpha alpha
+
+                w.CompletedDepth <- depth
+                reportInfo w depth bestScore
+
+                if abs bestScore >= MATE_IN_MAX_PLY then
+                    w.Control.Stop()
+
+        // Barrier 3: ready for next depth (helpers wait while main collects + reorders).
+        barrier.SignalAndWait()
+
+        depth <- depth + 1
+
+        // Reorder: move the best root move to [0] so the next iteration's PVS first-move is the strongest.
+        if w.IsMain && bestMove <> rootMoves.[0] && bestMove <> MoveNone then
+            let idx = Array.IndexOf(rootMoves, bestMove)
+
+            if idx > 0 then
+                let tmpM = rootMoves.[0]
+                rootMoves.[0] <- rootMoves.[idx]
+                rootMoves.[idx] <- tmpM
+                let tmpK = rootKeys.[0]
+                rootKeys.[0] <- rootKeys.[idx]
+                rootKeys.[idx] <- tmpK
+
         if w.IsMain && w.Control.SoftTimeUp then
             w.Control.Stop()
 
@@ -1392,22 +1702,73 @@ let go (control: SearchControl) : Move =
         else
             (MaxSearchPly - 1)
 
-    let threads =
-        [| for i in 1 .. n - 1 ->
-               let w = workers.[i]
+    // Branch: root-move parallelism (Phase 3) vs classic LazySMP. MultiPV needs per-line root exclusion,
+    // which the root-par phases don't support — force the classic path.
+    let useRootPar =
+        control.Config.UseWorkQueue
+        && n > 1
+        && control.WorkQueue <> null
+        && control.Config.MultiPv <= 1
 
-               let t =
-                   Thread(ThreadStart(fun () -> iterativeDeepening w maxDepth), 16 * 1024 * 1024)
+    if useRootPar then
+        // Generate root moves + their resulting position keys from the main worker's Position.
+        let p = NativePtr.stackalloc<Move> MaxMoves
+        let buf = Span<Move>(NativePtr.toVoidPtr p, MaxMoves)
+        let nMoves = generateLegal workers.[0].Pos buf
 
-               t.IsBackground <- true
-               t.Start()
-               t |]
+        let rootMoves: Move[] =
+            if nMoves = 0 then
+                [| MoveNone |]
+            else
+                buf.Slice(0, nMoves).ToArray()
 
-    iterativeDeepening workers.[0] maxDepth
-    control.Stop()
+        let rootKeys: uint64[] = Array.zeroCreate rootMoves.Length
 
-    for t in threads do
-        t.Join()
+        for i in 0 .. rootMoves.Length - 1 do
+            workers.[0].Pos.Make rootMoves.[i]
+            rootKeys.[i] <- workers.[0].Pos.Key
+            workers.[0].Pos.Unmake rootMoves.[i]
+
+        let barrier = new Barrier(n)
+
+        let threads =
+            [| for i in 1 .. n - 1 ->
+                   let w = workers.[i]
+
+                   let t =
+                       Thread(
+                           ThreadStart(fun () -> iterativeDeepeningRootPar w maxDepth barrier rootMoves rootKeys),
+                           16 * 1024 * 1024
+                       )
+
+                   t.IsBackground <- true
+                   t.Start()
+                   t |]
+
+        iterativeDeepeningRootPar workers.[0] maxDepth barrier rootMoves rootKeys
+        control.Stop()
+
+        for t in threads do
+            t.Join()
+
+        barrier.Dispose()
+    else
+        let threads =
+            [| for i in 1 .. n - 1 ->
+                   let w = workers.[i]
+
+                   let t =
+                       Thread(ThreadStart(fun () -> iterativeDeepening w maxDepth), 16 * 1024 * 1024)
+
+                   t.IsBackground <- true
+                   t.Start()
+                   t |]
+
+        iterativeDeepening workers.[0] maxDepth
+        control.Stop()
+
+        for t in threads do
+            t.Join()
 
     let rb = workers.[0].RootBest
 

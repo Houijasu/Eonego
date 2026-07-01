@@ -18,9 +18,12 @@ open Eonego.Search
 
 let private writeLine (s: string) = Console.Out.WriteLine(s)
 
-/// Hardwired transposition-table size (MB). Hash is no longer a UCI option.
+/// Default transposition-table size (MB); tunable via `setoption name Hash`.
 [<Literal>]
-let private HashMb = 256
+let private DefaultHashMb = 256
+
+[<Literal>]
+let private MaxHashMb = 65536
 
 /// Read an embedded manifest resource (the baked-in nets) fully into a byte array; None if absent.
 let private readEmbedded (name: string) : byte[] option =
@@ -34,11 +37,15 @@ let private readEmbedded (name: string) : byte[] option =
         s.CopyTo ms
         Some(ms.ToArray())
 
-/// Only Threads and Move Overhead remain tunable; every other option is hardwired ON / fixed. The NNUE
-/// net is embedded in the binary (see Eonego.fsproj), so there is no EvalFile UCI option.
+/// Tunable options: Threads, Hash, MultiPV, Move Overhead, Use Work Queue; every search toggle is
+/// hardwired ON. The NNUE net is embedded in the binary (see Eonego.fsproj), so there is no EvalFile
+/// UCI option.
 type private UCIState =
     { mutable Threads: int
+      mutable HashMb: int
+      mutable MultiPv: int
       mutable MoveOverhead: int
+      mutable UseWorkQueue: bool
       Net: Network option
       Tt: TranspositionTable
       mutable RootFen: string
@@ -177,10 +184,10 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
         for m in st.RootMoves do p.Make m
         writeLine ("bestmove " + toUci (Search.firstLegalMove p))
     | Some _ ->
-        // All search toggles are hardwired ON; HashMb is fixed; only Threads/MoveOverhead come from state.
+        // All search toggles are hardwired ON; Threads/Hash/MultiPV/MoveOverhead come from state.
         let cfg =
             { Threads = st.Threads
-              HashMb = HashMb
+              HashMb = st.HashMb
               UseTt = true
               UsePruning = true
               UseProbCut = true
@@ -195,7 +202,9 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
               UseAspTweaks = true
               MoveOverhead = st.MoveOverhead
               AccCheckpointMb = 0
-              DagHashMb = 2 }
+              DagHashMb = 2
+              UseWorkQueue = st.UseWorkQueue
+              MultiPv = st.MultiPv }
 
         let control =
             SearchControl(cfg, lim, st.Tt, st.RootFen, st.RootMoves, ?net = st.Net)
@@ -224,8 +233,18 @@ let private handleSetOption (st: UCIState) (tokens: string[]) =
 
         if String.Equals(name, "Threads", StringComparison.OrdinalIgnoreCase) then
             st.Threads <- max 1 (min 256 v)
+        elif String.Equals(name, "Hash", StringComparison.OrdinalIgnoreCase) then
+            // Resize must never run under a live probe: stop+join any active search first (same
+            // guarantee ucinewgame provides for Clear).
+            stopAndJoin st
+            st.HashMb <- max 1 (min MaxHashMb v)
+            st.Tt.Resize st.HashMb
+        elif String.Equals(name, "MultiPV", StringComparison.OrdinalIgnoreCase) then
+            st.MultiPv <- max 1 (min 256 v)
         elif String.Equals(name, "Move Overhead", StringComparison.OrdinalIgnoreCase) then
             st.MoveOverhead <- max 0 (min 5000 v)
+        elif String.Equals(name, "Use Work Queue", StringComparison.OrdinalIgnoreCase) then
+            st.UseWorkQueue <- (v <> 0)
     // Any other (legacy/hardwired) option is silently ignored.
     | _ -> ()
 
@@ -238,9 +257,12 @@ let run () =
 
     let st =
         { Threads = 1
+          HashMb = DefaultHashMb
+          MultiPv = 1
           MoveOverhead = 10
+          UseWorkQueue = false
           Net = net
-          Tt = TranspositionTable(HashMb)
+          Tt = TranspositionTable(DefaultHashMb)
           RootFen = StartPosFen
           RootMoves = [||]
           Control = None
@@ -260,7 +282,10 @@ let run () =
                     writeLine "id name Eonego"
                     writeLine "id author Houijasu"
                     writeLine "option name Threads type spin default 1 min 1 max 256"
+                    writeLine "option name Hash type spin default 256 min 1 max 65536"
+                    writeLine "option name MultiPV type spin default 1 min 1 max 256"
                     writeLine "option name Move Overhead type spin default 10 min 0 max 5000"
+                    writeLine "option name Use Work Queue type check default false"
                     writeLine "uciok"
                 | "isready" ->
                     writeLine "readyok"

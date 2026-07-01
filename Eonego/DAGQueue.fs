@@ -14,6 +14,7 @@ open System.Threading
 do ()
 
 [<Sealed>]
+[<AllowNullLiteral>]
 type DagWorkQueue(capacity: int) =
     // Capacity must be a positive power of two; the ctor rounds up. ~16 bytes/slot (key uint64 + seq int64).
     let cap =
