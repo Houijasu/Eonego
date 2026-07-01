@@ -49,8 +49,12 @@ let makeIndex (pColor: Color) (pc: int) (sq: int) (ksq: int) : int =
 [<Literal>]
 let MaxDirtyPieces = 8
 
+// Right-sized 512 -> 128 (2026-07-02): measured high-water mark is 30 physical edges/move over 950k makes
+// (midgame depth-15 + kiwipete depth-14, EONEGO_PROF maxThreatN); the reference engine bounds its equivalent
+// list at 96. Overflow degrades gracefully (dirtyThreatOverflow -> full-refresh fallback in CommitFrame).
+// Per-frame payload cost is 3 * AccMaxPly * MaxDirtyThreats * 4 B, so this is 384 KB/Position instead of 1.5 MB.
 [<Literal>]
-let MaxDirtyThreats = 512
+let MaxDirtyThreats = 128
 
 [<Literal>]
 let private DirtyThreatSignBit = 1 <<< 20

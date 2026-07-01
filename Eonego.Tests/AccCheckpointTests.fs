@@ -296,7 +296,9 @@ let ``eager accumulator materializes during Make (no cache needed)`` () =
             let pos = Position()
             pos.LoadFen StartPosFen
             bindNnue net pos
-            // With eager accumulator updates, Make itself computes both perspectives. After Make, eval is O(1).
+            // Eager mode is opt-in since the lazy default landed (audit 2026-07-01); this test covers the
+            // eager machinery explicitly: Make itself computes both perspectives, eval is O(1) afterwards.
+            pos.SetEagerUpdates true
             let moves = collectLegal pos
             Assert.True(moves.Length > 0)
             pos.Make moves.[0]

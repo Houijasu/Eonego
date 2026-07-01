@@ -172,6 +172,75 @@ let ``lazy accumulator replays unevaluated real-move chains`` () =
             oracle.Unmake m1
             assertRawAccEqualsOracle net bound oracle)
 
+// GUARDRAIL for the lazy multi-frame catch-up walk (audit 2026-07-01): with eager materialization disabled,
+// chains of UNEVALUATED makes must replay bit-exact through the per-frame delta stack when evaluation finally
+// happens. This is the only test that drives genuine >=2-frame back-walks — the eager production default
+// materializes every frame at Make, so the walk never runs there. Sibling switches after a leaf eval exercise
+// walks starting from a partially-computed ancestor; the promotion/king-endgame fens hit the blocked-walk
+// (full-rebuild) branch mid-chain.
+[<Fact>]
+let ``lazy multi-frame walk replays long unevaluated chains bit-exact`` () =
+    withNet (fun net ->
+        let fens =
+            [ "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1" // kiwipete: captures/castling
+              "rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3" // en passant available
+              "n1n5/PPPk4/8/8/8/8/4Kppp/5N1N b - - 0 1" // promotions + king moves
+              "8/8/8/3k4/8/3K4/4P3/8 w - - 0 1" ] // king-move endgame (refresh barriers)
+
+        // Descend `depth` plies WITHOUT any eval, checking parity only at the leaf; at the top level try
+        // several sibling first-moves so later chains walk from partially-computed ancestor frames.
+        let rec chain (b: Position) (o: Position) (depth: int) (branch: int) =
+            if depth = 0 then
+                assertRawAccEqualsOracle net b o
+                Assert.Equal(evalCp net o, evalCp net b)
+            else
+                let moves = collectLegal b
+                let take = min branch moves.Length
+
+                for i in 0 .. take - 1 do
+                    let m = moves.[i]
+                    b.Make m
+                    o.Make m
+                    chain b o (depth - 1) 1
+                    b.Unmake m
+                    o.Unmake m
+
+        for fen in fens do
+            let bound = Position.OfFen fen
+            bindNnue net bound
+            bound.SetEagerUpdates false
+            let oracle = Position.OfFen fen
+            // 4-ply unevaluated chains from 3 sibling roots.
+            chain bound oracle 4 3
+
+            // Mid-chain eval variant: 2 unevaluated plies, eval, 2 more, eval — the second walk starts from
+            // the mid-chain ancestor materialized by the first.
+            let made = System.Collections.Generic.Stack<Eonego.Move.Move>()
+
+            for _ in 1 .. 2 do
+                let m = (collectLegal bound).[0]
+                bound.Make m
+                oracle.Make m
+                made.Push m
+
+            assertRawAccEqualsOracle net bound oracle
+
+            for _ in 1 .. 2 do
+                let m = (collectLegal bound).[0]
+                bound.Make m
+                oracle.Make m
+                made.Push m
+
+            assertRawAccEqualsOracle net bound oracle
+            Assert.Equal(evalCp net oracle, evalCp net bound)
+
+            while made.Count > 0 do
+                let m = made.Pop()
+                bound.Unmake m
+                oracle.Unmake m
+
+            assertRawAccEqualsOracle net bound oracle)
+
 [<Fact>]
 let ``null moves preserve top and replay across following real move`` () =
     withNet (fun net ->
@@ -197,7 +266,7 @@ let ``null moves preserve top and replay across following real move`` () =
         assertRawAccEqualsOracle net bound oracle)
 
 [<Fact>]
-let ``changed threat indices are materialized eagerly during make`` () =
+let ``changed threat conversion defers to eval under lazy, fires during make under eager`` () =
     withNet (fun net ->
         let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"
         let scout = Position.OfFen fen
@@ -218,11 +287,21 @@ let ``changed threat indices are materialized eagerly during make`` () =
             (System.Func<Position, int[], int, int, int[], int[], int64>(fun p dirty off n bw bb ->
                 changedCalls <- changedCalls + 1
                 Eonego.Threats.appendChangedThreatsBothAt p dirty off n bw bb))
-        // With eager accumulator updates, the changed-threat delegate fires DURING Make (not deferred to eval).
+        // LAZY (production default): Make only records the dirty frame — the changed-threat delegate is
+        // deferred until evaluation materializes the frame.
         bound.Make move
-        Assert.True(changedCalls > 0, "eager Make must have converted dirty threats")
+        Assert.Equal(0, changedCalls)
         evalCp net bound |> ignore
-        bound.Unmake move)
+        Assert.True(changedCalls > 0, "lazy eval must have converted dirty threats")
+        bound.Unmake move
+
+        // EAGER (test hook): the conversion fires DURING Make.
+        bound.SetEagerUpdates true
+        let before = changedCalls
+        bound.Make move
+        Assert.True(changedCalls > before, "eager Make must have converted dirty threats")
+        bound.Unmake move
+        bound.SetEagerUpdates false)
 
 
 // The AVX2 forward kernels (ftProduct/fc0/fc1/fc2) MUST be bit-identical to the scalar reference. evalInternal

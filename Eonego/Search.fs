@@ -1797,6 +1797,7 @@ let go (control: SearchControl) : Move =
             + " nEnsure=" + string PosProf.nEnsure
             + " nBuild=" + string PosProf.nBuild
             + " nEval=" + string PosProf.nEval
+            + " maxThreatN=" + string PosProf.maxThreatN
         )
 
     let rb = workers.[0].RootBest

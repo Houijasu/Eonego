@@ -64,6 +64,7 @@ module PosProf =
     let mutable nEnsure = 0L
     let mutable nBuild = 0L
     let mutable nEval = 0L
+    let mutable maxThreatN = 0L // high-water mark of per-move physical dirty-threat edges (sizing data)
 
     let reset () =
         tMake <- 0L
@@ -75,6 +76,7 @@ module PosProf =
         nEnsure <- 0L
         nBuild <- 0L
         nEval <- 0L
+        maxThreatN <- 0L
 
 // ---------------------------------------------------------------------------
 // Module-level static tables — built once via `do initTables ()`. These read ONLY Bitboard [<Literal>]
@@ -530,14 +532,15 @@ type Position() =
             psqB <- Array.zeroCreate (AccMaxPly * Accumulator.PsqtBuckets)
             computedW <- Array.zeroCreate AccMaxPly
             computedB <- Array.zeroCreate AccMaxPly
-            frameDirtyPc <- Array.zeroCreate Accumulator.MaxDirtyPieces
-            frameDirtySq <- Array.zeroCreate Accumulator.MaxDirtyPieces
-            frameDirtySign <- Array.zeroCreate Accumulator.MaxDirtyPieces
+            // Delta payloads are PER-FRAME (offsets via DirtyOff/ThreatOff) — see the comment on those.
+            frameDirtyPc <- Array.zeroCreate (AccMaxPly * Accumulator.MaxDirtyPieces)
+            frameDirtySq <- Array.zeroCreate (AccMaxPly * Accumulator.MaxDirtyPieces)
+            frameDirtySign <- Array.zeroCreate (AccMaxPly * Accumulator.MaxDirtyPieces)
             frameDirtyN <- Array.zeroCreate AccMaxPly
-            frameThreats <- Array.zeroCreate Accumulator.MaxDirtyThreats
+            frameThreats <- Array.zeroCreate (AccMaxPly * Accumulator.MaxDirtyThreats)
             frameThreatN <- Array.zeroCreate AccMaxPly
-            frameChangedW <- Array.zeroCreate Accumulator.MaxDirtyThreats
-            frameChangedB <- Array.zeroCreate Accumulator.MaxDirtyThreats
+            frameChangedW <- Array.zeroCreate (AccMaxPly * Accumulator.MaxDirtyThreats)
+            frameChangedB <- Array.zeroCreate (AccMaxPly * Accumulator.MaxDirtyThreats)
             frameChangedNW <- Array.zeroCreate AccMaxPly
             frameChangedNB <- Array.zeroCreate AccMaxPly
             frameChangedValid <- Array.zeroCreate AccMaxPly
@@ -553,11 +556,16 @@ type Position() =
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member private _.PsqOff(frame: int) = frame * Accumulator.PsqtBuckets
 
+    // Per-frame offsets into the delta-payload arrays. These MUST be frame-multiplied: the lazy catch-up
+    // walk (EnsureComputed/EnsureBothComputedCore) replays SEVERAL frames' payloads, so flattening these to a
+    // shared single-frame buffer silently corrupts any >=2-frame walk (the 2026-07-01 audit bug — eager
+    // materialization consumed each frame immediately and hid it). Guarded by the multi-frame walk test in
+    // NnueTests.
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-    member private _.DirtyOff(frame: int) = 0
+    member private _.DirtyOff(frame: int) = frame * Accumulator.MaxDirtyPieces
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-    member private _.ThreatOff(frame: int) = 0
+    member private _.ThreatOff(frame: int) = frame * Accumulator.MaxDirtyThreats
 
     member private this.EnumThreats(pColor: Color, buf: int[]) : int =
         match threatFn with
@@ -689,6 +697,9 @@ type Position() =
             let threatN = min dirtyThreatN Accumulator.MaxDirtyThreats
             frameThreatN.[frame] <- threatN
             System.Array.Copy(dirtyThreats, 0, frameThreats, this.ThreatOff frame, threatN)
+
+            if PosProf.Enabled && int64 threatN > PosProf.maxThreatN then
+                PosProf.maxThreatN <- int64 threatN
 
             if threatN <> 0 then
                 frameChangedValid.[frame] <- false
@@ -1164,7 +1175,10 @@ type Position() =
         frameBlackKingMoved.[0] <- false
         frameThreatOverflow.[0] <- false
         active <- true
-        eagerUpdates <- true
+        // LAZY is the production default (audit 2026-07-01): 27.8% of makes are never evaluated, and the lazy
+        // refresh is per-perspective — measured ~+10% nps over eager materialization on bit-identical trees.
+        // Tests flip this via SetEagerUpdates to cover the eager machinery.
+        eagerUpdates <- false
         this.BuildFull(White, 0)
         this.BuildFull(Black, 0)
 
