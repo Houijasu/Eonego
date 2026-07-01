@@ -1,12 +1,11 @@
-/// Stockfish-master NNUE ("FullThreats" net, version 0x6A448AFA) loader + evaluator for Eonego.
-/// Clean-room from the published nnue-pytorch format + the SF master inference spec. Dual-input feature
-/// transformer: the L1=1024 accumulator (and 8 PSQT buckets) is built from BOTH HalfKAv2_hm features
+/// NNUE ("FullThreats" net, version 0x6A448AFA) loader + evaluator for Eonego.
+/// Dual-input feature transformer: the L1=1024 accumulator (and 8 PSQT buckets) is built from BOTH HalfKAv2_hm features
 /// (int16 `weights`) AND FullThreats features (int8 `threatWeights`); HalfKA indexing is reused from
 /// `Accumulator.makeIndex`, threats from `Threats`. Bound positions use Position's lazy incremental
 /// accumulator; unbound positions keep the from-scratch path as an oracle.
 ///
-/// Licensing: Stockfish `.nnue` FILES are CC0; this loader is a clean-room implementation of the file
-/// format (not copyrightable) and the integer inference, not a copy of SF's GPL C++. See THIRD-PARTY-NOTICES.
+/// Licensing: net files are public-domain (CC0); this loader is a clean-room implementation of the
+/// (non-copyrightable) file format and integer inference.
 ///
 /// AOT/F#: pure byte parsing; no printf; fail-soft; forward is stackalloc'd (0 heap alloc on the hot path).
 #nowarn "9"
@@ -22,10 +21,10 @@ open Eonego.Bitboard
 open Eonego.Position
 
 // ---------------------------------------------------------------------------
-// Architecture constants (SF master FullThreats net; verified against src/nnue/*)
+// Architecture constants (FullThreats net)
 // ---------------------------------------------------------------------------
 [<Literal>]
-let SfVersion = 0x6A448AFA
+let Version = 0x6A448AFA
 
 [<Literal>]
 let HalfKaDims = 22528 // HalfKAv2_hm feature dimension (704 planes * 32 king buckets)
@@ -63,7 +62,7 @@ let FtMaxVal = 255
 [<Literal>]
 let EvalMax = 10000
 
-/// SF-Value that equals one pawn (100 cp). SF derives this per-position via a WDL model; we use a fixed
+/// Net value that equals one pawn (100 cp). the reference derives this per-position via a WDL model; we use a fixed
 /// approximation (calibrate so startpos reads ~+25 cp). TUNABLE.
 [<Literal>]
 let NormalizeToPawnValue = 356
@@ -82,7 +81,7 @@ let UseVnni =
 
 /// One per-bucket fc stack: fc0 (L1->32), fc1 (62->32), fc2 (32->1). Weights int8 (natural [out][padded_in]),
 /// biases int32.
-type SfLayerStack =
+type LayerStack =
     { Fc0W: sbyte[] // Fc0Out * L1
       Fc0B: int[] // Fc0Out
       Fc1W: sbyte[] // Fc1Out * Fc1In
@@ -90,7 +89,7 @@ type SfLayerStack =
       Fc2W: sbyte[] // 1 * Fc2In
       Fc2B: int[] } // 1
 
-type SfNetwork =
+type Network =
     { Version: int
       Hash: uint32
       Desc: string
@@ -100,10 +99,10 @@ type SfNetwork =
       ThreatWeights: sbyte[] // ThreatDims * L1   (Threats -> accumulator, row-major [feature][L1])
       PsqtWeights: int[] // HalfKaDims * PsqtBuckets
       ThreatPsqtWeights: int[] // ThreatDims * PsqtBuckets
-      Stacks: SfLayerStack[] }
+      Stacks: LayerStack[] }
 
-type SfLoadResult =
-    | Loaded of SfNetwork
+type LoadResult =
+    | Loaded of Network
     | Failed of string
 
 // ---------------------------------------------------------------------------
@@ -219,7 +218,7 @@ let private readI8 (c: Cursor) (n: int) : sbyte[] =
     out
 
 // One fc stack: arch hash, then fc_0 (bias+weights), fc_1 (bias+weights), fc_2 (bias+weights). All raw.
-let private readStack (c: Cursor) : SfLayerStack =
+let private readStack (c: Cursor) : LayerStack =
     c.U32() |> ignore // per-stack architecture hash
     let fc0b = readI32 c Fc0Out
     let fc0w = readI8 c (Fc0Out * L1)
@@ -235,13 +234,13 @@ let private readStack (c: Cursor) : SfLayerStack =
       Fc2W = fc2w
       Fc2B = fc2b }
 
-let loadBytes (buf: byte[]) : SfLoadResult =
+let loadBytes (buf: byte[]) : LoadResult =
     try
         let c = Cursor(buf)
         let version = c.I32()
 
-        if version <> SfVersion then
-            Failed("unexpected NNUE version 0x" + version.ToString("X8") + " (expected 0x" + SfVersion.ToString("X8") + ")")
+        if version <> Version then
+            Failed("unexpected NNUE version 0x" + version.ToString("X8") + " (expected 0x" + Version.ToString("X8") + ")")
         else
             let hash = c.U32()
             let descLen = c.I32()
@@ -275,7 +274,7 @@ let loadBytes (buf: byte[]) : SfLoadResult =
     with ex ->
         Failed("exception during NNUE parse: " + ex.Message)
 
-let load (path: string) : SfLoadResult =
+let load (path: string) : LoadResult =
     if not (IO.File.Exists path) then
         Failed("file not found: " + path)
     else
@@ -303,7 +302,7 @@ type private ThreatBuf() =
 
 /// Build one perspective's L1 accumulator + PSQT from scratch: bias + HalfKA features (int16 weights) +
 /// FullThreats features (int8 weights).
-let private buildAcc (net: SfNetwork) (pos: Position) (pColor: Color) (acc: Span<int>) (psqt: Span<int>) =
+let private buildAcc (net: Network) (pos: Position) (pColor: Color) (acc: Span<int>) (psqt: Span<int>) =
     let ksq = pos.KingSquare pColor
 
     for j in 0 .. L1 - 1 do
@@ -347,14 +346,14 @@ let private buildAcc (net: SfNetwork) (pos: Position) (pColor: Color) (acc: Span
 /// Public oracle for tests/diagnostics: build one perspective's raw int32 accumulator from the board. Kept as
 /// int32 (the mathematically exact "true value") so tests can assert the int16 incremental path == int16(this)
 /// AND that this never exceeds int16 range (the overflow gate).
-let buildAccOracle (net: SfNetwork) (pos: Position) (pColor: Color) (acc: Span<int>) (psqt: Span<int>) =
+let buildAccOracle (net: Network) (pos: Position) (pColor: Color) (acc: Span<int>) (psqt: Span<int>) =
     buildAcc net pos pColor acc psqt
 
 /// Production from-scratch build into an int16 accumulator (unbound positions / eval else-branch): build the
 /// exact int32 value, then narrow to int16. Narrowing == the incremental int16 wrap (int16 of a sum-in-int32
 /// is order-independent, and the int32 oracle never overflows int32). PSQT stays int32.
 [<System.Runtime.CompilerServices.SkipLocalsInit>]
-let private buildAccProd (net: SfNetwork) (pos: Position) (pColor: Color) (acc: Span<int16>) (psqt: Span<int>) =
+let private buildAccProd (net: Network) (pos: Position) (pColor: Color) (acc: Span<int16>) (psqt: Span<int>) =
     let tmpP = NativePtr.stackalloc<int> L1
     let tmp = Span<int>(NativePtr.toVoidPtr tmpP, L1)
     buildAcc net pos pColor tmp psqt
@@ -554,13 +553,13 @@ let private fc2Dot (a1: Span<byte>) (fc2w: sbyte[]) (fc2b: int) (useAvx2: bool) 
 
         s
 
-/// SF-Value (the network output, ~NormalizeToPawnValue per pawn): (125*psqt + 131*positional)/128.
+/// Net value (the network output, ~NormalizeToPawnValue per pawn): (125*psqt + 131*positional)/128.
 /// `useAvx2` selects the SIMD vs scalar forward path (production passes the module `UseAvx2`; tests pass both
 /// to assert bit-exactness). SkipLocalsInit drops stackalloc zeroing; every stack buffer is fully written
 /// before read, and the two padded conc lanes are set explicitly.
 [<System.Runtime.CompilerServices.SkipLocalsInit>]
 let private evalFromAcc
-    (net: SfNetwork)
+    (net: Network)
     (pos: Position)
     (accW: Span<int16>)
     (accB: Span<int16>)
@@ -625,14 +624,14 @@ let private evalFromAcc
     (125 * psqtV + 131 * posV) / 128
 
 [<System.Runtime.CompilerServices.SkipLocalsInit>]
-let evalInternal (net: SfNetwork) (pos: Position) (useAvx2: bool) (useVnni: bool) : int =
-    if pos.SfActive then
+let evalInternal (net: Network) (pos: Position) (useAvx2: bool) (useVnni: bool) : int =
+    if pos.Active then
         // Incremental hot path: materialize BOTH perspectives in one frame walk, then read them in place.
-        pos.SfEnsureBothComputed()
-        let accW = pos.SfAccSpanComputed White
-        let accB = pos.SfAccSpanComputed Black
-        let psqW = pos.SfPsqtSpanComputed White
-        let psqB = pos.SfPsqtSpanComputed Black
+        pos.EnsureBothComputed()
+        let accW = pos.AccSpanComputed White
+        let accB = pos.AccSpanComputed Black
+        let psqW = pos.PsqtSpanComputed White
+        let psqB = pos.PsqtSpanComputed Black
         evalFromAcc net pos accW accB psqW psqB useAvx2 useVnni
     else
         // From-scratch path (tests / unbound positions): int16 accumulator (PSQT int32), built via buildAccProd.
@@ -650,14 +649,14 @@ let evalInternal (net: SfNetwork) (pos: Position) (useAvx2: bool) (useVnni: bool
         evalFromAcc net pos accW accB psqW psqB useAvx2 useVnni
 
 /// Side-to-move-relative centipawns, clamped to +/-EvalMax.
-let evalCp (net: SfNetwork) (pos: Position) : int =
+let evalCp (net: Network) (pos: Position) : int =
     let cp = int (int64 (evalInternal net pos UseAvx2 UseVnni) * 100L / int64 NormalizeToPawnValue)
     max -EvalMax (min EvalMax cp)
 
 /// Bind the net into the Position's incremental accumulator (root only). The threat enumerator is passed as
 /// a delegate so Position needn't depend on Threats. After binding, `evalInternal` reads the maintained
 /// accumulator; unbound, it falls back to the from-scratch oracle (used by tests).
-let bindNnue (net: SfNetwork) (pos: Position) : unit =
+let bindNnue (net: Network) (pos: Position) : unit =
     pos.EnableNnue
         net.FtBiases
         net.Weights

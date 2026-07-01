@@ -1,4 +1,4 @@
-/// FullThreats feature enumeration for the Stockfish-master NNUE ("FullThreats" net, version 0x6A448AFA).
+/// FullThreats feature enumeration for the NNUE ("FullThreats" net, version 0x6A448AFA).
 /// Clean-room port of src/nnue/features/full_threats.{h,cpp}. Threat features encode, for each non-king
 /// piece, every OCCUPIED square it attacks (own pieces = defences, enemy = attacks) plus pawn-blocked-by-pawn
 /// contacts, indexed by (attacker, from, to, attacked, king-bucket, perspective). 60720 dims, <=128 active.
@@ -15,12 +15,12 @@ open Eonego.Position
 let Dimensions = 60720
 
 [<Literal>]
-let MaxActive = 256 // SF caps at 128 active; 256 is a safe buffer size
+let MaxActive = 256 // The encoding caps at 128 active; 256 is a safe buffer size
 
-// SF Piece values present on a board (W_PAWN..W_KING, B_PAWN..B_KING). Order drives the cumulative offsets.
+// Encoded piece values present on a board (W_PAWN..W_KING, B_PAWN..B_KING). Order drives the cumulative offsets.
 let private allPieces = [| 1; 2; 3; 4; 5; 6; 9; 10; 11; 12; 13; 14 |]
 
-// numValidTargets[SfPiece] (PIECE_NB = 16); king has none.
+// numValidTargets[Piece] (PIECE_NB = 16); king has none.
 let private numValidTargets = [| 0; 6; 10; 8; 8; 10; 0; 0; 0; 6; 10; 8; 8; 10; 0; 0 |]
 
 // map[attackerType-1][attackedType-1] (PAWN..KING = type 1..6 -> row/col 0..5); -1 = excluded.
@@ -42,18 +42,18 @@ let private FileA = 0x0101010101010101UL
 [<Literal>]
 let private FileH = 0x8080808080808080UL
 
-let inline private sfType (sfPiece: int) = sfPiece &&& 7
-let inline private sfColor (sfPiece: int) = sfPiece >>> 3
-let inline private sfMakePiece (c: int) (sfPt: int) = (c <<< 3) + sfPt
+let inline private pieceType (piece: int) = piece &&& 7
+let inline private color (piece: int) = piece >>> 3
+let inline private makePiece (c: int) (pt: int) = (c <<< 3) + pt
 
-let private sfPieceOfEonego = [| 1; 2; 3; 4; 5; 6; 9; 10; 11; 12; 13; 14 |]
+let private pieceOfEonego = [| 1; 2; 3; 4; 5; 6; 9; 10; 11; 12; 13; 14 |]
 
-/// Eonego piece (0..11) -> SF piece. e = color*6 + type ; SF = (color<<3) + type + 1.
-let inline private sfOfEonego (e: int) = sfPieceOfEonego.[e]
+/// Eonego piece (0..11) -> encoded piece. e = color*6 + type ; encoded = (color<<3) + type + 1.
+let inline private ofEonego (e: int) = pieceOfEonego.[e]
 
-/// Empty-board pseudo-attacks for a SF non-pawn piece type (KNIGHT=2..KING=6).
-let inline private pseudoAttacks (sfPt: int) (sq: int) : Bitboard =
-    match sfPt with
+/// Empty-board pseudo-attacks for an encoded non-pawn piece type (KNIGHT=2..KING=6).
+let inline private pseudoAttacks (pt: int) (sq: int) : Bitboard =
+    match pt with
     | 2 -> knightAttacks sq
     | 3 -> bishopAttacks sq 0UL
     | 4 -> rookAttacks sq 0UL
@@ -70,16 +70,16 @@ let inline private pawnPushOrAttacks (color: int) (sq: int) : Bitboard =
 
     atk ||| push
 
-/// The attack/push set used for LUT ordinal counting, per SF Piece.
-let inline private attackSetFor (sfPiece: int) (sq: int) : Bitboard =
-    if sfType sfPiece = 1 then pawnPushOrAttacks (sfColor sfPiece) sq
-    else pseudoAttacks (sfType sfPiece) sq
+/// The attack/push set used for LUT ordinal counting, per encoded piece.
+let inline private attackSetFor (piece: int) (sq: int) : Bitboard =
+    if pieceType piece = 1 then pawnPushOrAttacks (color piece) sq
+    else pseudoAttacks (pieceType piece) sq
 
 // ---------------------------------------------------------------------------
 // Generated LUTs (constexpr equivalents from full_threats.cpp), built once at init.
 // ---------------------------------------------------------------------------
 
-// index_lut2[sfPiece][from][to] = popcount of attack-targets strictly below `to`. Flat [16*64*64].
+// index_lut2[piece][from][to] = popcount of attack-targets strictly below `to`. Flat [16*64*64].
 let private indexLut2 : int[] =
     let t = Array.zeroCreate (16 * 64 * 64)
 
@@ -92,7 +92,7 @@ let private indexLut2 : int[] =
 
     t
 
-// offsets[sfPiece][from] (flat [16*64]) and helper cumulativePieceOffset / cumulativeOffset per piece.
+// offsets[piece][from] (flat [16*64]) and helper cumulativePieceOffset / cumulativeOffset per piece.
 let private offsets : int[] = Array.zeroCreate (16 * 64)
 let private helperCumPiece : int[] = Array.zeroCreate 16
 let private helperCumOffset : int[] = Array.zeroCreate 16
@@ -102,15 +102,15 @@ let private initOffsets () =
 
     for piece in allPieces do
         let mutable cumPiece = 0
-        let isPawn = sfType piece = 1
+        let isPawn = pieceType piece = 1
 
         for from in 0..63 do
             offsets.[piece * 64 + from] <- cumPiece
 
             if not isPawn then
-                cumPiece <- cumPiece + popCount (pseudoAttacks (sfType piece) from)
+                cumPiece <- cumPiece + popCount (pseudoAttacks (pieceType piece) from)
             elif from >= 8 && from <= 55 then
-                cumPiece <- cumPiece + popCount (pawnPushOrAttacks (sfColor piece) from)
+                cumPiece <- cumPiece + popCount (pawnPushOrAttacks (color piece) from)
 
         helperCumPiece.[piece] <- cumPiece
         helperCumOffset.[piece] <- cumulativeOffset
@@ -125,14 +125,14 @@ let private indexLut1 : int[] =
     for attacker in allPieces do
         for attacked in allPieces do
             let enemy = (attacker ^^^ attacked) = 8
-            let aType = sfType attacker
-            let dType = sfType attacked
+            let aType = pieceType attacker
+            let dType = pieceType attacked
             let m = threatMap.[aType - 1, dType - 1]
             let semiExcluded = (aType = dType) && (enemy || aType <> 1)
 
             let feature =
                 helperCumOffset.[attacker]
-                + (sfColor attacked * (numValidTargets.[attacker] / 2) + m) * helperCumPiece.[attacker]
+                + (color attacked * (numValidTargets.[attacker] / 2) + m) * helperCumPiece.[attacker]
 
             let excluded = m < 0
             t.[(attacker * 16 + attacked) * 2 + 0] <- if excluded then Dimensions else feature
@@ -150,7 +150,7 @@ let inline private makeIndexOriented (orientation: int) (swap: int) (attacker: i
     + offsets.[attackerO * 64 + fromO]
     + indexLut2.[(attackerO * 64 + fromO) * 64 + toO]
 
-/// Feature index for a threat (SF make_index). `attacker`/`attacked` are SF pieces; from/to/ksq squares.
+/// Feature index for a threat. `attacker`/`attacked` are encoded pieces; from/to/ksq squares.
 let makeIndex (perspective: int) (attacker: int) (from: int) (too: int) (attacked: int) (ksq: int) : int =
     makeIndexOriented (orientTbl.[ksq] ^^^ (56 * perspective)) (8 * perspective) attacker from too attacked
 
@@ -166,7 +166,7 @@ let appendActiveThreats (perspective: int) (pos: Position) (buf: int[]) : int =
     let mutable n = 0
 
     let emit (attacker: int) (from: int) (too: int) =
-        let attacked = sfOfEonego (pos.PieceOn too)
+        let attacked = ofEonego (pos.PieceOn too)
         let idx = makeIndexOriented orientation swap attacker from too attacked
 
         if idx < Dimensions && n < MaxActive then
@@ -176,7 +176,7 @@ let appendActiveThreats (perspective: int) (pos: Position) (buf: int[]) : int =
     for colorBit in 0..1 do
         let c = perspective ^^^ colorBit // us, then them
         // --- pawns: diagonal captures onto occupied squares + pawn blocked by a pawn in front ---
-        let attackerP = sfMakePiece c 1
+        let attackerP = makePiece c 1
         let cPawns = pos.PiecesCT c Pawn
 
         if c = White then
@@ -211,15 +211,15 @@ let appendActiveThreats (perspective: int) (pos: Position) (buf: int[]) : int =
                 emit attackerP (too + 8) too
 
         // --- knight, bishop, rook, queen: every attack landing on an occupied square ---
-        for sfPt in 2..5 do
-            let attacker = sfMakePiece c sfPt
-            let mutable bb = pos.PiecesCT c (sfPt - 1) // SF type -> Eonego type
+        for pt in 2..5 do
+            let attacker = makePiece c pt
+            let mutable bb = pos.PiecesCT c (pt - 1) // encoded type -> Eonego type
 
             while bb <> 0UL do
                 let from = popLsb &bb
 
                 let attacks =
-                    (match sfPt with
+                    (match pt with
                      | 2 -> knightAttacks from
                      | 3 -> bishopAttacks from occupied
                      | 4 -> rookAttacks from occupied
@@ -250,7 +250,7 @@ let appendActiveThreatsBoth (pos: Position) (bufW: int[]) (bufB: int[]) : int64 
     let mutable nB = 0
 
     let emit (attacker: int) (from: int) (too: int) =
-        let attacked = sfOfEonego (pos.PieceOn too)
+        let attacked = ofEonego (pos.PieceOn too)
         let wIdx = makeIndexOriented orientW 0 attacker from too attacked
 
         if wIdx < Dimensions && nW < MaxActive then
@@ -264,7 +264,7 @@ let appendActiveThreatsBoth (pos: Position) (bufW: int[]) (bufB: int[]) : int64 
             nB <- nB + 1
 
     for c in 0..1 do
-        let attackerP = sfMakePiece c 1
+        let attackerP = makePiece c 1
         let cPawns = pos.PiecesCT c Pawn
 
         if c = White then
@@ -298,15 +298,15 @@ let appendActiveThreatsBoth (pos: Position) (bufW: int[]) (bufB: int[]) : int64 
                 let too = popLsb &push
                 emit attackerP (too + 8) too
 
-        for sfPt in 2..5 do
-            let attacker = sfMakePiece c sfPt
-            let mutable bb = pos.PiecesCT c (sfPt - 1)
+        for pt in 2..5 do
+            let attacker = makePiece c pt
+            let mutable bb = pos.PiecesCT c (pt - 1)
 
             while bb <> 0UL do
                 let from = popLsb &bb
 
                 let attacks =
-                    (match sfPt with
+                    (match pt with
                      | 2 -> knightAttacks from
                      | 3 -> bishopAttacks from occupied
                      | 4 -> rookAttacks from occupied
@@ -336,8 +336,8 @@ let appendChangedThreatsBothAt (pos: Position) (dirty: int[]) (dirtyOff: int) (d
         let signedEdge = dirty.[dirtyOff + i]
         let edge = Accumulator.dirtyThreatEdge signedEdge
         let sign = Accumulator.dirtyThreatSign signedEdge
-        let attacker = sfOfEonego (Accumulator.dirtyThreatAttacker edge)
-        let attacked = sfOfEonego (Accumulator.dirtyThreatAttacked edge)
+        let attacker = ofEonego (Accumulator.dirtyThreatAttacker edge)
+        let attacked = ofEonego (Accumulator.dirtyThreatAttacked edge)
         let from = Accumulator.dirtyThreatFrom edge
         let too = Accumulator.dirtyThreatTo edge
         let wIdx = makeIndexOriented orientW 0 attacker from too attacked

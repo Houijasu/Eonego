@@ -126,7 +126,7 @@ let private collectLegal (pos: Position) : Move[] =
 let private isNoisyBest (pos: Position) (m: Move) : bool =
     isPromotion m || isEnPassant m || not (pos.IsEmpty(toSq m))
 
-let private whiteRelEval (net: SfNetwork) (pos: Position) : int =
+let private whiteRelEval (net: Network) (pos: Position) : int =
     let e = Nnue.evalCp net pos
     if pos.SideToMove = White then e else -e
 
@@ -156,7 +156,7 @@ let private softmaxPick (rng: Random) (temp: float) (moves: Move[]) (scores: int
 
         pick
 
-let private gameResult (net: SfNetwork) (pos: Position) (ply: int) (maxPlies: int) : float =
+let private gameResult (net: Network) (pos: Position) (ply: int) (maxPlies: int) : float =
     let legal = collectLegal pos
 
     if legal.Length = 0 then
@@ -181,7 +181,7 @@ let private searchMove
     (depth: int option)
     (nodes: int64 option)
     (cfg: SearchConfig)
-    (net: SfNetwork option)
+    (net: Network option)
     : struct (int * Move) =
     let fenNow = pos.ToFen()
 
@@ -211,7 +211,7 @@ let private playOneGame
     (depthOpt: int option)
     (nodesOpt: int64 option)
     (cfg: SearchConfig)
-    (net: SfNetwork)
+    (net: Network)
     : unit =
     let pos = Position.OfFen startFen
     let mutable rootMoves = [||]
@@ -281,7 +281,7 @@ let private playOneGame
                 ply <- ply + 1
 
 let runGen (args: string[]) : int =
-    let runGenGames outPath startFen games depthOpt nodesOpt temp seed randomPlies maxPlies (net: SfNetwork) =
+    let runGenGames outPath startFen games depthOpt nodesOpt temp seed randomPlies maxPlies (net: Network) =
         let cfg = { defaultConfig with Threads = 1 }
 
         use writer = new StreamWriter(outPath, false, Encoding.UTF8)
@@ -334,5 +334,5 @@ let runGen (args: string[]) : int =
                 1
             | Nnue.Loaded n -> runGenGames outPath startFen games depthOpt nodesOpt temp seed randomPlies maxPlies n
         | None ->
-            errLine "gen requires --net <path> (SF NNUE file)"
+            errLine "gen requires --net <path> (NNUE file)"
             1

@@ -21,7 +21,7 @@ open Eonego.Search
 
 /// Walk up to the repo root (holds Eonego.slnx) and load the real FullThreats net if present. Shared by the
 /// NNUE benchmarks so they exercise the actual evaluator instead of no-opping on a stale filename.
-let private loadFullThreatsNet () : SfNetwork option =
+let private loadFullThreatsNet () : Network option =
     let mutable dir = System.IO.DirectoryInfo(System.AppContext.BaseDirectory)
     let mutable root = None
 
@@ -435,7 +435,7 @@ type MovePickBench() =
 
         acc
 
-/// Static eval throughput for the Stockfish FullThreats NNUE — the sole evaluator. Soft-skips (does nothing)
+/// Static eval throughput for the FullThreats NNUE — the sole evaluator. Soft-skips (does nothing)
 /// if `nets/nn-f8a759c05f9f.nnue` is absent. These four benchmarks DECOMPOSE the per-node cost so the
 /// eval-vs-make-time-threat-tracking question can be settled empirically (the previous EvalBench loaded a
 /// stale filename and measured nothing; it also only exercised the unbound from-scratch path, never the
@@ -460,7 +460,7 @@ type EvalBench() =
     let richFen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -" // Kiwipete
 
     let mutable positions: Position[] = [||]
-    let mutable net: SfNetwork option = None
+    let mutable net: Network option = None
     let mutable bound = Unchecked.defaultof<Position>
     let moves: Move[] = Array.zeroCreate 256
     let mutable nMoves = 0
@@ -473,7 +473,7 @@ type EvalBench() =
         match net with
         | Some n ->
             bound <- Position.OfFen richFen
-            Eonego.Nnue.bindNnue n bound // SfActive = true; root frame (0) materialized -> incremental path live
+            Eonego.Nnue.bindNnue n bound // Active = true; root frame (0) materialized -> incremental path live
             nMoves <- generateLegal bound (Span<Move>(moves))
         | None -> ()
 
@@ -490,7 +490,7 @@ type EvalBench() =
 
         acc
 
-    /// Forward pass only: the bound root stays computed across calls, so SfEnsureComputed is a no-op.
+    /// Forward pass only: the bound root stays computed across calls, so EnsureComputed is a no-op.
     [<Benchmark>]
     member _.EvalBoundRoot() =
         match net with
@@ -512,7 +512,7 @@ type EvalBench() =
         | Some n -> evalInternal n bound true true
         | None -> 0
 
-    /// Pure make-time threat tracking (SfUpdatePieceThreats / SfRayBeyond + dirty recording), no eval.
+    /// Pure make-time threat tracking (UpdatePieceThreats / RayBeyond + dirty recording), no eval.
     [<Benchmark>]
     member _.MakeUnmake() =
         let mutable acc = 0
@@ -551,7 +551,7 @@ type SearchBench() =
 
     let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -" // Kiwipete (rich tree)
     let mutable worker = Unchecked.defaultof<Worker>
-    let mutable net: SfNetwork option = None
+    let mutable net: Network option = None
 
     [<GlobalSetup>]
     member _.Setup() =
@@ -586,7 +586,7 @@ type AccCheckpointSearchBench() =
     let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -" // Kiwipete (rich tree)
     let mutable workerOn = Unchecked.defaultof<Worker>
     let mutable workerOff = Unchecked.defaultof<Worker>
-    let mutable net: SfNetwork option = None
+    let mutable net: Network option = None
 
     [<GlobalSetup>]
     member _.Setup() =
@@ -644,7 +644,7 @@ type DagSearchBench() =
     let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -" // Kiwipete (rich tree)
     let mutable workerOn = Unchecked.defaultof<Worker>
     let mutable workerOff = Unchecked.defaultof<Worker>
-    let mutable net: SfNetwork option = None
+    let mutable net: Network option = None
 
     [<GlobalSetup>]
     member _.Setup() =
@@ -694,7 +694,7 @@ type DagSearchBench() =
 /// SearchControl - only the lock-free TT/DAG/checkpoint tables are shared mutable state) but stops on a NODE
 /// budget instead of depth/time and skips the UCI `bestmove` stdout write, so repeated BenchmarkDotNet
 /// invocations stay quiet and the wall-clock budget stays roughly comparable across thread counts.
-let private searchNodesMultiThreaded (fen: string) (nodes: int64) (cfg: SearchConfig) (net: SfNetwork option) : int64 =
+let private searchNodesMultiThreaded (fen: string) (nodes: int64) (cfg: SearchConfig) (net: Network option) : int64 =
     let tt = TranspositionTable(max 1 cfg.HashMb)
     let limits = { defaultLimits with Nodes = nodes }
     let control = SearchControl(cfg, limits, tt, fen, [||], ?net = net)
@@ -749,7 +749,7 @@ type DagSearchMtBench() =
 
     let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -" // Kiwipete (rich tree)
     let nodeBudget = 200_000L
-    let mutable net: SfNetwork option = None
+    let mutable net: Network option = None
 
     [<Params(1, 4, 8)>]
     member val Threads = 1 with get, set
@@ -792,7 +792,7 @@ type AccCheckpointSearchMtBench() =
 
     let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -" // Kiwipete (rich tree)
     let nodeBudget = 200_000L
-    let mutable net: SfNetwork option = None
+    let mutable net: Network option = None
 
     [<Params(1, 4, 8)>]
     member val Threads = 1 with get, set

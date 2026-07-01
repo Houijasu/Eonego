@@ -1,7 +1,7 @@
 /// Eonego — staged, allocation-free move generation for the chess engine.
 ///
-/// Phase 1 delivers the PERFT GATE: a Stockfish-style pseudo-legal generator plus a cheap legality
-/// filter (`isLegal`) that consumes the check/pin state Position already caches in `set_check_info`
+/// Phase 1 delivers the PERFT GATE: a pseudo-legal generator plus a cheap legality
+/// filter (`isLegal`) that consumes the check/pin state Position already caches
 /// (Checkers, BlockersForKing, Pinners, CheckSquares). Node counts are validated against the published
 /// reference values for the standard test positions before any search is layered on.
 ///
@@ -54,7 +54,7 @@ let NonEvasions = 4
 let Legal = 5 // never routed through `generate`; served by `generateLegal`
 
 [<Literal>]
-let MaxMoves = 256 // SF MAX_MOVES; max legal moves in any position ≈ 218
+let MaxMoves = 256 // max legal moves in any position ≈ 218
 
 // Color-relative pawn rank masks (Bitboard.fs ships only Rank1/Rank8). Plain hex, 16 digits each.
 [<Literal>]
@@ -88,7 +88,7 @@ let addPromotions (moves: Span<Move>) (n: byref<int>) (from: Square) (dst: Squar
     addMove moves &n (mkPromotion from dst Bishop)
     addMove moves &n (mkPromotion from dst Knight)
 
-/// Per-genType promotion emission (Stockfish make_promotions split, Phase-2 refinement). The QUEEN
+/// Per-genType promotion emission (promotion split, Phase-2 refinement). The QUEEN
 /// promotion counts as a CAPTURE-class move (so a captures-only qsearch sees queen push-promotions); the
 /// three under-promotions split capture vs quiet. `isCapture` = the promotion lands on an enemy square.
 ///   Captures  : Queen (push or capture) + Rook/Bishop/Knight only when capturing.
@@ -342,7 +342,7 @@ let generate (pos: Position) (moves: Span<Move>) (genType: int) : int =
         n
 
 // ---------------------------------------------------------------------------
-// (5) Legality filter (SF Position::legal). Module function — Position stays frozen.
+// (5) Legality filter. Module function — Position stays frozen.
 // ---------------------------------------------------------------------------
 let isLegal (pos: Position) (m: Move) : bool =
     let us = pos.SideToMove
@@ -377,7 +377,7 @@ let isLegal (pos: Position) (m: Move) : bool =
 
 // ---------------------------------------------------------------------------
 // (6) Fully-legal generation. Pseudo-legal then in-place 0-alloc compaction with
-//     SF's fast-path: only EP, king moves, and pinned pieces need the isLegal test.
+//     The fast-path: only EP, king moves, and pinned pieces need the isLegal test.
 // ---------------------------------------------------------------------------
 let generateLegal (pos: Position) (moves: Span<Move>) : int =
     let us = pos.SideToMove

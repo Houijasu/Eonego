@@ -41,8 +41,8 @@ let private cfgOff = { cfgBase with UseProbCut = false }
 // ---------------------------------------------------------------------------
 [<Fact>]
 let ``ProbCut does not hide a winning capture`` () =
-    match tryLoadSfNet () with
-    | None -> () // soft-skip: SF net absent
+    match tryLoadNet () with
+    | None -> () // soft-skip: NNUE net absent
     | Some net ->
         let struct (score, _, m) = searchToDepthNet "4k3/8/8/3q4/4P3/8/8/3RK3 w - - 0 1" [||] 8 cfgOn (Some net)
         Assert.Equal(mkSquare 3 4, toSq m)                          // the move captures the queen on d5
@@ -60,8 +60,8 @@ let ``ProbCut does not hide a mate`` () =
 // ---------------------------------------------------------------------------
 [<Fact>]
 let ``ProbCut reduces nodes on a capture-rich position`` () =
-    match tryLoadSfNet () with
-    | None -> () // soft-skip: SF net absent
+    match tryLoadNet () with
+    | None -> () // soft-skip: NNUE net absent
     | Some net ->
         let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"   // Kiwipete
         let depth = 9

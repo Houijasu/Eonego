@@ -50,8 +50,8 @@ let snap (p: Position) : Snap =
       Rule50 = p.Rule50
       Stm = p.SideToMove }
 
-/// Load the SF16 net for eval-dependent tests; None when nets/sf16.nnue is absent (soft-skip).
-let tryLoadSfNet () : SfNetwork option =
+/// Load the NNUE net for eval-dependent tests; None when nets/nn-f8a759c05f9f.nnue is absent (soft-skip).
+let tryLoadNet () : Network option =
     let mutable dir = System.IO.DirectoryInfo(System.AppContext.BaseDirectory)
     let mutable root = None
     while root.IsNone && not (isNull dir) do

@@ -54,7 +54,7 @@ let FlagCastling = 3
 
 // ---------------------------------------------------------------------------
 // Sentinels. Both have from == to (impossible for a legal move) so `isOk`
-// rejects both. MoveNull = 0x41 = b1->b1 is Stockfish's Move(65).
+// rejects both. MoveNull = 0x41 = b1->b1 (the null-move sentinel; never a legal move).
 // ---------------------------------------------------------------------------
 [<Literal>]
 let MoveNone = 0

@@ -1,7 +1,7 @@
 /// Eonego — lock-free Zobrist-keyed NNUE accumulator checkpoint cache (Phase 1 of the DAG+TT plan).
 ///
 /// Each slot caches a fully-materialized NNUE accumulator snapshot (per-perspective L1 int16 arrays +
-/// PSQT int32 buckets) for a position identified by its 64-bit Zobrist key. When `Position.SfEnsureBothComputed`
+/// PSQT int32 buckets) for a position identified by its 64-bit Zobrist key. When `Position.EnsureBothComputed`
 /// walks back a deep lazy frame stack, it can short-circuit by consulting this cache: a hit pays an O(1) copy
 /// instead of an O(distance) frame-delta walk. The cache is the substrate that makes far DAG transposition
 /// jumps (Phases 3+) cheap; in Phase 1 it is wired into the existing alpha-beta Lazy-SMP path as a bonus
@@ -175,7 +175,7 @@ type AccCheckpointTable(mb: int) =
     /// Store a fresh snapshot. Caller's buffers are copied into the slot in the strict ordering
     /// (payload -> hash -> key) defined by the module doc. The previous occupant is overwritten unconditionally;
     /// a best-effort age check would add races without payoff for Phase 1 (write frequency is bounded by
-    /// successful SfEnsureBothComputed completions, well below TT-store traffic).
+    /// successful EnsureBothComputed completions, well below TT-store traffic).
     member this.Store
         (realKey: uint64,
          srcAccW: int16[],

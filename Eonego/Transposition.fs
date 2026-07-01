@@ -9,7 +9,7 @@
 ///
 /// `Data` packing (LSB->MSB): move:16 | score:int16 | eval:int16 | depth:uint8 | genBound:uint8 ,
 /// where genBound = (generation5 << 3) | (ttPv << 2) | bound. generation is therefore only 5 bits
-/// (wraps mod 32); bit 2 is the SF-style ttPv flag (set at former-PV nodes).
+/// (wraps mod 32); bit 2 is the ttPv flag (set at former-PV nodes).
 /// Clusters of 4 entries (64 B, cache-line sized). Replacement = empty/key-match first, else min
 /// (depth - relativeAge*2). Scores are mate-ply-corrected by the CALLER (Search.valueToTt/valueFromTt).
 ///
@@ -175,7 +175,7 @@ type TranspositionTable(mb: int) =
         let ek = Volatile.Read(&entries.[slot].Key)
         let ed = Volatile.Read(&entries.[slot].Data)
         let isMatch = (ek ^^^ ed) = key && dBound ed <> BoundNone
-        // Keep the existing move when overwriting the same position with MoveNone (SF behaviour).
+        // Keep the existing move when overwriting the same position with MoveNone (standard behaviour).
         let mv = if move <> MoveNone || not isMatch then move else dMove ed
         // On a key match, preserve a meaningfully deeper non-exact entry's value/depth/bound.
         let updateValue = (not isMatch) || (bound = BoundExact) || (depth + 4 > dDepth ed)
@@ -183,7 +183,7 @@ type TranspositionTable(mb: int) =
         let sc = if updateValue then score else dScore ed
         let ev = if updateValue then eval else dEval ed
         let bd = if updateValue then bound else dBound ed
-        // ttPv is sticky: once a position is marked PV, keep it marked across overwrites (SF behaviour).
+        // ttPv is sticky: once a position is marked PV, keep it marked across overwrites (standard behaviour).
         let pvOut = ttPv || (isMatch && dTtPv ed)
         let pvBit = if pvOut then 1 else 0
         let data = packData mv sc ev dpt ((generation <<< 3) ||| (pvBit <<< 2) ||| bd)

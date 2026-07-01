@@ -100,7 +100,7 @@ type SearchConfig =
       // Phase 1: NNUE accumulator checkpoint cache. Set to 0 to disable; ~4 MiB is the recommended default
       // (1024 slots, ~4.1 KiB/slot). Cleared per search by `SearchControl.NewSearch` (alongside the TT gen
       // bump). Probes are best-effort lock-free (matching the TT); populates on each successful
-      // `Position.SfEnsureBothComputed` materialization.
+      // `Position.EnsureBothComputed` materialization.
       AccCheckpointMb: int
       // Phase 2: DAG node table. Set to 0 to disable; ~2 MiB is the default (the table carries in-flight
       // partial-result + alpha/beta-window metadata the TT cannot encode). Worker search routes through the DAG
@@ -271,7 +271,7 @@ let private PonderArmed = 3
 
 [<Sealed>]
 type SearchControl
-    (config: SearchConfig, limits: SearchLimits, tt: TranspositionTable, rootFen: string, rootMoves: Move[], ?net: SfNetwork) =
+    (config: SearchConfig, limits: SearchLimits, tt: TranspositionTable, rootFen: string, rootMoves: Move[], ?net: Network) =
     let mutable stopFlag = 0
     let mutable startTick = System.Diagnostics.Stopwatch.GetTimestamp()
     let mutable softMs = 0L
@@ -287,7 +287,7 @@ type SearchControl
         (delta * 1000L) / System.Diagnostics.Stopwatch.Frequency
 
     // Phase 1: per-search NNUE accumulator checkpoint cache. `null` when the config disables it (zero MiB).
-    // Owned here, bound to each worker's `Position` via `SfBindCheckpoint` in `Worker.SetupRoot`; cleared in
+    // Owned here, bound to each worker's `Position` via `BindCheckpoint` in `Worker.SetupRoot`; cleared in
     // `NewSearch` alongside `tt.newSearch`.
     let accCheckpoint: AccCheckpointTable =
         if config.AccCheckpointMb <= 0 then null else AccCheckpointTable(config.AccCheckpointMb)
@@ -301,7 +301,7 @@ type SearchControl
     member _.Tt = tt
     member _.RootFen = rootFen
     member _.RootMoves = rootMoves
-    member _.Net: SfNetwork option = net
+    member _.Net: Network option = net
     /// Borrowed reference to the per-search accumulator checkpoint cache; `null` when disabled in config.
     member _.AccCheckpoint: AccCheckpointTable = accCheckpoint
     /// Borrowed reference to the per-search DAG node table; `null` when disabled in config.
@@ -464,12 +464,12 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
         for m in control.RootMoves do
             pos.Make m
 
-        // Phase 1: borrow the per-search checkpoint cache so `SfEnsureBothComputed` can probe/store snapshots
+        // Phase 1: borrow the per-search checkpoint cache so `EnsureBothComputed` can probe/store snapshots
         // during the upcoming search. `null` disables the fast-path entirely. Seed the root snapshot now —
         // `EnableNnue` just materialized frame 0 and set the computed flags, so the early-return path inside
-        // `SfEnsureBothComputed` would otherwise skip the populate on the first eval at the root.
-        pos.SfBindCheckpoint control.AccCheckpoint
-        pos.SfSeedCheckpoint()
+        // `EnsureBothComputed` would otherwise skip the populate on the first eval at the root.
+        pos.BindCheckpoint control.AccCheckpoint
+        pos.SeedCheckpoint()
 
         tables.Clear()
         nodes <- 0L
@@ -1350,7 +1350,7 @@ let computeTimes (moveOverhead: int) (l: SearchLimits) (stm: Color) : int64 * in
             (0L, 0L)
         else
             // Proven baseline budget + MoveOverhead: soft ~ (clock - overhead)/movestogo + 3/4*inc; hard caps
-            // one move at 40% of the clock (or 4x soft). The SF optimum/maximum-scaling experiment over the
+            // one move at 40% of the clock (or 4x soft). The optimum/maximum-scaling experiment over the
             // soft limit was reverted as an un-tuned regression (it spent only ~1/3 of the budget).
             let mtg = if l.MovesToGo > 0 then l.MovesToGo else 30
             let avail = max 1L (int64 time - overhead)
@@ -1429,7 +1429,7 @@ let go (control: SearchControl) : Move =
 // ---------------------------------------------------------------------------
 // Test entry: a single fixed-depth, FULL-WINDOW negamax (bypasses aspiration/ID). The correctness oracle.
 // ---------------------------------------------------------------------------
-let searchToDepthNet (fen: string) (rootMoves: Move[]) (depth: int) (cfg: SearchConfig) (net: SfNetwork option) : struct (int * int64 * Move) =
+let searchToDepthNet (fen: string) (rootMoves: Move[]) (depth: int) (cfg: SearchConfig) (net: Network option) : struct (int * int64 * Move) =
     let tt = TranspositionTable(max 1 cfg.HashMb)
 
     let control =
@@ -1444,7 +1444,7 @@ let searchToDepthNet (fen: string) (rootMoves: Move[]) (depth: int) (cfg: Search
     struct (score, w.Nodes, w.Pv.[0])
 
 /// Single-thread iterative deepening until the node budget is exhausted (no UCI stdout). Test/tooling entry.
-let searchToNodesNet (fen: string) (rootMoves: Move[]) (nodes: int64) (cfg: SearchConfig) (net: SfNetwork option) : struct (int * int64 * Move) =
+let searchToNodesNet (fen: string) (rootMoves: Move[]) (nodes: int64) (cfg: SearchConfig) (net: Network option) : struct (int * int64 * Move) =
     let tt = TranspositionTable(max 1 cfg.HashMb)
     let limits = { defaultLimits with Nodes = nodes }
 

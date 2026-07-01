@@ -62,12 +62,12 @@
     <Compile Include="Program.fs" />
   </ItemGroup>
 
-  <!-- Embed the SF NNUE evaluator into the binary so the exe is self-contained. Conditional on the net
+  <!-- Embed the NNUE evaluator into the binary so the exe is self-contained. Conditional on the net
        existing: nets/ is gitignored (the net is large/licensed), so a fresh checkout (CI, a new contributor)
        builds without it — the exe then has no embedded net and tests that need one soft-skip. Local/release
        builds embed it as before. -->
   <ItemGroup Condition="Exists('..\nets\nn-f8a759c05f9f.nnue')">
-    <EmbeddedResource Include="..\nets\nn-f8a759c05f9f.nnue" LogicalName="sf16.nnue" />
+    <EmbeddedResource Include="..\nets\nn-f8a759c05f9f.nnue" LogicalName="eval.nnue" />
   </ItemGroup>
 
 </Project>

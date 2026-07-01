@@ -1,4 +1,4 @@
-/// History.Tables: SF "gravity" updates must saturate within int16 (never overflow) and converge toward
+/// History.Tables: "gravity" updates must saturate within int16 (never overflow) and converge toward
 /// the divisor D; counter-moves and killers must round-trip per (piece,to) / per ply.
 module Eonego.Tests.HistoryTests
 

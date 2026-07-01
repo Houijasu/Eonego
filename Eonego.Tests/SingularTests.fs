@@ -21,8 +21,8 @@ let private cfgOff = { defaultConfig with UseSingular = false }
 // ---------------------------------------------------------------------------
 [<Fact>]
 let ``singular extension does not hide a winning capture`` () =
-    match tryLoadSfNet () with
-    | None -> () // soft-skip: SF net absent
+    match tryLoadNet () with
+    | None -> () // soft-skip: NNUE net absent
     | Some net ->
         let struct (score, _, m) = searchToDepthNet "4k3/8/8/3q4/4P3/8/8/3RK3 w - - 0 1" [||] 10 cfgOn (Some net)
         Assert.Equal(mkSquare 3 4, toSq m) // e4xd5 takes the queen

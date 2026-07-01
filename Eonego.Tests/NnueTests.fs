@@ -1,8 +1,8 @@
-/// Stockfish-master "FullThreats" NNUE loader + evaluator tests. The net (nn-f8a759c05f9f.nnue, version
+/// "FullThreats" NNUE loader + evaluator tests. The net (nn-f8a759c05f9f.nnue, version
 /// 0x6A448AFA, ~90 MB) is NOT committed (CC0 but large) — these SOFT-SKIP when absent. Without a way to run
-/// real Stockfish here we cannot bit-exact-verify the inference, so these are STRUCTURAL (loads-to-EOF +
+/// a reference engine here we cannot bit-exact-verify the inference, so these are STRUCTURAL (loads-to-EOF +
 /// dimensions) and SANITY (startpos balanced, up-a-rook large). The parity scaffold at the bottom is ready
-/// for reference "NNUE evaluation" pawn values from real Stockfish on this net.
+/// for reference "NNUE evaluation" pawn values from a reference engine on this net.
 module Eonego.Tests.NnueTests
 
 open System
@@ -29,7 +29,7 @@ let private netPath () : string option =
         if File.Exists p then Some p else None
     | None -> None
 
-let private withNet (f: SfNetwork -> unit) =
+let private withNet (f: Network -> unit) =
     match netPath () with
     | None -> () // soft-skip: net not present
     | Some p ->
@@ -37,13 +37,13 @@ let private withNet (f: SfNetwork -> unit) =
         | Failed reason -> Assert.Fail("FullThreats net failed to load: " + reason)
         | Loaded net -> f net
 
-let private assertRawAccEqualsOracle (net: SfNetwork) (bound: Position) (oracle: Position) =
+let private assertRawAccEqualsOracle (net: Network) (bound: Position) (oracle: Position) =
     for persp in [ White; Black ] do
         let incAcc = Array.zeroCreate<int16> L1 // int16 incremental accumulator
         let incPsqt = Array.zeroCreate PsqtBuckets
         let refAcc = Array.zeroCreate L1 // int32 "true value" oracle
         let refPsqt = Array.zeroCreate PsqtBuckets
-        bound.SfReadAccInto(persp, Span<int16>(incAcc), Span<int>(incPsqt))
+        bound.ReadAccInto(persp, Span<int16>(incAcc), Span<int>(incPsqt))
         buildAccOracle net oracle persp (Span<int>(refAcc)) (Span<int>(refPsqt))
         // int16 incremental == int16(true value), AND the true value fits int16 (the overflow gate the old
         // both-int32 test could not express).
@@ -93,7 +93,7 @@ let ``int32 oracle accumulator stays within int16 range over a deep corpus`` () 
 let ``loads to EOF with the FullThreats version`` () =
     withNet (fun net ->
         // A clean `Loaded` already means the parse consumed exactly to EOF (layout/dimension proof).
-        Assert.Equal(SfVersion, net.Version))
+        Assert.Equal(Version, net.Version))
 
 [<Fact>]
 let ``feature-transformer arrays have the dual-input FullThreats dimensions`` () =
@@ -143,7 +143,7 @@ let ``incremental accumulator equals from-scratch over a make/unmake walk`` () =
 
         for fen in fens do
             let bound = Position.OfFen fen
-            bindNnue net bound // sfActive -> incremental
+            bindNnue net bound // active -> incremental
             let oracle = Position.OfFen fen // unbound -> from-scratch
             walk bound oracle 2)
 
@@ -173,27 +173,27 @@ let ``lazy accumulator replays unevaluated real-move chains`` () =
             assertRawAccEqualsOracle net bound oracle)
 
 [<Fact>]
-let ``null moves preserve sfTop and replay across following real move`` () =
+let ``null moves preserve top and replay across following real move`` () =
     withNet (fun net ->
         let bound = Position.OfFen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
         bindNnue net bound
         let oracle = Position.OfFen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
-        let top0 = bound.SfTop
+        let top0 = bound.Top
         bound.MakeNull()
         oracle.MakeNull()
-        Assert.Equal(top0, bound.SfTop)
+        Assert.Equal(top0, bound.Top)
         assertRawAccEqualsOracle net bound oracle
         let m = (collectLegal bound).[0]
         bound.Make m
         oracle.Make m
-        Assert.Equal(top0 + 1, bound.SfTop)
+        Assert.Equal(top0 + 1, bound.Top)
         assertRawAccEqualsOracle net bound oracle
         bound.Unmake m
         oracle.Unmake m
-        Assert.Equal(top0, bound.SfTop)
+        Assert.Equal(top0, bound.Top)
         bound.UnmakeNull()
         oracle.UnmakeNull()
-        Assert.Equal(top0, bound.SfTop)
+        Assert.Equal(top0, bound.Top)
         assertRawAccEqualsOracle net bound oracle)
 
 [<Fact>]
@@ -204,7 +204,7 @@ let ``changed threat indices are materialized eagerly during make`` () =
         let dirty = Array.zeroCreate Eonego.Accumulator.MaxDirtyThreats
         let move =
             collectLegal scout
-            |> Array.find (fun m -> scout.SfDebugCollectDirtyThreats(m, dirty) > 0)
+            |> Array.find (fun m -> scout.DebugCollectDirtyThreats(m, dirty) > 0)
         let bound = Position.OfFen fen
         let mutable changedCalls = 0
         bound.EnableNnue
@@ -280,20 +280,20 @@ let ``evalCp is roughly balanced at startpos and large-positive when up a rook``
 
 // ---------------------------------------------------------------------------
 // PARITY SCAFFOLD (the only TRUE correctness gate). Fill `cases` with (FEN, white-side pawn value) from
-// running real Stockfish (with this net): `position fen <FEN>` then `eval`, read the final "NNUE evaluation"
+// running a reference engine (with this net): `position fen <FEN>` then `eval`, read the final "NNUE evaluation"
 // pawn number. Then this asserts Eonego matches to +/-0.05 pawn. Empty => no-op until provided.
 // ---------------------------------------------------------------------------
 [<Literal>]
 let private NormalizeToPawnValueF = 356.0
 
-let private parityCases: (string * float) list = [] // (fen, sf_white_pawns)
+let private parityCases: (string * float) list = [] // (fen, white_pawns)
 
 [<Fact>]
-let ``inference matches real Stockfish NNUE eval (white-side pawns) when reference values are provided`` () =
+let ``inference matches a reference NNUE eval (white-side pawns) when reference values are provided`` () =
     withNet (fun net ->
         for (fen, expected) in parityCases do
             let pos = Position.OfFen fen
             let cpStm = float (evalCp net pos)
             let cpWhite = if pos.SideToMove = White then cpStm else -cpStm
             let pawns = cpWhite / 100.0
-            Assert.True(abs (pawns - expected) < 0.05, sprintf "%s: mine=%.2f sf=%.2f" fen pawns expected))
+            Assert.True(abs (pawns - expected) < 0.05, sprintf "%s: mine=%.2f expected=%.2f" fen pawns expected))

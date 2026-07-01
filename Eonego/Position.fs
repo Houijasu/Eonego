@@ -1,7 +1,7 @@
 /// Eonego — mutable board state for the chess engine.
 ///
 /// Position is a single [<Sealed>] mutable CLASS (one heap allocation reused across the whole search via
-/// make/unmake — NOT copy-make). It owns Stockfish-style boards: `byTypeBB.[0..5]` = Pawn..King (both
+/// make/unmake — NOT copy-make). It owns boards: `byTypeBB.[0..5]` = Pawn..King (both
 /// colors), `byTypeBB.[AllPieces]` = full occupancy, `byColorBB.[2]`, and a `Piece[64]` mailbox. All
 /// irreversible / derived undo data lives in a plain mutable [<Struct>] StateInfo stored in a preallocated
 /// `StateInfo[MaxPly]` stack indexed by `stPly` (no per-node allocation, no linked list), read copy-free
@@ -54,7 +54,7 @@ let private castleKingPath: Bitboard[] = Array.zeroCreate 16 // by right bit; sq
 let private castleEmptyPath: Bitboard[] = Array.zeroCreate 16 // by right bit; squares that must be empty
 let private castleRookOrigin: int[] = Array.create 16 NoSquare // by right bit; rook from square
 let private castleKingDest: int[] = Array.create 16 NoSquare // by right bit; king to square
-let private sfRayBeyond: Bitboard[] = Array.zeroCreate (64 * 64) // [from][through] -> squares beyond through
+let private rayBeyond: Bitboard[] = Array.zeroCreate (64 * 64) // [from][through] -> squares beyond through
 
 let private bbOf (sqs: int list) : Bitboard =
     List.fold (fun acc s -> acc ||| (1UL <<< s)) 0UL sqs
@@ -117,7 +117,7 @@ let private initTables () =
                         b <- b ||| (1UL <<< sq)
                         sq <- sq + step
 
-                    sfRayBeyond.[(from <<< 6) + throughSq] <- b
+                    rayBeyond.[(from <<< 6) + throughSq] <- b
 
 do initTables ()
 
@@ -151,7 +151,7 @@ type StateInfo =
       mutable PliesFromNull: int
       mutable CapturedPiece: Piece // removed by the move producing this node; NoPiece if none
       mutable Repetition: int // 0 none; search-only (perft ignores)
-      // cached check-info (SF set_check_info), for the side to move AT this node
+      // cached check-info, for the side to move AT this node
       mutable Checkers: Bitboard
       mutable BlockersW: Bitboard // pieces (either color) blocking a check on the White king
       mutable BlockersB: Bitboard
@@ -177,81 +177,81 @@ type Position() =
     let states: StateInfo[] = Array.zeroCreate MaxPly
     let mutable stPly = 0
 
-    // --- SF FullThreats NNUE lazy accumulator (gated by sfActive) ----------------------------------------
+    // --- FullThreats NNUE lazy accumulator (gated by active) ----------------------------------------
     // MERGED accumulator: HalfKA and FullThreats both add into the same L1 cells. Make records dirty frame
-    // metadata; eval/read materializes the current sfTop frame on demand. Dirty threats are physical edges,
+    // metadata; eval/read materializes the current top frame on demand. Dirty threats are physical edges,
     // converted to perspective-dependent indices through delegates bound by NNUE.fs to avoid Position->Threats.
     [<Literal>]
-    let SfMaxThreats = 256
+    let MaxThreats = 256
 
     [<Literal>]
-    let SfMaxPly = 246
+    let AccMaxPly = 246
 
-    let mutable sfActive = false
-    let mutable sfEagerUpdates = false
-    let mutable sfTop = 0
-    // Phase 1 — optional lock-free NNUE accumulator checkpoint cache. When non-null, `SfEnsureBothComputed`
+    let mutable active = false
+    let mutable eagerUpdates = false
+    let mutable top = 0
+    // Phase 1 — optional lock-free NNUE accumulator checkpoint cache. When non-null, `EnsureBothComputed`
     // consults it as a fast-path before walking the lazy frame stack, and populates it on a successful
-    // materialization. Owned by `SearchControl`, bound per-worker via `SfBindCheckpoint`; cleared via the
+    // materialization. Owned by `SearchControl`, bound per-worker via `BindCheckpoint`; cleared via the
     // owning table's `Clear()` between searches (NOT here — the position may outlive multiple searches).
-    let mutable sfCheckpoint: AccCheckpointTable = null
-    let mutable sfAccW: int16[] = Array.empty
-    let mutable sfAccB: int16[] = Array.empty
-    let mutable sfPsqW: int[] = Array.empty
-    let mutable sfPsqB: int[] = Array.empty
-    let mutable sfComputedW: bool[] = Array.empty
-    let mutable sfComputedB: bool[] = Array.empty
-    let sfTmpW: int[] = Array.zeroCreate SfMaxThreats // enumeration scratch, white perspective
-    let sfTmpB: int[] = Array.zeroCreate SfMaxThreats // enumeration scratch, black perspective
-    let sfChangedW: int[] = Array.zeroCreate Accumulator.MaxDirtyThreats
-    let sfChangedB: int[] = Array.zeroCreate Accumulator.MaxDirtyThreats
-    let mutable sfBiases: int16[] = Array.empty
-    let mutable sfHalfWeights: int16[] = Array.empty
-    let mutable sfHalfPsqt: int[] = Array.empty
-    let mutable sfThreatWeights: sbyte[] = Array.empty
-    let mutable sfThreatPsqt: int[] = Array.empty
-    let mutable sfThreatFn: (System.Func<Position, int, int[], int>) | null = null
-    let mutable sfThreatFnBoth: (System.Func<Position, int[], int[], int64>) | null = null
-    let mutable sfThreatFnChangedBoth: (System.Func<Position, int[], int, int, int[], int[], int64>) | null = null
-    let mutable sfFrameDirtyPc: int[] = Array.empty
-    let mutable sfFrameDirtySq: int[] = Array.empty
-    let mutable sfFrameDirtySign: int[] = Array.empty
-    let mutable sfFrameDirtyN: int[] = Array.empty
-    let mutable sfFrameThreats: int[] = Array.empty
-    let mutable sfFrameThreatN: int[] = Array.empty
-    let mutable sfFrameChangedW: int[] = Array.empty
-    let mutable sfFrameChangedB: int[] = Array.empty
-    let mutable sfFrameChangedNW: int[] = Array.empty
-    let mutable sfFrameChangedNB: int[] = Array.empty
-    let mutable sfFrameChangedValid: bool[] = Array.empty
-    let mutable sfFrameChangedKsqW: int[] = Array.empty
-    let mutable sfFrameChangedKsqB: int[] = Array.empty
-    let mutable sfFrameWhiteKingMoved: bool[] = Array.empty
-    let mutable sfFrameBlackKingMoved: bool[] = Array.empty
-    let mutable sfFrameThreatOverflow: bool[] = Array.empty
-    let sfDirtyPc: int[] = Array.zeroCreate Accumulator.MaxDirtyPieces
-    let sfDirtySq: int[] = Array.zeroCreate Accumulator.MaxDirtyPieces
-    let sfDirtySign: int[] = Array.zeroCreate Accumulator.MaxDirtyPieces
-    let mutable sfDirtyN = 0
-    let sfDirtyThreats: int[] = Array.zeroCreate Accumulator.MaxDirtyThreats
-    let mutable sfDirtyThreatN = 0
-    let mutable sfDirtyThreatOverflow = false
+    let mutable checkpoint: AccCheckpointTable = null
+    let mutable accW: int16[] = Array.empty
+    let mutable accB: int16[] = Array.empty
+    let mutable psqW: int[] = Array.empty
+    let mutable psqB: int[] = Array.empty
+    let mutable computedW: bool[] = Array.empty
+    let mutable computedB: bool[] = Array.empty
+    let tmpW: int[] = Array.zeroCreate MaxThreats // enumeration scratch, white perspective
+    let tmpB: int[] = Array.zeroCreate MaxThreats // enumeration scratch, black perspective
+    let changedW: int[] = Array.zeroCreate Accumulator.MaxDirtyThreats
+    let changedB: int[] = Array.zeroCreate Accumulator.MaxDirtyThreats
+    let mutable biases: int16[] = Array.empty
+    let mutable halfWeights: int16[] = Array.empty
+    let mutable halfPsqt: int[] = Array.empty
+    let mutable threatWeights: sbyte[] = Array.empty
+    let mutable threatPsqt: int[] = Array.empty
+    let mutable threatFn: (System.Func<Position, int, int[], int>) | null = null
+    let mutable threatFnBoth: (System.Func<Position, int[], int[], int64>) | null = null
+    let mutable threatFnChangedBoth: (System.Func<Position, int[], int, int, int[], int[], int64>) | null = null
+    let mutable frameDirtyPc: int[] = Array.empty
+    let mutable frameDirtySq: int[] = Array.empty
+    let mutable frameDirtySign: int[] = Array.empty
+    let mutable frameDirtyN: int[] = Array.empty
+    let mutable frameThreats: int[] = Array.empty
+    let mutable frameThreatN: int[] = Array.empty
+    let mutable frameChangedW: int[] = Array.empty
+    let mutable frameChangedB: int[] = Array.empty
+    let mutable frameChangedNW: int[] = Array.empty
+    let mutable frameChangedNB: int[] = Array.empty
+    let mutable frameChangedValid: bool[] = Array.empty
+    let mutable frameChangedKsqW: int[] = Array.empty
+    let mutable frameChangedKsqB: int[] = Array.empty
+    let mutable frameWhiteKingMoved: bool[] = Array.empty
+    let mutable frameBlackKingMoved: bool[] = Array.empty
+    let mutable frameThreatOverflow: bool[] = Array.empty
+    let dirtyPc: int[] = Array.zeroCreate Accumulator.MaxDirtyPieces
+    let dirtySq: int[] = Array.zeroCreate Accumulator.MaxDirtyPieces
+    let dirtySign: int[] = Array.zeroCreate Accumulator.MaxDirtyPieces
+    let mutable dirtyN = 0
+    let dirtyThreats: int[] = Array.zeroCreate Accumulator.MaxDirtyThreats
+    let mutable dirtyThreatN = 0
+    let mutable dirtyThreatOverflow = false
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-    member private _.SfAppendDirtyThreat(putPiece: bool, pc: Piece, attacked: Piece, from: Square, too: Square) =
-        if pc <> NoPiece && attacked <> NoPiece && pieceType pc <> King && not sfDirtyThreatOverflow then
-            if sfDirtyThreatN < Accumulator.MaxDirtyThreats then
+    member private _.AppendDirtyThreat(putPiece: bool, pc: Piece, attacked: Piece, from: Square, too: Square) =
+        if pc <> NoPiece && attacked <> NoPiece && pieceType pc <> King && not dirtyThreatOverflow then
+            if dirtyThreatN < Accumulator.MaxDirtyThreats then
                 let edge = Accumulator.packDirtyThreatEdge pc from too attacked
-                sfDirtyThreats.[sfDirtyThreatN] <- Accumulator.packSignedDirtyThreat edge (if putPiece then 1 else -1)
-                sfDirtyThreatN <- sfDirtyThreatN + 1
+                dirtyThreats.[dirtyThreatN] <- Accumulator.packSignedDirtyThreat edge (if putPiece then 1 else -1)
+                dirtyThreatN <- dirtyThreatN + 1
             else
-                sfDirtyThreatOverflow <- true
+                dirtyThreatOverflow <- true
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-    member private _.SfRayBeyond(from: Square, throughSq: Square) : Bitboard =
-        sfRayBeyond.[(from <<< 6) + throughSq]
+    member private _.RayBeyond(from: Square, throughSq: Square) : Bitboard =
+        rayBeyond.[(from <<< 6) + throughSq]
 
-    member private _.SfPawnPushOrAttacks(c: Color, sq: Square) : Bitboard =
+    member private _.PawnPushOrAttacks(c: Color, sq: Square) : Bitboard =
         let atk = pawnAttacks c sq
 
         let push =
@@ -265,7 +265,7 @@ type Position() =
         atk ||| push
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-    member private this.SfProcessSliders
+    member private this.ProcessSliders
         (
             sliders: Bitboard,
             putPiece: bool,
@@ -285,17 +285,17 @@ type Position() =
             let slider = board.[sliderSq]
 
             if computeRay then
-                let ray = this.SfRayBeyond(sliderSq, sq)
+                let ray = this.RayBeyond(sliderSq, sq)
                 let discovered = ray &&& (rAttacks ||| bAttacks) &&& occupiedNoK
 
                 if discovered <> 0UL && ((ray &&& noRaysContaining) <> noRaysContaining) then
                     let threatenedSq = lsb discovered
-                    this.SfAppendDirtyThreat(not putPiece, slider, board.[threatenedSq], sliderSq, threatenedSq)
+                    this.AppendDirtyThreat(not putPiece, slider, board.[threatenedSq], sliderSq, threatenedSq)
 
             if addDirectAttacks then
-                this.SfAppendDirtyThreat(putPiece, slider, pc, sliderSq, sq)
+                this.AppendDirtyThreat(putPiece, slider, pc, sliderSq, sq)
 
-    member private this.SfUpdatePieceThreats(pc: Piece, putPiece: bool, sq: Square, computeRay: bool, noRaysContaining: Bitboard) =
+    member private this.UpdatePieceThreats(pc: Piece, putPiece: bool, sq: Square, computeRay: bool, noRaysContaining: Bitboard) =
         if pc <> NoPiece then
             let occupied = byTypeBB.[AllPieces]
             let rookQueens = byTypeBB.[Rook] ||| byTypeBB.[Queen]
@@ -307,7 +307,7 @@ type Position() =
 
             if pieceType pc = King then
                 if computeRay then
-                    this.SfProcessSliders(sliders, putPiece, pc, sq, computeRay, noRaysContaining, occupiedNoK, rAttacks, bAttacks, false)
+                    this.ProcessSliders(sliders, putPiece, pc, sq, computeRay, noRaysContaining, occupiedNoK, rAttacks, bAttacks, false)
             else
                 let pt = pieceType pc
                 let c = pieceColor pc
@@ -324,8 +324,8 @@ type Position() =
                 let mutable incoming = knightAttacks sq &&& byTypeBB.[Knight]
 
                 if pt = Pawn then
-                    let whiteAttacks = this.SfPawnPushOrAttacks(White, sq)
-                    let blackAttacks = this.SfPawnPushOrAttacks(Black, sq)
+                    let whiteAttacks = this.PawnPushOrAttacks(White, sq)
+                    let blackAttacks = this.PawnPushOrAttacks(Black, sq)
                     threatened <- threatened ||| ((if c = White then whiteAttacks else blackAttacks) &&& byTypeBB.[Pawn])
                     incoming <- incoming ||| (whiteAttacks &&& byColorBB.[Black] &&& byTypeBB.[Pawn])
                     incoming <- incoming ||| (blackAttacks &&& byColorBB.[White] &&& byTypeBB.[Pawn])
@@ -339,10 +339,10 @@ type Position() =
 
                 while t <> 0UL do
                     let too = popLsb &t
-                    this.SfAppendDirtyThreat(putPiece, pc, board.[too], sq, too)
+                    this.AppendDirtyThreat(putPiece, pc, board.[too], sq, too)
 
                 if computeRay then
-                    this.SfProcessSliders(sliders, putPiece, pc, sq, computeRay, noRaysContaining, occupiedNoK, rAttacks, bAttacks, true)
+                    this.ProcessSliders(sliders, putPiece, pc, sq, computeRay, noRaysContaining, occupiedNoK, rAttacks, bAttacks, true)
                 else
                     incoming <- incoming ||| sliders
 
@@ -351,7 +351,7 @@ type Position() =
                     let src = board.[from]
 
                     if src <> NoPiece && pieceType src <> King then
-                        this.SfAppendDirtyThreat(putPiece, src, pc, from, sq)
+                        this.AppendDirtyThreat(putPiece, src, pc, from, sq)
 
     // --- mutation choke points (the ONLY board writers) ---------------------
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
@@ -365,15 +365,15 @@ type Position() =
         byColorBB.[c] <- byColorBB.[c] ||| b
         board.[sq] <- pc
         currentKey <- currentKey ^^^ zPiece pc sq
-        if sfActive then
-            sfDirtyPc.[sfDirtyN] <- pc; sfDirtySq.[sfDirtyN] <- sq; sfDirtySign.[sfDirtyN] <- 1; sfDirtyN <- sfDirtyN + 1
-            this.SfUpdatePieceThreats(pc, true, sq, true, System.UInt64.MaxValue)
+        if active then
+            dirtyPc.[dirtyN] <- pc; dirtySq.[dirtyN] <- sq; dirtySign.[dirtyN] <- 1; dirtyN <- dirtyN + 1
+            this.UpdatePieceThreats(pc, true, sq, true, System.UInt64.MaxValue)
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member private this.RemovePiece (pc: Piece) (sq: Square) =
         Debug.Assert(pc <> NoPiece, "RemovePiece: NoPiece")
-        if sfActive then
-            this.SfUpdatePieceThreats(pc, false, sq, true, System.UInt64.MaxValue)
+        if active then
+            this.UpdatePieceThreats(pc, false, sq, true, System.UInt64.MaxValue)
 
         let b = 1UL <<< sq
         let pt = pieceType pc
@@ -383,16 +383,16 @@ type Position() =
         byColorBB.[c] <- byColorBB.[c] ^^^ b
         board.[sq] <- NoPiece
         currentKey <- currentKey ^^^ zPiece pc sq
-        if sfActive then
-            sfDirtyPc.[sfDirtyN] <- pc; sfDirtySq.[sfDirtyN] <- sq; sfDirtySign.[sfDirtyN] <- -1; sfDirtyN <- sfDirtyN + 1
+        if active then
+            dirtyPc.[dirtyN] <- pc; dirtySq.[dirtyN] <- sq; dirtySign.[dirtyN] <- -1; dirtyN <- dirtyN + 1
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member private this.MovePiece (pc: Piece) (from: Square) (dst: Square) =
         Debug.Assert(pc <> NoPiece, "MovePiece: NoPiece")
         // PRE: dst is empty for pt and color c (captures call RemovePiece on dst first).
         let fromTo = (1UL <<< from) ^^^ (1UL <<< dst)
-        if sfActive then
-            this.SfUpdatePieceThreats(pc, false, from, true, fromTo)
+        if active then
+            this.UpdatePieceThreats(pc, false, from, true, fromTo)
 
         let pt = pieceType pc
         let c = pieceColor pc
@@ -402,10 +402,10 @@ type Position() =
         board.[from] <- NoPiece
         board.[dst] <- pc
         currentKey <- currentKey ^^^ zPiece pc from ^^^ zPiece pc dst
-        if sfActive then
-            sfDirtyPc.[sfDirtyN] <- pc; sfDirtySq.[sfDirtyN] <- from; sfDirtySign.[sfDirtyN] <- -1; sfDirtyN <- sfDirtyN + 1
-            sfDirtyPc.[sfDirtyN] <- pc; sfDirtySq.[sfDirtyN] <- dst;  sfDirtySign.[sfDirtyN] <- 1;  sfDirtyN <- sfDirtyN + 1
-            this.SfUpdatePieceThreats(pc, true, dst, true, fromTo)
+        if active then
+            dirtyPc.[dirtyN] <- pc; dirtySq.[dirtyN] <- from; dirtySign.[dirtyN] <- -1; dirtyN <- dirtyN + 1
+            dirtyPc.[dirtyN] <- pc; dirtySq.[dirtyN] <- dst;  dirtySign.[dirtyN] <- 1;  dirtyN <- dirtyN + 1
+            this.UpdatePieceThreats(pc, true, dst, true, fromTo)
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member private this.SwapPiece (oldPc: Piece) (newPc: Piece) (sq: Square) =
@@ -417,18 +417,18 @@ type Position() =
         byColorBB.[pieceColor oldPc] <- byColorBB.[pieceColor oldPc] ^^^ b
         board.[sq] <- NoPiece
         currentKey <- currentKey ^^^ zPiece oldPc sq
-        if sfActive then
-            sfDirtyPc.[sfDirtyN] <- oldPc; sfDirtySq.[sfDirtyN] <- sq; sfDirtySign.[sfDirtyN] <- -1; sfDirtyN <- sfDirtyN + 1
-            this.SfUpdatePieceThreats(oldPc, false, sq, false, 0UL)
+        if active then
+            dirtyPc.[dirtyN] <- oldPc; dirtySq.[dirtyN] <- sq; dirtySign.[dirtyN] <- -1; dirtyN <- dirtyN + 1
+            this.UpdatePieceThreats(oldPc, false, sq, false, 0UL)
 
         byTypeBB.[pieceType newPc] <- byTypeBB.[pieceType newPc] ||| b
         byTypeBB.[AllPieces] <- byTypeBB.[AllPieces] ||| b
         byColorBB.[pieceColor newPc] <- byColorBB.[pieceColor newPc] ||| b
         board.[sq] <- newPc
         currentKey <- currentKey ^^^ zPiece newPc sq
-        if sfActive then
-            sfDirtyPc.[sfDirtyN] <- newPc; sfDirtySq.[sfDirtyN] <- sq; sfDirtySign.[sfDirtyN] <- 1; sfDirtyN <- sfDirtyN + 1
-            this.SfUpdatePieceThreats(newPc, true, sq, false, 0UL)
+        if active then
+            dirtyPc.[dirtyN] <- newPc; dirtySq.[dirtyN] <- sq; dirtySign.[dirtyN] <- 1; dirtyN <- dirtyN + 1
+            this.UpdatePieceThreats(newPc, true, sq, false, 0UL)
 
     // Key-less siblings (used ONLY by unmake -> pure board restore, zero key-drift risk).
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
@@ -480,62 +480,62 @@ type Position() =
     member _.SideToMove: Color = sideToMove
     member _.GamePly: int = gamePly
 
-    // --- SF FullThreats NNUE accumulator: public read + lazy materialization ---
-    member _.SfActive: bool = sfActive
+    // --- FullThreats NNUE accumulator: public read + lazy materialization ---
+    member _.Active: bool = active
 
-    member _.SfTop: int = sfTop
+    member _.Top: int = top
 
-    member private _.SfEnsureStorage() =
-        if Array.isEmpty sfAccW then
-            sfAccW <- Array.zeroCreate<int16> (SfMaxPly * Accumulator.L1)
-            sfAccB <- Array.zeroCreate<int16> (SfMaxPly * Accumulator.L1)
-            sfPsqW <- Array.zeroCreate (SfMaxPly * Accumulator.PsqtBuckets)
-            sfPsqB <- Array.zeroCreate (SfMaxPly * Accumulator.PsqtBuckets)
-            sfComputedW <- Array.zeroCreate SfMaxPly
-            sfComputedB <- Array.zeroCreate SfMaxPly
-            sfFrameDirtyPc <- Array.zeroCreate Accumulator.MaxDirtyPieces
-            sfFrameDirtySq <- Array.zeroCreate Accumulator.MaxDirtyPieces
-            sfFrameDirtySign <- Array.zeroCreate Accumulator.MaxDirtyPieces
-            sfFrameDirtyN <- Array.zeroCreate SfMaxPly
-            sfFrameThreats <- Array.zeroCreate Accumulator.MaxDirtyThreats
-            sfFrameThreatN <- Array.zeroCreate SfMaxPly
-            sfFrameChangedW <- Array.zeroCreate Accumulator.MaxDirtyThreats
-            sfFrameChangedB <- Array.zeroCreate Accumulator.MaxDirtyThreats
-            sfFrameChangedNW <- Array.zeroCreate SfMaxPly
-            sfFrameChangedNB <- Array.zeroCreate SfMaxPly
-            sfFrameChangedValid <- Array.zeroCreate SfMaxPly
-            sfFrameChangedKsqW <- Array.create SfMaxPly NoSquare
-            sfFrameChangedKsqB <- Array.create SfMaxPly NoSquare
-            sfFrameWhiteKingMoved <- Array.zeroCreate SfMaxPly
-            sfFrameBlackKingMoved <- Array.zeroCreate SfMaxPly
-            sfFrameThreatOverflow <- Array.zeroCreate SfMaxPly
-
-    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-    member private _.SfAccOff(frame: int) = frame * Accumulator.L1
+    member private _.EnsureStorage() =
+        if Array.isEmpty accW then
+            accW <- Array.zeroCreate<int16> (AccMaxPly * Accumulator.L1)
+            accB <- Array.zeroCreate<int16> (AccMaxPly * Accumulator.L1)
+            psqW <- Array.zeroCreate (AccMaxPly * Accumulator.PsqtBuckets)
+            psqB <- Array.zeroCreate (AccMaxPly * Accumulator.PsqtBuckets)
+            computedW <- Array.zeroCreate AccMaxPly
+            computedB <- Array.zeroCreate AccMaxPly
+            frameDirtyPc <- Array.zeroCreate Accumulator.MaxDirtyPieces
+            frameDirtySq <- Array.zeroCreate Accumulator.MaxDirtyPieces
+            frameDirtySign <- Array.zeroCreate Accumulator.MaxDirtyPieces
+            frameDirtyN <- Array.zeroCreate AccMaxPly
+            frameThreats <- Array.zeroCreate Accumulator.MaxDirtyThreats
+            frameThreatN <- Array.zeroCreate AccMaxPly
+            frameChangedW <- Array.zeroCreate Accumulator.MaxDirtyThreats
+            frameChangedB <- Array.zeroCreate Accumulator.MaxDirtyThreats
+            frameChangedNW <- Array.zeroCreate AccMaxPly
+            frameChangedNB <- Array.zeroCreate AccMaxPly
+            frameChangedValid <- Array.zeroCreate AccMaxPly
+            frameChangedKsqW <- Array.create AccMaxPly NoSquare
+            frameChangedKsqB <- Array.create AccMaxPly NoSquare
+            frameWhiteKingMoved <- Array.zeroCreate AccMaxPly
+            frameBlackKingMoved <- Array.zeroCreate AccMaxPly
+            frameThreatOverflow <- Array.zeroCreate AccMaxPly
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-    member private _.SfPsqOff(frame: int) = frame * Accumulator.PsqtBuckets
+    member private _.AccOff(frame: int) = frame * Accumulator.L1
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-    member private _.SfDirtyOff(frame: int) = 0
+    member private _.PsqOff(frame: int) = frame * Accumulator.PsqtBuckets
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-    member private _.SfThreatOff(frame: int) = 0
+    member private _.DirtyOff(frame: int) = 0
 
-    member private this.SfEnumThreats(pColor: Color, buf: int[]) : int =
-        match sfThreatFn with
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+    member private _.ThreatOff(frame: int) = 0
+
+    member private this.EnumThreats(pColor: Color, buf: int[]) : int =
+        match threatFn with
         | null -> 0
         | f -> f.Invoke(this, pColor, buf)
 
-    member private this.SfBuildHalf(pColor: Color, frame: int) =
-        let acc = if pColor = White then sfAccW else sfAccB
-        let psq = if pColor = White then sfPsqW else sfPsqB
-        let accOff = this.SfAccOff frame
-        let psqOff = this.SfPsqOff frame
+    member private this.BuildHalf(pColor: Color, frame: int) =
+        let acc = if pColor = White then accW else accB
+        let psq = if pColor = White then psqW else psqB
+        let accOff = this.AccOff frame
+        let psqOff = this.PsqOff frame
         let ksq = this.KingSquare pColor
 
         for j in 0 .. Accumulator.L1 - 1 do
-            acc.[accOff + j] <- sfBiases.[j]
+            acc.[accOff + j] <- biases.[j]
 
         System.Array.Clear(psq, psqOff, Accumulator.PsqtBuckets)
 
@@ -543,145 +543,145 @@ type Position() =
             let pc = board.[sq]
 
             if pc <> NoPiece then
-                Accumulator.addFeatureAt acc accOff psq psqOff sfHalfWeights sfHalfPsqt (Accumulator.makeIndex pColor pc sq ksq) 1 Accumulator.UseAvx2
+                Accumulator.addFeatureAt acc accOff psq psqOff halfWeights halfPsqt (Accumulator.makeIndex pColor pc sq ksq) 1 Accumulator.UseAvx2
 
-    member private this.SfAddActiveThreats(pColor: Color, frame: int) =
-        let acc = if pColor = White then sfAccW else sfAccB
-        let psq = if pColor = White then sfPsqW else sfPsqB
-        let accOff = this.SfAccOff frame
-        let psqOff = this.SfPsqOff frame
-        let n = this.SfEnumThreats(pColor, sfTmpW)
+    member private this.AddActiveThreats(pColor: Color, frame: int) =
+        let acc = if pColor = White then accW else accB
+        let psq = if pColor = White then psqW else psqB
+        let accOff = this.AccOff frame
+        let psqOff = this.PsqOff frame
+        let n = this.EnumThreats(pColor, tmpW)
 
         for k in 0 .. n - 1 do
-            Accumulator.addThreatAt acc accOff psq psqOff sfThreatWeights sfThreatPsqt sfTmpW.[k] 1 Accumulator.UseAvx2
+            Accumulator.addThreatAt acc accOff psq psqOff threatWeights threatPsqt tmpW.[k] 1 Accumulator.UseAvx2
 
-    member private this.SfBuildFull(pColor: Color, frame: int) =
-        this.SfBuildHalf(pColor, frame)
-        this.SfAddActiveThreats(pColor, frame)
-        if pColor = White then sfComputedW.[frame] <- true else sfComputedB.[frame] <- true
+    member private this.BuildFull(pColor: Color, frame: int) =
+        this.BuildHalf(pColor, frame)
+        this.AddActiveThreats(pColor, frame)
+        if pColor = White then computedW.[frame] <- true else computedB.[frame] <- true
 
     // Both perspectives' active threats from a SINGLE physical enumeration (slider rays walked once),
-    // emitting per-perspective indices into sfTmpW/sfTmpB. Bit-exact vs two SfAddActiveThreats calls:
+    // emitting per-perspective indices into tmpW/tmpB. Bit-exact vs two AddActiveThreats calls:
     // same indices, and int16 accumulation is order-independent (modular add).
-    member private this.SfAddActiveThreatsBoth(frame: int) =
-        match sfThreatFnBoth with
+    member private this.AddActiveThreatsBoth(frame: int) =
+        match threatFnBoth with
         | null ->
-            this.SfAddActiveThreats(White, frame)
-            this.SfAddActiveThreats(Black, frame)
+            this.AddActiveThreats(White, frame)
+            this.AddActiveThreats(Black, frame)
         | f ->
-            let packed = f.Invoke(this, sfTmpW, sfTmpB)
+            let packed = f.Invoke(this, tmpW, tmpB)
             let nW = int (packed >>> 32)
             let nB = int (packed &&& 0xFFFFFFFFL)
-            let accOff = this.SfAccOff frame
-            let psqOff = this.SfPsqOff frame
+            let accOff = this.AccOff frame
+            let psqOff = this.PsqOff frame
 
             for k in 0 .. nW - 1 do
-                Accumulator.addThreatAt sfAccW accOff sfPsqW psqOff sfThreatWeights sfThreatPsqt sfTmpW.[k] 1 Accumulator.UseAvx2
+                Accumulator.addThreatAt accW accOff psqW psqOff threatWeights threatPsqt tmpW.[k] 1 Accumulator.UseAvx2
 
             for k in 0 .. nB - 1 do
-                Accumulator.addThreatAt sfAccB accOff sfPsqB psqOff sfThreatWeights sfThreatPsqt sfTmpB.[k] 1 Accumulator.UseAvx2
+                Accumulator.addThreatAt accB accOff psqB psqOff threatWeights threatPsqt tmpB.[k] 1 Accumulator.UseAvx2
 
-    member private this.SfBuildFullBoth(frame: int) =
-        this.SfBuildHalf(White, frame)
-        this.SfBuildHalf(Black, frame)
-        this.SfAddActiveThreatsBoth(frame)
-        sfComputedW.[frame] <- true
-        sfComputedB.[frame] <- true
+    member private this.BuildFullBoth(frame: int) =
+        this.BuildHalf(White, frame)
+        this.BuildHalf(Black, frame)
+        this.AddActiveThreatsBoth(frame)
+        computedW.[frame] <- true
+        computedB.[frame] <- true
 
-    member private this.SfBeginFrame() =
-        Debug.Assert((sfTop + 1 < SfMaxPly), "SfBeginFrame: stack overflow")
-        sfTop <- sfTop + 1
-        sfDirtyN <- 0
-        sfDirtyThreatN <- 0
-        sfDirtyThreatOverflow <- false
-        sfFrameDirtyN.[sfTop] <- 0
-        sfFrameThreatN.[sfTop] <- 0
-        sfFrameChangedNW.[sfTop] <- 0
-        sfFrameChangedNB.[sfTop] <- 0
-        sfFrameChangedValid.[sfTop] <- false
-        sfFrameChangedKsqW.[sfTop] <- NoSquare
-        sfFrameChangedKsqB.[sfTop] <- NoSquare
-        sfFrameWhiteKingMoved.[sfTop] <- false
-        sfFrameBlackKingMoved.[sfTop] <- false
-        sfFrameThreatOverflow.[sfTop] <- false
-        sfComputedW.[sfTop] <- false
-        sfComputedB.[sfTop] <- false
+    member private this.BeginFrame() =
+        Debug.Assert((top + 1 < AccMaxPly), "BeginFrame: stack overflow")
+        top <- top + 1
+        dirtyN <- 0
+        dirtyThreatN <- 0
+        dirtyThreatOverflow <- false
+        frameDirtyN.[top] <- 0
+        frameThreatN.[top] <- 0
+        frameChangedNW.[top] <- 0
+        frameChangedNB.[top] <- 0
+        frameChangedValid.[top] <- false
+        frameChangedKsqW.[top] <- NoSquare
+        frameChangedKsqB.[top] <- NoSquare
+        frameWhiteKingMoved.[top] <- false
+        frameBlackKingMoved.[top] <- false
+        frameThreatOverflow.[top] <- false
+        computedW.[top] <- false
+        computedB.[top] <- false
 
-    member private this.SfCommitFrame() =
-        let frame = sfTop
-        let dOff = this.SfDirtyOff frame
+    member private this.CommitFrame() =
+        let frame = top
+        let dOff = this.DirtyOff frame
         let mutable whiteKingMoved = false
         let mutable blackKingMoved = false
 
-        Debug.Assert((sfDirtyN <= Accumulator.MaxDirtyPieces), "SfCommitFrame: dirty piece overflow")
+        Debug.Assert((dirtyN <= Accumulator.MaxDirtyPieces), "CommitFrame: dirty piece overflow")
 
-        for i in 0 .. sfDirtyN - 1 do
-            let pc = sfDirtyPc.[i]
-            sfFrameDirtyPc.[dOff + i] <- pc
-            sfFrameDirtySq.[dOff + i] <- sfDirtySq.[i]
-            sfFrameDirtySign.[dOff + i] <- sfDirtySign.[i]
+        for i in 0 .. dirtyN - 1 do
+            let pc = dirtyPc.[i]
+            frameDirtyPc.[dOff + i] <- pc
+            frameDirtySq.[dOff + i] <- dirtySq.[i]
+            frameDirtySign.[dOff + i] <- dirtySign.[i]
 
             if pieceType pc = King then
                 if pieceColor pc = White then whiteKingMoved <- true else blackKingMoved <- true
 
-        sfFrameDirtyN.[frame] <- sfDirtyN
-        sfFrameWhiteKingMoved.[frame] <- whiteKingMoved
-        sfFrameBlackKingMoved.[frame] <- blackKingMoved
+        frameDirtyN.[frame] <- dirtyN
+        frameWhiteKingMoved.[frame] <- whiteKingMoved
+        frameBlackKingMoved.[frame] <- blackKingMoved
 
-        if sfDirtyThreatOverflow then
-            sfFrameThreatOverflow.[frame] <- true
-            sfFrameThreatN.[frame] <- 0
-            sfFrameChangedNW.[frame] <- 0
-            sfFrameChangedNB.[frame] <- 0
-            sfFrameChangedValid.[frame] <- false
+        if dirtyThreatOverflow then
+            frameThreatOverflow.[frame] <- true
+            frameThreatN.[frame] <- 0
+            frameChangedNW.[frame] <- 0
+            frameChangedNB.[frame] <- 0
+            frameChangedValid.[frame] <- false
         else
-            let threatN = min sfDirtyThreatN Accumulator.MaxDirtyThreats
-            sfFrameThreatN.[frame] <- threatN
-            System.Array.Copy(sfDirtyThreats, 0, sfFrameThreats, this.SfThreatOff frame, threatN)
+            let threatN = min dirtyThreatN Accumulator.MaxDirtyThreats
+            frameThreatN.[frame] <- threatN
+            System.Array.Copy(dirtyThreats, 0, frameThreats, this.ThreatOff frame, threatN)
 
             if threatN <> 0 then
-                sfFrameChangedValid.[frame] <- false
+                frameChangedValid.[frame] <- false
             else
-                sfFrameChangedNW.[frame] <- 0
-                sfFrameChangedNB.[frame] <- 0
-                sfFrameChangedValid.[frame] <- true
+                frameChangedNW.[frame] <- 0
+                frameChangedNB.[frame] <- 0
+                frameChangedValid.[frame] <- true
 
-    member private _.SfFrameNeedsRefresh(pColor: Color, frame: int) : bool =
-        sfFrameThreatOverflow.[frame]
-        || (pColor = White && sfFrameWhiteKingMoved.[frame])
-        || (pColor = Black && sfFrameBlackKingMoved.[frame])
+    member private _.FrameNeedsRefresh(pColor: Color, frame: int) : bool =
+        frameThreatOverflow.[frame]
+        || (pColor = White && frameWhiteKingMoved.[frame])
+        || (pColor = Black && frameBlackKingMoved.[frame])
 
-    /// Eagerly materialize the current frame's accumulator during Make: copy the parent (sfTop-1) into sfTop,
-    /// then apply this frame's dirty piece + threat deltas immediately. After this, sfComputedW/B.[sfTop] are
+    /// Eagerly materialize the current frame's accumulator during Make: copy the parent (top-1) into top,
+    /// then apply this frame's dirty piece + threat deltas immediately. After this, computedW/B.[top] are
     /// true and eval is O(1) — no lazy frame walk, no cache probe, no deferred delegate conversion at eval time.
     /// King moves or threat overflow force a full from-scratch rebuild (all HalfKA indices change).
-    member private this.SfEagerUpdate() =
-        let frame = sfTop
+    member private this.EagerUpdate() =
+        let frame = top
 
-        if sfFrameThreatOverflow.[frame] || sfFrameWhiteKingMoved.[frame] || sfFrameBlackKingMoved.[frame] then
-            this.SfBuildFullBoth(frame)
+        if frameThreatOverflow.[frame] || frameWhiteKingMoved.[frame] || frameBlackKingMoved.[frame] then
+            this.BuildFullBoth(frame)
         else
-            this.SfCopyFrame(White, frame - 1, frame)
-            this.SfCopyFrame(Black, frame - 1, frame)
-            this.SfApplyFrameBoth(frame)
-            sfComputedW.[frame] <- true
-            sfComputedB.[frame] <- true
+            this.CopyFrame(White, frame - 1, frame)
+            this.CopyFrame(Black, frame - 1, frame)
+            this.ApplyFrameBoth(frame)
+            computedW.[frame] <- true
+            computedB.[frame] <- true
 
-    member private this.SfCopyFrame(pColor: Color, src: int, dst: int) =
-        let acc = if pColor = White then sfAccW else sfAccB
-        let psq = if pColor = White then sfPsqW else sfPsqB
-        System.Array.Copy(acc, this.SfAccOff src, acc, this.SfAccOff dst, Accumulator.L1)
-        System.Array.Copy(psq, this.SfPsqOff src, psq, this.SfPsqOff dst, Accumulator.PsqtBuckets)
+    member private this.CopyFrame(pColor: Color, src: int, dst: int) =
+        let acc = if pColor = White then accW else accB
+        let psq = if pColor = White then psqW else psqB
+        System.Array.Copy(acc, this.AccOff src, acc, this.AccOff dst, Accumulator.L1)
+        System.Array.Copy(psq, this.PsqOff src, psq, this.PsqOff dst, Accumulator.PsqtBuckets)
 
-    member private this.SfApplySignedThreats(pColor: Color, frame: int, buf: int[], off: int, n: int) =
-        let acc = if pColor = White then sfAccW else sfAccB
-        let psq = if pColor = White then sfPsqW else sfPsqB
-        let accOff = this.SfAccOff frame
-        let psqOff = this.SfPsqOff frame
+    member private this.ApplySignedThreats(pColor: Color, frame: int, buf: int[], off: int, n: int) =
+        let acc = if pColor = White then accW else accB
+        let psq = if pColor = White then psqW else psqB
+        let accOff = this.AccOff frame
+        let psqOff = this.PsqOff frame
 
         if n <= 62 then
-            let addIdxs = sfTmpW
-            let subIdxs = sfTmpB
+            let addIdxs = tmpW
+            let subIdxs = tmpB
             let mutable nAdd = 0
             let mutable nSub = 0
 
@@ -704,8 +704,8 @@ type Position() =
                     accOff
                     psq
                     psqOff
-                    sfThreatWeights
-                    sfThreatPsqt
+                    threatWeights
+                    threatPsqt
                     subIdxs.[p]
                     addIdxs.[p]
                     subIdxs.[p + 1]
@@ -715,37 +715,37 @@ type Position() =
                 p <- p + 2
 
             if p < pairN then
-                Accumulator.addThreatPairAt acc accOff psq psqOff sfThreatWeights sfThreatPsqt subIdxs.[p] addIdxs.[p] Accumulator.UseAvx2
+                Accumulator.addThreatPairAt acc accOff psq psqOff threatWeights threatPsqt subIdxs.[p] addIdxs.[p] Accumulator.UseAvx2
 
             for i in pairN .. nAdd - 1 do
-                Accumulator.addThreatAt acc accOff psq psqOff sfThreatWeights sfThreatPsqt addIdxs.[i] 1 Accumulator.UseAvx2
+                Accumulator.addThreatAt acc accOff psq psqOff threatWeights threatPsqt addIdxs.[i] 1 Accumulator.UseAvx2
 
             for i in pairN .. nSub - 1 do
-                Accumulator.addThreatAt acc accOff psq psqOff sfThreatWeights sfThreatPsqt subIdxs.[i] -1 Accumulator.UseAvx2
+                Accumulator.addThreatAt acc accOff psq psqOff threatWeights threatPsqt subIdxs.[i] -1 Accumulator.UseAvx2
         else
             for i in 0 .. n - 1 do
                 let v = buf.[off + i]
                 let sign, idx = if v > 0 then 1, v - 1 else -1, -v - 1
-                Accumulator.addThreatAt acc accOff psq psqOff sfThreatWeights sfThreatPsqt idx sign Accumulator.UseAvx2
+                Accumulator.addThreatAt acc accOff psq psqOff threatWeights threatPsqt idx sign Accumulator.UseAvx2
 
-    member private this.SfApplyFrame(pColor: Color, frame: int) =
-        let acc = if pColor = White then sfAccW else sfAccB
-        let psq = if pColor = White then sfPsqW else sfPsqB
-        let accOff = this.SfAccOff sfTop
-        let psqOff = this.SfPsqOff sfTop
-        let dOff = this.SfDirtyOff frame
+    member private this.ApplyFrame(pColor: Color, frame: int) =
+        let acc = if pColor = White then accW else accB
+        let psq = if pColor = White then psqW else psqB
+        let accOff = this.AccOff top
+        let psqOff = this.PsqOff top
+        let dOff = this.DirtyOff frame
         let ksq = this.KingSquare pColor
         let ksqW = this.KingSquare White
         let ksqB = this.KingSquare Black
 
-        let dirtyN = sfFrameDirtyN.[frame]
+        let dirtyN = frameDirtyN.[frame]
         let mutable usedDirty = 0
 
         for i in 0 .. dirtyN - 1 do
             if (usedDirty &&& (1 <<< i)) = 0 then
-                let pc = sfFrameDirtyPc.[dOff + i]
-                let sq = sfFrameDirtySq.[dOff + i]
-                let sign = sfFrameDirtySign.[dOff + i]
+                let pc = frameDirtyPc.[dOff + i]
+                let sq = frameDirtySq.[dOff + i]
+                let sign = frameDirtySign.[dOff + i]
 
                 if sign < 0 then
                     let mutable j = i + 1
@@ -754,8 +754,8 @@ type Position() =
                     while pair < 0 && j < dirtyN do
                         if
                             (usedDirty &&& (1 <<< j)) = 0
-                            && sfFrameDirtyPc.[dOff + j] = pc
-                            && sfFrameDirtySign.[dOff + j] > 0
+                            && frameDirtyPc.[dOff + j] = pc
+                            && frameDirtySign.[dOff + j] > 0
                         then
                             pair <- j
                         else
@@ -763,97 +763,97 @@ type Position() =
 
                     if pair >= 0 then
                         usedDirty <- usedDirty ||| (1 <<< i) ||| (1 <<< pair)
-                        let addSq = sfFrameDirtySq.[dOff + pair]
+                        let addSq = frameDirtySq.[dOff + pair]
                         Accumulator.addFeaturePairAt
                             acc
                             accOff
                             psq
                             psqOff
-                            sfHalfWeights
-                            sfHalfPsqt
+                            halfWeights
+                            halfPsqt
                             (Accumulator.makeIndex pColor pc sq ksq)
                             (Accumulator.makeIndex pColor pc addSq ksq)
                             Accumulator.UseAvx2
                     else
                         usedDirty <- usedDirty ||| (1 <<< i)
-                        Accumulator.addFeatureAt acc accOff psq psqOff sfHalfWeights sfHalfPsqt (Accumulator.makeIndex pColor pc sq ksq) sign Accumulator.UseAvx2
+                        Accumulator.addFeatureAt acc accOff psq psqOff halfWeights halfPsqt (Accumulator.makeIndex pColor pc sq ksq) sign Accumulator.UseAvx2
                 else
                     usedDirty <- usedDirty ||| (1 <<< i)
-                    Accumulator.addFeatureAt acc accOff psq psqOff sfHalfWeights sfHalfPsqt (Accumulator.makeIndex pColor pc sq ksq) sign Accumulator.UseAvx2
+                    Accumulator.addFeatureAt acc accOff psq psqOff halfWeights halfPsqt (Accumulator.makeIndex pColor pc sq ksq) sign Accumulator.UseAvx2
 
-        let threatN = sfFrameThreatN.[frame]
+        let threatN = frameThreatN.[frame]
 
         if threatN <> 0 then
-            if sfFrameChangedValid.[frame] && sfFrameChangedKsqW.[frame] = ksqW && sfFrameChangedKsqB.[frame] = ksqB then
-                let off = this.SfThreatOff frame
+            if frameChangedValid.[frame] && frameChangedKsqW.[frame] = ksqW && frameChangedKsqB.[frame] = ksqB then
+                let off = this.ThreatOff frame
                 if pColor = White then
-                    this.SfApplySignedThreats(White, sfTop, sfFrameChangedW, off, sfFrameChangedNW.[frame])
+                    this.ApplySignedThreats(White, top, frameChangedW, off, frameChangedNW.[frame])
                 else
-                    this.SfApplySignedThreats(Black, sfTop, sfFrameChangedB, off, sfFrameChangedNB.[frame])
+                    this.ApplySignedThreats(Black, top, frameChangedB, off, frameChangedNB.[frame])
             else
-                match sfThreatFnChangedBoth with
+                match threatFnChangedBoth with
                 | null -> ()
                 | f ->
-                    let packed = f.Invoke(this, sfFrameThreats, this.SfThreatOff frame, threatN, sfChangedW, sfChangedB)
+                    let packed = f.Invoke(this, frameThreats, this.ThreatOff frame, threatN, changedW, changedB)
                     let nW = int (packed >>> 32)
                     let nB = int (packed &&& 0xFFFFFFFFL)
-                    let off = this.SfThreatOff frame
+                    let off = this.ThreatOff frame
 
-                    System.Array.Copy(sfChangedW, 0, sfFrameChangedW, off, nW)
-                    System.Array.Copy(sfChangedB, 0, sfFrameChangedB, off, nB)
-                    sfFrameChangedNW.[frame] <- nW
-                    sfFrameChangedNB.[frame] <- nB
-                    sfFrameChangedKsqW.[frame] <- ksqW
-                    sfFrameChangedKsqB.[frame] <- ksqB
-                    sfFrameChangedValid.[frame] <- true
+                    System.Array.Copy(changedW, 0, frameChangedW, off, nW)
+                    System.Array.Copy(changedB, 0, frameChangedB, off, nB)
+                    frameChangedNW.[frame] <- nW
+                    frameChangedNB.[frame] <- nB
+                    frameChangedKsqW.[frame] <- ksqW
+                    frameChangedKsqB.[frame] <- ksqB
+                    frameChangedValid.[frame] <- true
 
                     if pColor = White then
-                        this.SfApplySignedThreats(White, sfTop, sfFrameChangedW, off, nW)
+                        this.ApplySignedThreats(White, top, frameChangedW, off, nW)
                     else
-                        this.SfApplySignedThreats(Black, sfTop, sfFrameChangedB, off, nB)
+                        this.ApplySignedThreats(Black, top, frameChangedB, off, nB)
 
-    member private this.SfEnsureComputed(pColor: Color) =
-        if sfActive then
-            let computed = if pColor = White then sfComputedW else sfComputedB
+    member private this.EnsureComputed(pColor: Color) =
+        if active then
+            let computed = if pColor = White then computedW else computedB
 
-            if not computed.[sfTop] then
-                let mutable baseFrame = sfTop
+            if not computed.[top] then
+                let mutable baseFrame = top
                 let mutable blocked = false
 
                 while baseFrame > 0 && not blocked && not computed.[baseFrame] do
-                    if this.SfFrameNeedsRefresh(pColor, baseFrame) then
+                    if this.FrameNeedsRefresh(pColor, baseFrame) then
                         blocked <- true
                     else
                         baseFrame <- baseFrame - 1
 
                 if blocked || not computed.[baseFrame] then
-                    this.SfBuildFull(pColor, sfTop)
+                    this.BuildFull(pColor, top)
                 else
-                    this.SfCopyFrame(pColor, baseFrame, sfTop)
+                    this.CopyFrame(pColor, baseFrame, top)
 
-                    for f in baseFrame + 1 .. sfTop do
-                        this.SfApplyFrame(pColor, f)
+                    for f in baseFrame + 1 .. top do
+                        this.ApplyFrame(pColor, f)
 
-                    computed.[sfTop] <- true
+                    computed.[top] <- true
 
-    // Replay one frame's deltas onto the sfTop accumulator for BOTH perspectives at once: one pass over the
+    // Replay one frame's deltas onto the top accumulator for BOTH perspectives at once: one pass over the
     // dirty-piece list (each acc only takes its own perspective's features), one shared changed-threat
-    // conversion. Bit-exact vs SfApplyFrame(White)+SfApplyFrame(Black).
-    member private this.SfApplyFrameBoth(frame: int) =
-        let accOff = this.SfAccOff sfTop
-        let psqOff = this.SfPsqOff sfTop
-        let dOff = this.SfDirtyOff frame
+    // conversion. Bit-exact vs ApplyFrame(White)+ApplyFrame(Black).
+    member private this.ApplyFrameBoth(frame: int) =
+        let accOff = this.AccOff top
+        let psqOff = this.PsqOff top
+        let dOff = this.DirtyOff frame
         let ksqW = this.KingSquare White
         let ksqB = this.KingSquare Black
 
-        let dirtyN = sfFrameDirtyN.[frame]
+        let dirtyN = frameDirtyN.[frame]
         let mutable usedDirty = 0
 
         for i in 0 .. dirtyN - 1 do
             if (usedDirty &&& (1 <<< i)) = 0 then
-                let pc = sfFrameDirtyPc.[dOff + i]
-                let sq = sfFrameDirtySq.[dOff + i]
-                let sign = sfFrameDirtySign.[dOff + i]
+                let pc = frameDirtyPc.[dOff + i]
+                let sq = frameDirtySq.[dOff + i]
+                let sign = frameDirtySign.[dOff + i]
 
                 if sign < 0 then
                     let mutable j = i + 1
@@ -862,8 +862,8 @@ type Position() =
                     while pair < 0 && j < dirtyN do
                         if
                             (usedDirty &&& (1 <<< j)) = 0
-                            && sfFrameDirtyPc.[dOff + j] = pc
-                            && sfFrameDirtySign.[dOff + j] > 0
+                            && frameDirtyPc.[dOff + j] = pc
+                            && frameDirtySign.[dOff + j] > 0
                         then
                             pair <- j
                         else
@@ -871,260 +871,260 @@ type Position() =
 
                     if pair >= 0 then
                         usedDirty <- usedDirty ||| (1 <<< i) ||| (1 <<< pair)
-                        let addSq = sfFrameDirtySq.[dOff + pair]
+                        let addSq = frameDirtySq.[dOff + pair]
                         Accumulator.addFeaturePairAt
-                            sfAccW
+                            accW
                             accOff
-                            sfPsqW
+                            psqW
                             psqOff
-                            sfHalfWeights
-                            sfHalfPsqt
+                            halfWeights
+                            halfPsqt
                             (Accumulator.makeIndex White pc sq ksqW)
                             (Accumulator.makeIndex White pc addSq ksqW)
                             Accumulator.UseAvx2
                         Accumulator.addFeaturePairAt
-                            sfAccB
+                            accB
                             accOff
-                            sfPsqB
+                            psqB
                             psqOff
-                            sfHalfWeights
-                            sfHalfPsqt
+                            halfWeights
+                            halfPsqt
                             (Accumulator.makeIndex Black pc sq ksqB)
                             (Accumulator.makeIndex Black pc addSq ksqB)
                             Accumulator.UseAvx2
                     else
                         usedDirty <- usedDirty ||| (1 <<< i)
-                        Accumulator.addFeatureAt sfAccW accOff sfPsqW psqOff sfHalfWeights sfHalfPsqt (Accumulator.makeIndex White pc sq ksqW) sign Accumulator.UseAvx2
-                        Accumulator.addFeatureAt sfAccB accOff sfPsqB psqOff sfHalfWeights sfHalfPsqt (Accumulator.makeIndex Black pc sq ksqB) sign Accumulator.UseAvx2
+                        Accumulator.addFeatureAt accW accOff psqW psqOff halfWeights halfPsqt (Accumulator.makeIndex White pc sq ksqW) sign Accumulator.UseAvx2
+                        Accumulator.addFeatureAt accB accOff psqB psqOff halfWeights halfPsqt (Accumulator.makeIndex Black pc sq ksqB) sign Accumulator.UseAvx2
                 else
                     usedDirty <- usedDirty ||| (1 <<< i)
-                    Accumulator.addFeatureAt sfAccW accOff sfPsqW psqOff sfHalfWeights sfHalfPsqt (Accumulator.makeIndex White pc sq ksqW) sign Accumulator.UseAvx2
-                    Accumulator.addFeatureAt sfAccB accOff sfPsqB psqOff sfHalfWeights sfHalfPsqt (Accumulator.makeIndex Black pc sq ksqB) sign Accumulator.UseAvx2
+                    Accumulator.addFeatureAt accW accOff psqW psqOff halfWeights halfPsqt (Accumulator.makeIndex White pc sq ksqW) sign Accumulator.UseAvx2
+                    Accumulator.addFeatureAt accB accOff psqB psqOff halfWeights halfPsqt (Accumulator.makeIndex Black pc sq ksqB) sign Accumulator.UseAvx2
 
-        let threatN = sfFrameThreatN.[frame]
+        let threatN = frameThreatN.[frame]
 
         if threatN <> 0 then
-            let off = this.SfThreatOff frame
+            let off = this.ThreatOff frame
 
-            if sfFrameChangedValid.[frame] && sfFrameChangedKsqW.[frame] = ksqW && sfFrameChangedKsqB.[frame] = ksqB then
-                this.SfApplySignedThreats(White, sfTop, sfFrameChangedW, off, sfFrameChangedNW.[frame])
-                this.SfApplySignedThreats(Black, sfTop, sfFrameChangedB, off, sfFrameChangedNB.[frame])
+            if frameChangedValid.[frame] && frameChangedKsqW.[frame] = ksqW && frameChangedKsqB.[frame] = ksqB then
+                this.ApplySignedThreats(White, top, frameChangedW, off, frameChangedNW.[frame])
+                this.ApplySignedThreats(Black, top, frameChangedB, off, frameChangedNB.[frame])
             else
-                match sfThreatFnChangedBoth with
+                match threatFnChangedBoth with
                 | null -> ()
                 | f ->
-                    let packed = f.Invoke(this, sfFrameThreats, off, threatN, sfChangedW, sfChangedB)
+                    let packed = f.Invoke(this, frameThreats, off, threatN, changedW, changedB)
                     let nW = int (packed >>> 32)
                     let nB = int (packed &&& 0xFFFFFFFFL)
 
-                    System.Array.Copy(sfChangedW, 0, sfFrameChangedW, off, nW)
-                    System.Array.Copy(sfChangedB, 0, sfFrameChangedB, off, nB)
-                    sfFrameChangedNW.[frame] <- nW
-                    sfFrameChangedNB.[frame] <- nB
-                    sfFrameChangedKsqW.[frame] <- ksqW
-                    sfFrameChangedKsqB.[frame] <- ksqB
-                    sfFrameChangedValid.[frame] <- true
+                    System.Array.Copy(changedW, 0, frameChangedW, off, nW)
+                    System.Array.Copy(changedB, 0, frameChangedB, off, nB)
+                    frameChangedNW.[frame] <- nW
+                    frameChangedNB.[frame] <- nB
+                    frameChangedKsqW.[frame] <- ksqW
+                    frameChangedKsqB.[frame] <- ksqB
+                    frameChangedValid.[frame] <- true
 
-                    this.SfApplySignedThreats(White, sfTop, sfFrameChangedW, off, nW)
-                    this.SfApplySignedThreats(Black, sfTop, sfFrameChangedB, off, nB)
+                    this.ApplySignedThreats(White, top, frameChangedW, off, nW)
+                    this.ApplySignedThreats(Black, top, frameChangedB, off, nB)
 
-    // Materialize BOTH perspectives at sfTop in one frame walk (evalInternal always needs both). Takes the
+    // Materialize BOTH perspectives at top in one frame walk (evalInternal always needs both). Takes the
     // merged path only when the two perspectives' back-walks agree (the common no-king-move/no-overflow
-    // case); falls back to the per-perspective SfEnsureComputed otherwise (byte-identical to that path).
-    member this.SfEnsureBothComputed() =
-        if sfActive && not (sfComputedW.[sfTop] && sfComputedB.[sfTop]) then
+    // case); falls back to the per-perspective EnsureComputed otherwise (byte-identical to that path).
+    member this.EnsureBothComputed() =
+        if active && not (computedW.[top] && computedB.[top]) then
             // Phase 1 fast-path: best-effort checkpoint cache. A validated hit pays an O(1) snapshot copy
             // instead of the O(distance) frame-delta walk below. Stored snapshots are bit-exact for any given
             // position regardless of the make/unmake path that reached it, so a hit is provably equivalent
             // to re-running the lazy walk.
-            let accOff = this.SfAccOff sfTop
-            let psqOff = this.SfPsqOff sfTop
+            let accOff = this.AccOff top
+            let psqOff = this.PsqOff top
 
             let cached =
-                match sfCheckpoint with
+                match checkpoint with
                 | null -> false
                 | cache ->
-                    cache.TryProbe(this.Key, sfAccW, accOff, sfAccB, accOff, sfPsqW, psqOff, sfPsqB, psqOff)
+                    cache.TryProbe(this.Key, accW, accOff, accB, accOff, psqW, psqOff, psqB, psqOff)
 
             if cached then
-                sfComputedW.[sfTop] <- true
-                sfComputedB.[sfTop] <- true
+                computedW.[top] <- true
+                computedB.[top] <- true
             else
-                this.SfEnsureBothComputedCore()
+                this.EnsureBothComputedCore()
 
                 // Best-effort populate. Checking both flags post-materialization guarantees we never cache a
                 // partial snapshot, even on the mixed-rebuild branch + the per-perspective fallback path.
-                if sfComputedW.[sfTop] && sfComputedB.[sfTop] then
-                    match sfCheckpoint with
+                if computedW.[top] && computedB.[top] then
+                    match checkpoint with
                     | null -> ()
                     | cache ->
-                        cache.Store(this.Key, sfAccW, accOff, sfAccB, accOff, sfPsqW, psqOff, sfPsqB, psqOff)
+                        cache.Store(this.Key, accW, accOff, accB, accOff, psqW, psqOff, psqB, psqOff)
 
     /// Bind the per-worker checkpoint cache. Pass `null` to disable (tests, from-scratch eval, etc.).
     /// `SearchControl` owns the table lifecycle; this Position merely holds a borrowed reference for the
     /// duration of a search.
-    member _.SfBindCheckpoint(cache: AccCheckpointTable) : unit = sfCheckpoint <- cache
+    member _.BindCheckpoint(cache: AccCheckpointTable) : unit = checkpoint <- cache
 
     /// Detach the cache (no-op if already detached). Called by `SearchControl` once the search has joined to
     /// release the worker's borrowed reference; the position can continue to be reused by tests/tools.
-    member _.SfUnbindCheckpoint() : unit = sfCheckpoint <- null
+    member _.UnbindCheckpoint() : unit = checkpoint <- null
 
     /// Unconditionally publish the current frame's computed accumulator snapshot to the bound checkpoint
     /// cache, if any. Used by `Worker.SetupRoot` to seed the root after `EnableNnue` has already set the
-    /// `sfComputed` flags (so the early-return path inside `SfEnsureBothComputed` skips the populate).
+    /// `computed` flags (so the early-return path inside `EnsureBothComputed` skips the populate).
     /// No-op when the accumulator is inactive, the current frame is not yet materialized, or no cache is bound.
-    member this.SfSeedCheckpoint() : unit =
-        if sfActive && sfComputedW.[sfTop] && sfComputedB.[sfTop] then
-            match sfCheckpoint with
+    member this.SeedCheckpoint() : unit =
+        if active && computedW.[top] && computedB.[top] then
+            match checkpoint with
             | null -> ()
             | cache ->
-                let accOff = this.SfAccOff sfTop
-                let psqOff = this.SfPsqOff sfTop
-                cache.Store(this.Key, sfAccW, accOff, sfAccB, accOff, sfPsqW, psqOff, sfPsqB, psqOff)
+                let accOff = this.AccOff top
+                let psqOff = this.PsqOff top
+                cache.Store(this.Key, accW, accOff, accB, accOff, psqW, psqOff, psqB, psqOff)
 
     /// Phase 1 — the unchanged frame-walk materialization used when the checkpoint cache misses (or is
-    /// null). Byte-for-byte identical to the pre-Phase-1 `SfEnsureBothComputed`; retained verbatim so that
+    /// null). Byte-for-byte identical to the pre-Phase-1 `EnsureBothComputed`; retained verbatim so that
     /// benchmarks + parity tests can isolate Phase 1's perf contribution empirically (toggle the UCI option
     /// `EnableAccCheckpoint` off — Phase 1 Step 5 — to route all calls through this core).
-    member private this.SfEnsureBothComputedCore() =
-        if sfActive && not (sfComputedW.[sfTop] && sfComputedB.[sfTop]) then
-            let mutable baseW = sfTop
+    member private this.EnsureBothComputedCore() =
+        if active && not (computedW.[top] && computedB.[top]) then
+            let mutable baseW = top
             let mutable blockedW = false
 
-            while baseW > 0 && not blockedW && not sfComputedW.[baseW] do
-                if this.SfFrameNeedsRefresh(White, baseW) then blockedW <- true
+            while baseW > 0 && not blockedW && not computedW.[baseW] do
+                if this.FrameNeedsRefresh(White, baseW) then blockedW <- true
                 else baseW <- baseW - 1
 
-            let mutable baseB = sfTop
+            let mutable baseB = top
             let mutable blockedB = false
 
-            while baseB > 0 && not blockedB && not sfComputedB.[baseB] do
-                if this.SfFrameNeedsRefresh(Black, baseB) then blockedB <- true
+            while baseB > 0 && not blockedB && not computedB.[baseB] do
+                if this.FrameNeedsRefresh(Black, baseB) then blockedB <- true
                 else baseB <- baseB - 1
 
-            let rebuildW = blockedW || not sfComputedW.[baseW]
-            let rebuildB = blockedB || not sfComputedB.[baseB]
+            let rebuildW = blockedW || not computedW.[baseW]
+            let rebuildB = blockedB || not computedB.[baseB]
 
             if not rebuildW && not rebuildB && baseW = baseB then
-                this.SfCopyFrame(White, baseW, sfTop)
-                this.SfCopyFrame(Black, baseB, sfTop)
+                this.CopyFrame(White, baseW, top)
+                this.CopyFrame(Black, baseB, top)
 
-                for f in baseW + 1 .. sfTop do
-                    this.SfApplyFrameBoth(f)
+                for f in baseW + 1 .. top do
+                    this.ApplyFrameBoth(f)
 
-                sfComputedW.[sfTop] <- true
-                sfComputedB.[sfTop] <- true
+                computedW.[top] <- true
+                computedB.[top] <- true
             elif rebuildW && rebuildB then
-                this.SfBuildFullBoth(sfTop)
+                this.BuildFullBoth(top)
             else
-                this.SfEnsureComputed White
-                this.SfEnsureComputed Black
+                this.EnsureComputed White
+                this.EnsureComputed Black
 
     /// Merged accumulator (biases + HalfKA + threats already summed) for a perspective, into caller spans.
-    member this.SfReadAccInto(pColor: Color, acc: System.Span<int16>, psqt: System.Span<int>) =
-        this.SfEnsureComputed pColor
-        let m = if pColor = White then sfAccW else sfAccB
-        let mp = if pColor = White then sfPsqW else sfPsqB
-        System.Span<int16>(m, this.SfAccOff sfTop, Accumulator.L1).CopyTo(acc)
-        System.Span<int>(mp, this.SfPsqOff sfTop, Accumulator.PsqtBuckets).CopyTo(psqt)
+    member this.ReadAccInto(pColor: Color, acc: System.Span<int16>, psqt: System.Span<int>) =
+        this.EnsureComputed pColor
+        let m = if pColor = White then accW else accB
+        let mp = if pColor = White then psqW else psqB
+        System.Span<int16>(m, this.AccOff top, Accumulator.L1).CopyTo(acc)
+        System.Span<int>(mp, this.PsqOff top, Accumulator.PsqtBuckets).CopyTo(psqt)
 
-    member this.SfAccSpan(pColor: Color) : System.Span<int16> =
-        this.SfEnsureComputed pColor
-        let m = if pColor = White then sfAccW else sfAccB
-        System.Span<int16>(m, this.SfAccOff sfTop, Accumulator.L1)
+    member this.AccSpan(pColor: Color) : System.Span<int16> =
+        this.EnsureComputed pColor
+        let m = if pColor = White then accW else accB
+        System.Span<int16>(m, this.AccOff top, Accumulator.L1)
 
-    member this.SfPsqtSpan(pColor: Color) : System.Span<int> =
-        this.SfEnsureComputed pColor
-        let mp = if pColor = White then sfPsqW else sfPsqB
-        System.Span<int>(mp, this.SfPsqOff sfTop, Accumulator.PsqtBuckets)
+    member this.PsqtSpan(pColor: Color) : System.Span<int> =
+        this.EnsureComputed pColor
+        let mp = if pColor = White then psqW else psqB
+        System.Span<int>(mp, this.PsqOff top, Accumulator.PsqtBuckets)
 
-    member this.SfAccSpanComputed(pColor: Color) : System.Span<int16> =
-        let m = if pColor = White then sfAccW else sfAccB
-        System.Span<int16>(m, this.SfAccOff sfTop, Accumulator.L1)
+    member this.AccSpanComputed(pColor: Color) : System.Span<int16> =
+        let m = if pColor = White then accW else accB
+        System.Span<int16>(m, this.AccOff top, Accumulator.L1)
 
-    member this.SfPsqtSpanComputed(pColor: Color) : System.Span<int> =
-        let mp = if pColor = White then sfPsqW else sfPsqB
-        System.Span<int>(mp, this.SfPsqOff sfTop, Accumulator.PsqtBuckets)
+    member this.PsqtSpanComputed(pColor: Color) : System.Span<int> =
+        let mp = if pColor = White then psqW else psqB
+        System.Span<int>(mp, this.PsqOff top, Accumulator.PsqtBuckets)
 
-    /// Compatibility escape hatch for tests/probes that still want an array. Prefer SfAccSpan in hot code.
-    member this.SfAccArray(pColor: Color) : int16[] =
-        this.SfEnsureComputed pColor
-        let src = if pColor = White then sfAccW else sfAccB
-        src.[this.SfAccOff sfTop .. this.SfAccOff sfTop + Accumulator.L1 - 1]
+    /// Compatibility escape hatch for tests/probes that still want an array. Prefer AccSpan in hot code.
+    member this.AccArray(pColor: Color) : int16[] =
+        this.EnsureComputed pColor
+        let src = if pColor = White then accW else accB
+        src.[this.AccOff top .. this.AccOff top + Accumulator.L1 - 1]
 
-    member this.SfPsqtArray(pColor: Color) : int[] =
-        this.SfEnsureComputed pColor
-        let src = if pColor = White then sfPsqW else sfPsqB
-        src.[this.SfPsqOff sfTop .. this.SfPsqOff sfTop + Accumulator.PsqtBuckets - 1]
+    member this.PsqtArray(pColor: Color) : int[] =
+        this.EnsureComputed pColor
+        let src = if pColor = White then psqW else psqB
+        src.[this.PsqOff top .. this.PsqOff top + Accumulator.PsqtBuckets - 1]
 
     /// Bind weights + threat enumerators + materialize root. ROOT ONLY.
     member this.EnableNnue
-        (biases: int16[])
-        (halfWeights: int16[])
-        (halfPsqt: int[])
-        (threatWeights: sbyte[])
-        (threatPsqt: int[])
-        (threatFn: System.Func<Position, int, int[], int>)
-        (threatFnBoth: System.Func<Position, int[], int[], int64>)
-        (threatFnChangedBoth: System.Func<Position, int[], int, int, int[], int[], int64>)
+        (biasesIn: int16[])
+        (halfWeightsIn: int16[])
+        (halfPsqtIn: int[])
+        (threatWeightsIn: sbyte[])
+        (threatPsqtIn: int[])
+        (threatFnIn: System.Func<Position, int, int[], int>)
+        (threatFnBothIn: System.Func<Position, int[], int[], int64>)
+        (threatFnChangedBothIn: System.Func<Position, int[], int, int, int[], int[], int64>)
         =
         Debug.Assert((stPly = 0), "EnableNnue must be called at the root (stPly = 0)")
-        this.SfEnsureStorage()
-        sfBiases <- biases
-        sfHalfWeights <- halfWeights
-        sfHalfPsqt <- halfPsqt
-        sfThreatWeights <- threatWeights
-        sfThreatPsqt <- threatPsqt
-        sfThreatFn <- threatFn
-        sfThreatFnBoth <- threatFnBoth
-        sfThreatFnChangedBoth <- threatFnChangedBoth
-        sfTop <- 0
-        sfDirtyN <- 0
-        sfDirtyThreatN <- 0
-        sfDirtyThreatOverflow <- false
-        System.Array.Clear(sfComputedW, 0, sfComputedW.Length)
-        System.Array.Clear(sfComputedB, 0, sfComputedB.Length)
-        sfFrameDirtyN.[0] <- 0
-        sfFrameThreatN.[0] <- 0
-        sfFrameChangedNW.[0] <- 0
-        sfFrameChangedNB.[0] <- 0
-        sfFrameChangedValid.[0] <- false
-        sfFrameChangedKsqW.[0] <- NoSquare
-        sfFrameChangedKsqB.[0] <- NoSquare
-        sfFrameWhiteKingMoved.[0] <- false
-        sfFrameBlackKingMoved.[0] <- false
-        sfFrameThreatOverflow.[0] <- false
-        sfActive <- true
-        sfEagerUpdates <- true
-        this.SfBuildFull(White, 0)
-        this.SfBuildFull(Black, 0)
+        this.EnsureStorage()
+        biases <- biasesIn
+        halfWeights <- halfWeightsIn
+        halfPsqt <- halfPsqtIn
+        threatWeights <- threatWeightsIn
+        threatPsqt <- threatPsqtIn
+        threatFn <- threatFnIn
+        threatFnBoth <- threatFnBothIn
+        threatFnChangedBoth <- threatFnChangedBothIn
+        top <- 0
+        dirtyN <- 0
+        dirtyThreatN <- 0
+        dirtyThreatOverflow <- false
+        System.Array.Clear(computedW, 0, computedW.Length)
+        System.Array.Clear(computedB, 0, computedB.Length)
+        frameDirtyN.[0] <- 0
+        frameThreatN.[0] <- 0
+        frameChangedNW.[0] <- 0
+        frameChangedNB.[0] <- 0
+        frameChangedValid.[0] <- false
+        frameChangedKsqW.[0] <- NoSquare
+        frameChangedKsqB.[0] <- NoSquare
+        frameWhiteKingMoved.[0] <- false
+        frameBlackKingMoved.[0] <- false
+        frameThreatOverflow.[0] <- false
+        active <- true
+        eagerUpdates <- true
+        this.BuildFull(White, 0)
+        this.BuildFull(Black, 0)
 
     /// Test/debug hook: collect the physical dirty FullThreats edges that `Make m` would record, without
     /// requiring NNUE weights. Returns -1 if the frame hit the overflow fallback.
-    member this.SfDebugCollectDirtyThreats(m: Move, dst: int[]) : int =
-        let wasActive = sfActive
-        let savedTop = sfTop
-        this.SfEnsureStorage()
+    member this.DebugCollectDirtyThreats(m: Move, dst: int[]) : int =
+        let wasActive = active
+        let savedTop = top
+        this.EnsureStorage()
 
         if not wasActive then
-            sfActive <- true
-            sfTop <- 0
-            sfDirtyN <- 0
+            active <- true
+            top <- 0
+            dirtyN <- 0
 
         this.Make m
-        let frame = sfTop
-        let n = sfFrameThreatN.[frame]
-        let overflow = sfDirtyThreatOverflow
+        let frame = top
+        let n = frameThreatN.[frame]
+        let overflow = dirtyThreatOverflow
 
         if not overflow then
-            System.Array.Copy(sfFrameThreats, this.SfThreatOff frame, dst, 0, min n dst.Length)
+            System.Array.Copy(frameThreats, this.ThreatOff frame, dst, 0, min n dst.Length)
 
         this.Unmake m
 
         if not wasActive then
-            sfActive <- false
-            sfTop <- savedTop
-            sfDirtyN <- 0
+            active <- false
+            top <- savedTop
+            dirtyN <- 0
 
         if overflow then -1 else min n dst.Length
 
@@ -1168,12 +1168,12 @@ type Position() =
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member _.PieceValueOf(pt: PieceType) : int = pieceValue.[pt]
 
-    // --- SEE: static-exchange evaluation >= threshold (Stockfish Position::see_ge, faithful) ----------
-    // v1 simplifications (see plan D5): non-NORMAL m short-circuits to (0 >= threshold) — exactly SF's
+    // --- SEE: static-exchange evaluation >= threshold ----------
+    // v1 simplifications (see plan D5): non-NORMAL m short-circuits to (0 >= threshold) — exactly the reference's
     // own early-out (promotion treated via that path); and the swap loop is NOT pin-aware (the
     // KING-terminate rule already covers the dominant illegal-recapture case; Pinners/BlockersForKing are
     // available for a v2 refinement). SEE drives only pruning/ordering, never legality. The control flow
-    // (swap accumulator, res toggle, `swap < res` break, KING terminate, return bool(res)) mirrors SF
+    // (swap accumulator, res toggle, `swap < res` break, KING terminate, return bool(res)) mirrors the reference
     // line-for-line so the unit fixtures pin to exact values.
     member this.SeeGe (m: Move) (threshold: int) : bool =
         if isSpecial m then
@@ -1294,7 +1294,7 @@ type Position() =
 
                     result
 
-    // --- slider blockers / pinners (SF slider_blockers, verbatim) -----------
+    // --- slider blockers / pinners -----------
     // snipers are found on the EMPTY board so a far slider behind a blocker is still seen; occ ^^^ snipers
     // removes ALL snipers so one sniper isn't mis-counted as a "blocker" behind another. Tupled (byref out).
     member private _.SliderBlockers(kc: Color, ksq: Square, pinners: byref<Bitboard>) : Bitboard =
@@ -1322,7 +1322,7 @@ type Position() =
 
         blockers
 
-    // --- set_check_info: cache checkers / blockers / pinners / checkSquares --
+    // --- check-info: cache checkers / blockers / pinners / check squares --
     // HARD RULE: never pass &states.[stPly].Field as a byref out-param — compute into a local, assign back.
     member private this.SetCheckInfo() =
         let us = sideToMove // side to move AFTER the move
@@ -1380,7 +1380,7 @@ type Position() =
         | Bishop -> st.CheckSqB
         | Rook -> st.CheckSqR
         | Queen -> st.CheckSqQ
-        | _ -> 0UL // King never gives check (SF: checkSquares[KING] = 0)
+        | _ -> 0UL // King never gives check (checkSquares[KING] = 0)
 
     // --- castling geometry for MoveGen (by single right bit WK/WQ/BK/BQ) ----
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
@@ -1446,14 +1446,14 @@ type Position() =
         currentKey <- 0UL
         stPly <- 0
         gamePly <- 0
-        // A bulk board load invalidates the incremental SF accumulator: disable it so the piece-placement
+        // A bulk board load invalidates the incremental accumulator: disable it so the piece-placement
         // below records NO deltas (32 PutPiece calls would overflow the small dirty buffer). The caller
-        // re-enables via EnableNnue, which rebuilds both perspectives from scratch (SfRefresh).
-        sfActive <- false
-        sfTop <- 0
-        sfDirtyN <- 0
-        sfDirtyThreatN <- 0
-        sfDirtyThreatOverflow <- false
+        // re-enables via EnableNnue, which rebuilds both perspectives from scratch (Refresh).
+        active <- false
+        top <- 0
+        dirtyN <- 0
+        dirtyThreatN <- 0
+        dirtyThreatOverflow <- false
         let n = fen.Length
         let mutable i = 0
         // 1. piece placement (ranks 8->1, files a->h)
@@ -1519,7 +1519,7 @@ type Position() =
 
         while i < n && fen.[i] = ' ' do
             i <- i + 1
-        // 4. en-passant target (kept only if a real capturer exists — the SF gate)
+        // 4. en-passant target (kept only if a real capturer exists — the gate)
         let mutable ep = NoSquare
 
         if i < n && fen.[i] = '-' then
@@ -1678,9 +1678,9 @@ type Position() =
         let pCastling = prev.CastlingRights
         let pRule50 = prev.Rule50
         let pPlies = prev.PliesFromNull
-        // SF NNUE: push a lazy dirty frame for real moves only. Null moves intentionally do not affect sfTop.
-        if sfActive then
-            this.SfBeginFrame()
+        // NNUE: push a lazy dirty frame for real moves only. Null moves intentionally do not affect top.
+        if active then
+            this.BeginFrame()
         stPly <- stPly + 1
         gamePly <- gamePly + 1
         let st = &states.[stPly]
@@ -1752,11 +1752,11 @@ type Position() =
         sideToMove <- them
         st.Key <- currentKey
         this.SetCheckInfo()
-        // SF NNUE: persist dirty pieces + physical FullThreats deltas, then eagerly materialize the child
+        // NNUE: persist dirty pieces + physical FullThreats deltas, then eagerly materialize the child
         // accumulator (copy parent + apply deltas). Eval becomes O(1) — no lazy frame walk at eval time.
-        if sfActive then
-            this.SfCommitFrame()
-            if sfEagerUpdates then this.SfEagerUpdate()
+        if active then
+            this.CommitFrame()
+            if eagerUpdates then this.EagerUpdate()
 
     /// Undo the move applied by Make. Pure board restore — NO key math (the parent frame holds the key).
     member this.Unmake(m: Move) : unit =
@@ -1792,10 +1792,10 @@ type Position() =
         stPly <- stPly - 1
         gamePly <- gamePly - 1
         currentKey <- (let p = &states.[stPly] in p.Key)
-        // SF NNUE: pop the lazy frame. Parent materialization, if needed, is computed on demand.
-        if sfActive then
-            Debug.Assert((sfTop > 0), "Unmake: sfTop underflow")
-            sfTop <- sfTop - 1
+        // NNUE: pop the lazy frame. Parent materialization, if needed, is computed on demand.
+        if active then
+            Debug.Assert((top > 0), "Unmake: top underflow")
+            top <- top - 1
 
     /// Play a null move (side passes). PRE: not in check.
     member this.MakeNull() : unit =
@@ -1809,8 +1809,8 @@ type Position() =
 
         let pCastling = prev.CastlingRights
         let pRule50 = prev.Rule50
-        // SF NNUE: a null move moves no pieces ⇒ the accumulator is identical ⇒ no snapshot/update needed.
-        if sfActive then sfDirtyN <- 0
+        // NNUE: a null move moves no pieces ⇒ the accumulator is identical ⇒ no snapshot/update needed.
+        if active then dirtyN <- 0
         stPly <- stPly + 1
         gamePly <- gamePly + 1
         let st = &states.[stPly]
@@ -1830,7 +1830,7 @@ type Position() =
         gamePly <- gamePly - 1
         sideToMove <- flipColor sideToMove
         currentKey <- (let p = &states.[stPly] in p.Key)
-        // SF NNUE: a null move left the accumulator unchanged ⇒ nothing to restore.
+        // NNUE: a null move left the accumulator unchanged ⇒ nothing to restore.
 
     // --- GivesCheck: does `m` give check? (search/movegen; perft does not use it) -------------------
     // Normal: direct via cached CheckSquares (valid because a `from`-blocked ray would mean the enemy king
@@ -1870,10 +1870,10 @@ type Position() =
 
     // --- in-check resolution shared by IsPseudoLegal's NORMAL/Promotion arms -----------------------
     // king=true  -> destination must be safe with the king REMOVED from occ (X-ray through the vacated
-    //               square) — this is the one piece of legality IsPseudoLegal does (matching SF pseudo_legal).
+    //               square) — this is the one piece of legality IsPseudoLegal does (matching pseudo_legal).
     // king=false -> under single check the move must land on between(ksq,checker)|checkers (capture/interpose);
     //               under double check a non-king move is illegal. Pin legality for non-king pieces is left
-    //               to isLegal (exactly as SF). PRE: the move already passed its shape check.
+    //               to isLegal (exactly as the reference). PRE: the move already passed its shape check.
     member private this.ResolvesCheck (us: Color) (from: Square) (dst: Square) (isKing: bool) : bool =
         let them = flipColor us
 
@@ -1891,12 +1891,12 @@ type Position() =
                 let checker = lsb st.Checkers
                 testBit ((between ksq checker) ||| st.Checkers) dst
 
-    // --- IsPseudoLegal (SF Position::pseudo_legal): is `m` playable in THIS position by sideToMove? --
+    // --- IsPseudoLegal: is `m` playable in THIS position by sideToMove? --
     // Used by the MovePick to emit a TT/killer/counter move WITHOUT generating it (Make assumes
     // legality). Fully INLINE — it MUST NOT call MoveGeneration.generate (Position compiles first); the
     // three special-move validators are hand-rolled from Position's own accessors (mirroring tryCastle /
     // genPawnMoves / the evasion target so that IsPseudoLegal == membership in the generated set). Pin
-    // legality for non-king pieces is deferred to isLegal, exactly as SF.
+    // legality for non-king pieces is deferred to isLegal, exactly as the reference.
     member this.IsPseudoLegal(m: Move) : bool =
         if not (isOk m) then
             false // rejects MoveNone, MoveNull, from==to

@@ -2,7 +2,7 @@
 /// pseudo-legal set (Evasions when in check, else NonEvasions) and the fully-legal set, then assert:
 ///   (a) every fully-legal move is pseudo-legal;
 ///   (b) every generated NON-king candidate is pseudo-legal;
-///   (c) for KING moves, IsPseudoLegal <=> membership in the LEGAL set (IsPseudoLegal keeps SF's
+///   (c) for KING moves, IsPseudoLegal <=> membership in the LEGAL set (IsPseudoLegal keeps the reference's
 ///       king-into-check test, which raw generate() does not cull — the "split oracle");
 ///   (d) no NORMAL move from a side-to-move piece is a false positive.
 /// Plus a battery of crafted negatives.

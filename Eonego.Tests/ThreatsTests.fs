@@ -1,6 +1,6 @@
-/// FullThreats feature-enumeration invariants. Without a real-Stockfish reference we can't bit-exact-verify
+/// FullThreats feature-enumeration invariants. Without a reference implementation we can't bit-exact-verify
 /// the threat indices, but we pin the structural invariants: every active index is in [0, Dimensions), the
-/// active count never exceeds SF's MaxActiveDimensions (128), and a normal middlegame has a non-empty,
+/// active count never exceeds the active-feature cap (128), and a normal middlegame has a non-empty,
 /// perspective-dependent threat set. (The material-accurate evals in NnueTests are the broader evidence.)
 module Eonego.Tests.ThreatsTests
 
@@ -88,7 +88,7 @@ let private checkDirtyMove (pos: Position) (m: Move) =
     let oldKsqW = pos.KingSquare White
     let oldKsqB = pos.KingSquare Black
     let dirty = Array.zeroCreate MaxDirtyThreats
-    let dirtyN = pos.SfDebugCollectDirtyThreats(m, dirty)
+    let dirtyN = pos.DebugCollectDirtyThreats(m, dirty)
     Assert.True(dirtyN >= 0, sprintf "dirty threat overflow for %s in %s" (toUci m) (pos.ToFen()))
 
     pos.Make m

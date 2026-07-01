@@ -1,4 +1,4 @@
-/// Eonego — staged, lazy move picker (port of Stockfish movepick.cpp).
+/// Eonego — staged, lazy move picker.
 ///
 /// [<Struct; IsByRefLike>] value type carrying the two caller-owned PARALLEL stackalloc buffers
 /// (Span<Move> moves + Span<int> scores) plus the live stage/cursor state, the Position, and the
@@ -184,7 +184,7 @@ let private pickBest (mp: byref<MovePick>) (s: int) (e: int) : int =
 
     s
 
-/// SF partial_insertion_sort: move every element with score >= limit to the front in score-descending
+/// partial_insertion_sort: move every element with score >= limit to the front in score-descending
 /// order; the rest stay unordered behind. Operates on BOTH parallel buffers (held-element form, NOT swaps).
 let private partialInsertionSort (mp: byref<MovePick>) (s: int) (e: int) (limit: int) : unit =
     let mutable sortedEnd = s

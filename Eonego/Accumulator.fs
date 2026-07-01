@@ -1,7 +1,7 @@
-/// HalfKAv2_hm feature indexing — the single source of truth for the SF NNUE accumulator math.
+/// HalfKAv2_hm feature indexing — the single source of truth for the NNUE accumulator math.
 /// Compiles BEFORE Position.fs (Position maintains the incremental accumulator and calls these); NNUE.fs
-/// (after Position) reuses them in the from-scratch `buildAcc` oracle. PURE: no Position, no SfNetwork.
-/// Eonego squares are LERF (a1=0) == Stockfish; Color White=0/Black=1; Piece 0..11.
+/// (after Position) reuses them in the from-scratch `buildAcc` oracle. PURE: no Position, no Network.
+/// Eonego squares are LERF (a1=0); Color White=0/Black=1; Piece 0..11.
 module Eonego.Accumulator
 
 open System.Runtime.CompilerServices
@@ -11,7 +11,7 @@ open System.Runtime.Intrinsics.X86
 open Eonego.Bitboard
 
 [<Literal>]
-let L1 = 1024 // FullThreats accumulator dim (was 1536 for SF16); HalfKA weights are now [feature][1024]
+let L1 = 1024 // FullThreats accumulator dim (was 1536 for the prior net); HalfKA weights are now [feature][1024]
 
 [<Literal>]
 let PsqtBuckets = 8

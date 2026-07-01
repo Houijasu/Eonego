@@ -1,4 +1,4 @@
-/// Golden regression for the NNUE evaluator's NUMERIC output. Locks `evalInternal` (the raw SF-Value,
+/// Golden regression for the NNUE evaluator's NUMERIC output. Locks `evalInternal` (the raw Net value,
 /// side-to-move-relative, BEFORE the centipawn/NormalizeToPawnValue conversion) to fixed integers captured
 /// from the current build. Every performance phase (VNNI, bounds-check elimination, int16 accumulator, ...)
 /// MUST reproduce these exactly — this is the bit-exactness gate that proves a perf change did not alter eval.
@@ -29,7 +29,7 @@ let private repoRoot () : string option =
 
     found
 
-let private withNet (f: SfNetwork -> unit) =
+let private withNet (f: Network -> unit) =
     match repoRoot () with
     | None -> ()
     | Some root ->

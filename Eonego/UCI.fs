@@ -34,12 +34,12 @@ let private readEmbedded (name: string) : byte[] option =
         s.CopyTo ms
         Some(ms.ToArray())
 
-/// Only Threads and Move Overhead remain tunable; every other option is hardwired ON / fixed. The SF NNUE
+/// Only Threads and Move Overhead remain tunable; every other option is hardwired ON / fixed. The NNUE
 /// net is embedded in the binary (see Eonego.fsproj), so there is no EvalFile UCI option.
 type private UCIState =
     { mutable Threads: int
       mutable MoveOverhead: int
-      Net: SfNetwork option
+      Net: Network option
       Tt: TranspositionTable
       mutable RootFen: string
       mutable RootMoves: Move[]
@@ -230,9 +230,9 @@ let private handleSetOption (st: UCIState) (tokens: string[]) =
     | _ -> ()
 
 let run () =
-    // The SF NNUE net is embedded in the binary (see Eonego.fsproj <EmbeddedResource>); load it once at startup.
+    // The NNUE net is embedded in the binary (see Eonego.fsproj <EmbeddedResource>); load it once at startup.
     let net =
-        match readEmbedded "sf16.nnue" with
+        match readEmbedded "eval.nnue" with
         | Some bytes -> (match Nnue.loadBytes bytes with Loaded n -> Some n | Failed _ -> None)
         | None -> None
 

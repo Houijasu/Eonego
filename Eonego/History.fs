@@ -7,9 +7,9 @@
 ///  - main          : butterfly main history, flat int16[2*4096] indexed [color<<<12 | fromTo m].
 ///  - capture       : capture history, flat int16[12*64*8] indexed [((pc*64)+to)<<<3 + capturedPT].
 ///  - counter       : counter-moves, flat Move[12*64] indexed [prevPc*64 + prevTo].
-///  - killers        : per-ply refutation pair, Move[2*MaxPly] indexed [ply*2 + slot] (SF keeps killers
+///  - killers        : per-ply refutation pair, Move[2*MaxPly] indexed [ply*2 + slot] (killers are kept, as in the reference:
 ///                     in the search Stack; stored here so the per-thread object owns them).
-///  - All stats use SF's "gravity" update: entry += clamp(bonus,-D,D) - entry*abs(clamp)/D. The fixpoint
+///  - All stats use the "gravity" update: entry += clamp(bonus,-D,D) - entry*abs(clamp)/D. The fixpoint
 ///    keeps |entry| < D < int16 max, so the int16 store never overflows. The update functions are NOT
 ///    driven by a search yet (Phase 2 has no search) — they exist + are unit-tested for saturation.
 ///  - Continuation history and QuietChecks are deliberately out of scope (a later phase).
@@ -21,17 +21,17 @@ open Eonego.Bitboard
 open Eonego.Move
 open Eonego.Position
 
-// SF gravity divisors (also the bonus clamp bound). Both < int16 max (32767) so the store can't overflow.
+// Gravity divisors (also the bonus clamp bound). Both < int16 max (32767) so the store can't overflow.
 [<Literal>]
-let MainHistD = 7183 // SF ButterflyHistory
+let MainHistD = 7183 // butterfly (main) history divisor
 
 [<Literal>]
-let CaptureHistD = 10692 // SF CapturePieceToHistory
+let CaptureHistD = 10692 // capture history divisor
 
 [<Literal>]
-let ContHistD = 29952 // SF PieceToHistory (continuation); < int16 max so the gravity store can't overflow
+let ContHistD = 29952 // continuation history divisor; < int16 max so the gravity store can't overflow
 
-/// Stat bonus as a function of depth (representative SF shape; tunable when the search lands).
+/// Stat bonus as a function of depth (representative shape; tunable when the search lands).
 let inline statBonus (depth: int) : int = min (160 * depth - 100) 1700
 
 [<Sealed>]
@@ -98,21 +98,21 @@ type Tables() =
             killers.[i + 1] <- killers.[i]
             killers.[i] <- m
 
-    /// SF gravity update of main history (saturates within int16 toward +/-MainHistD).
+    /// Gravity update of main history (saturates within int16 toward +/-MainHistD).
     member _.UpdateMain (c: Color) (m: Move) (bonus: int) : unit =
         let i = (c <<< 12) ||| (fromTo m)
         let b = max -MainHistD (min MainHistD bonus)
         let v = int main.[i]
         main.[i] <- int16 (v + b - v * (abs b) / MainHistD)
 
-    /// SF gravity update of capture history.
+    /// Gravity update of capture history.
     member _.UpdateCapture (pc: Piece) (dst: Square) (capturedPT: PieceType) (bonus: int) : unit =
         let i = ((pc * 64 + dst) <<< 3) + capturedPT
         let b = max -CaptureHistD (min CaptureHistD bonus)
         let v = int capture.[i]
         capture.[i] <- int16 (v + b - v * (abs b) / CaptureHistD)
 
-    /// SF gravity update of 1-ply continuation history (no-op when prevPc < 0).
+    /// Gravity update of 1-ply continuation history (no-op when prevPc < 0).
     member _.UpdateCont1 (prevPc: int) (prevTo: int) (pc: Piece) (dst: Square) (bonus: int) : unit =
         if prevPc >= 0 then
             let i = (prevPc * 64 + prevTo) * 768 + (pc * 64 + dst)
@@ -120,7 +120,7 @@ type Tables() =
             let v = int cont1.[i]
             cont1.[i] <- int16 (v + b - v * (abs b) / ContHistD)
 
-    /// SF gravity update of 2-ply continuation history (no-op when prevPc < 0).
+    /// Gravity update of 2-ply continuation history (no-op when prevPc < 0).
     member _.UpdateCont2 (prevPc: int) (prevTo: int) (pc: Piece) (dst: Square) (bonus: int) : unit =
         if prevPc >= 0 then
             let i = (prevPc * 64 + prevTo) * 768 + (pc * 64 + dst)

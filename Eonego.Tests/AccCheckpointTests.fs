@@ -3,7 +3,7 @@
 /// Two layers:
 ///   1. Pure-cache unit tests on `AccCheckpointTable` (no NNUE, no Position): round-trip, miss, clear,
 ///      torn-payload rejection, capacity-invariants. These pin the lock-free contract.
-///   2. Integration tests via `Position.SfEnsureBothComputed` with a real SF NNUE net bound: bit-exact acc
+///   2. Integration tests via `Position.EnsureBothComputed` with a real NNUE net bound: bit-exact acc
 ///      parity with the cache enabled vs disabled; a hit restores the same accumulator as a from-scratch
 ///      materialization of the same position.
 ///
@@ -25,7 +25,7 @@ open Eonego.Nnue
 open Eonego.Tests.TestFixtures
 
 // ---------------------------------------------------------------------------
-// Soft-skip helper mirroring NnueTests.fs: locate the SF net under nets/.
+// Soft-skip helper mirroring NnueTests.fs: locate the NNUE net under nets/.
 // ---------------------------------------------------------------------------
 let private netPath () : string option =
     let mutable dir = DirectoryInfo(AppContext.BaseDirectory)
@@ -43,7 +43,7 @@ let private netPath () : string option =
         if File.Exists p then Some p else None
     | None -> None
 
-let private withNet (f: SfNetwork -> unit) =
+let private withNet (f: Network -> unit) =
     match netPath () with
     | None -> () // soft-skip: net not present in this checkout
     | Some p ->
@@ -167,7 +167,7 @@ let ``4 MiB cache capacity is 512 slots (power-of-two)`` () =
 let ``zero-MiB config yields null table (cache disabled)`` () =
     // The SearchControl ctor interprets AccCheckpointMb <= 0 as "disabled" by allocating null. We can't easily
     // reach the ctor here, but the explicit-null pattern is what every probe site guards against — sanity-check
-    // that a fresh null literal is recognized by the F# Option-style `match` (the same idiom SfEnsureBothComputed
+    // that a fresh null literal is recognized by the F# Option-style `match` (the same idiom EnsureBothComputed
     // uses today). This is a deliberate tautology that pins the contract by example.
     let cache: AccCheckpointTable = null
     Assert.True(obj.ReferenceEquals(cache, null))
@@ -223,16 +223,16 @@ let ``distinct Zobrist keys with identical payloads round-trip independently`` (
     Assert.True(cache.TryProbe(keyB, dAW, 0, dAB, 0, dPW, 0, dPB, 0), "keyB must hit")
 
 // ---------------------------------------------------------------------------
-// 2. NNUE integration tests via Position.SfEnsureBothComputed. SOFT-SKIP if the
+// 2. NNUE integration tests via Position.EnsureBothComputed. SOFT-SKIP if the
 //    embedded/local net is absent (CC0 but large — see NnueTests.fs).
 // ---------------------------------------------------------------------------
-let private bindAndEval (net: SfNetwork) (fen: string) (cache: AccCheckpointTable) : int =
+let private bindAndEval (net: Network) (fen: string) (cache: AccCheckpointTable) : int =
     let pos = Position()
     pos.LoadFen fen
     bindNnue net pos
     if not (obj.ReferenceEquals(cache, null)) then
-        pos.SfBindCheckpoint cache
-    // SfEnsureBothComputed fires lazily here once evalCp touches the accumulators.
+        pos.BindCheckpoint cache
+    // EnsureBothComputed fires lazily here once evalCp touches the accumulators.
     evalCp net pos
 
 [<Fact>]
@@ -254,24 +254,24 @@ let ``evalCp parity: cache ON == cache OFF across a fixed-position set`` () =
                 Assert.Equal(vOff, vOn))
 
 [<Fact>]
-let ``SfEnsureBothComputed cache hit yields bit-exact acc vs from-scratch`` () =
+let ``EnsureBothComputed cache hit yields bit-exact acc vs from-scratch`` () =
     withNet
         (fun net ->
             let pos = Position()
             pos.LoadFen StartPosFen
             bindNnue net pos
             let cache = AccCheckpointTable(4)
-            pos.SfBindCheckpoint cache
-            // `bindNnue`/EnableNnue already materialized root frame 0 and set sfComputed flags, so
-            // the early-return path inside SfEnsureBothComputed would skip the cache populate. Mirror
+            pos.BindCheckpoint cache
+            // `bindNnue`/EnableNnue already materialized root frame 0 and set computed flags, so
+            // the early-return path inside EnsureBothComputed would skip the cache populate. Mirror
             // what `Worker.SetupRoot` does: explicitly seed the cache for the already-computed root.
-            pos.SfSeedCheckpoint()
+            pos.SeedCheckpoint()
 
             // Read the materialized acc/psqt arrays (both perspectives computed at the root).
-            let accWArr = pos.SfAccArray White
-            let accBArr = pos.SfAccArray Black
-            let psqWArr = pos.SfPsqtArray White
-            let psqBArr = pos.SfPsqtArray Black
+            let accWArr = pos.AccArray White
+            let accBArr = pos.AccArray Black
+            let psqWArr = pos.PsqtArray White
+            let psqBArr = pos.PsqtArray Black
             // The seed MUST have left a cache entry for this position.
             let dAW = Array.zeroCreate L1
             let dAB = Array.zeroCreate L1
@@ -279,7 +279,7 @@ let ``SfEnsureBothComputed cache hit yields bit-exact acc vs from-scratch`` () =
             let dPB = Array.zeroCreate PsqtBuckets
 
             let hit = cache.TryProbe(pos.Key, dAW, 0, dAB, 0, dPW, 0, dPB, 0)
-            Assert.True(hit, "SfSeedCheckpoint must have populated the cache for the root key")
+            Assert.True(hit, "SeedCheckpoint must have populated the cache for the root key")
 
             for i in 0 .. L1 - 1 do
                 Assert.Equal(accWArr.[i], dAW.[i])
@@ -300,9 +300,9 @@ let ``eager accumulator materializes during Make (no cache needed)`` () =
             let moves = collectLegal pos
             Assert.True(moves.Length > 0)
             pos.Make moves.[0]
-            // The accumulator at sfTop must already be materialized (eager update sets computed flags).
-            let accWArr = pos.SfAccArray White
-            let accBArr = pos.SfAccArray Black
+            // The accumulator at top must already be materialized (eager update sets computed flags).
+            let accWArr = pos.AccArray White
+            let accBArr = pos.AccArray Black
 
             // Verify the accumulator is non-trivial (not all zeros).
             Assert.True(accWArr |> Array.exists (fun v -> v <> 0s), "white acc must be materialized")
