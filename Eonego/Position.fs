@@ -244,6 +244,13 @@ type Position() =
     let tmpB: int[] = Array.zeroCreate MaxThreats // enumeration scratch, black perspective
     let changedW: int[] = Array.zeroCreate Accumulator.MaxDirtyThreats
     let changedB: int[] = Array.zeroCreate Accumulator.MaxDirtyThreats
+    // Fused-apply gather scratch (dedicated — tmpW/tmpB are aliased by EnumThreats). HalfKA lists are sized
+    // for the finny board-diff worst case (32 subs + 32 adds would only occur split across the two lists;
+    // 40 gives slack + assert headroom). Threat lists hold decoded per-perspective row indices.
+    let fusedHalfAdd: int[] = Array.zeroCreate 40
+    let fusedHalfSub: int[] = Array.zeroCreate 40
+    let fusedThrAdd: int[] = Array.zeroCreate Accumulator.MaxDirtyThreats
+    let fusedThrSub: int[] = Array.zeroCreate Accumulator.MaxDirtyThreats
     let mutable biases: int16[] = Array.empty
     let mutable halfWeights: int16[] = Array.empty
     let mutable halfPsqt: int[] = Array.empty
@@ -726,159 +733,115 @@ type Position() =
         if frameThreatOverflow.[frame] || frameWhiteKingMoved.[frame] || frameBlackKingMoved.[frame] then
             this.BuildFullBoth(frame)
         else
-            this.CopyFrame(White, frame - 1, frame)
-            this.CopyFrame(Black, frame - 1, frame)
-            this.ApplyFrameBoth(frame)
+            let ksqW = this.KingSquare White
+            let ksqB = this.KingSquare Black
+            this.EnsureChangedThreats(frame, ksqW, ksqB)
+            this.ApplyFrameFusedTo(White, frame, frame - 1, frame)
+            this.ApplyFrameFusedTo(Black, frame, frame - 1, frame)
             computedW.[frame] <- true
             computedB.[frame] <- true
 
         if PosProf.Enabled then
             PosProf.tEager <- PosProf.tEager + (System.Diagnostics.Stopwatch.GetTimestamp() - profT0)
 
-    member private this.CopyFrame(pColor: Color, src: int, dst: int) =
-        let acc = if pColor = White then accW else accB
-        let psq = if pColor = White then psqW else psqB
-        System.Array.Copy(acc, this.AccOff src, acc, this.AccOff dst, Accumulator.L1)
-        System.Array.Copy(psq, this.PsqOff src, psq, this.PsqOff dst, Accumulator.PsqtBuckets)
-
-    member private this.ApplySignedThreats(pColor: Color, frame: int, buf: int[], off: int, n: int) =
-        let acc = if pColor = White then accW else accB
-        let psq = if pColor = White then psqW else psqB
-        let accOff = this.AccOff frame
-        let psqOff = this.PsqOff frame
-
-        if n <= 62 then
-            let addIdxs = tmpW
-            let subIdxs = tmpB
-            let mutable nAdd = 0
-            let mutable nSub = 0
-
-            for i in 0 .. n - 1 do
-                let v = buf.[off + i]
-
-                if v > 0 then
-                    addIdxs.[nAdd] <- v - 1
-                    nAdd <- nAdd + 1
-                else
-                    subIdxs.[nSub] <- -v - 1
-                    nSub <- nSub + 1
-
-            let pairN = min nAdd nSub
-            let mutable p = 0
-
-            while p + 1 < pairN do
-                Accumulator.addThreatPair2At
-                    acc
-                    accOff
-                    psq
-                    psqOff
-                    threatWeights
-                    threatPsqt
-                    subIdxs.[p]
-                    addIdxs.[p]
-                    subIdxs.[p + 1]
-                    addIdxs.[p + 1]
-                    Accumulator.UseAvx2
-
-                p <- p + 2
-
-            if p < pairN then
-                Accumulator.addThreatPairAt acc accOff psq psqOff threatWeights threatPsqt subIdxs.[p] addIdxs.[p] Accumulator.UseAvx2
-
-            for i in pairN .. nAdd - 1 do
-                Accumulator.addThreatAt acc accOff psq psqOff threatWeights threatPsqt addIdxs.[i] 1 Accumulator.UseAvx2
-
-            for i in pairN .. nSub - 1 do
-                Accumulator.addThreatAt acc accOff psq psqOff threatWeights threatPsqt subIdxs.[i] -1 Accumulator.UseAvx2
-        else
-            for i in 0 .. n - 1 do
-                let v = buf.[off + i]
-                let sign, idx = if v > 0 then 1, v - 1 else -1, -v - 1
-                Accumulator.addThreatAt acc accOff psq psqOff threatWeights threatPsqt idx sign Accumulator.UseAvx2
-
-    member private this.ApplyFrame(pColor: Color, frame: int) =
-        let acc = if pColor = White then accW else accB
-        let psq = if pColor = White then psqW else psqB
-        let accOff = this.AccOff top
-        let psqOff = this.PsqOff top
-        let dOff = this.DirtyOff frame
-        let ksq = this.KingSquare pColor
-        let ksqW = this.KingSquare White
-        let ksqB = this.KingSquare Black
-
-        let dirtyN = frameDirtyN.[frame]
-        let mutable usedDirty = 0
-
-        for i in 0 .. dirtyN - 1 do
-            if (usedDirty &&& (1 <<< i)) = 0 then
-                let pc = frameDirtyPc.[dOff + i]
-                let sq = frameDirtySq.[dOff + i]
-                let sign = frameDirtySign.[dOff + i]
-
-                if sign < 0 then
-                    let mutable j = i + 1
-                    let mutable pair = -1
-
-                    while pair < 0 && j < dirtyN do
-                        if
-                            (usedDirty &&& (1 <<< j)) = 0
-                            && frameDirtyPc.[dOff + j] = pc
-                            && frameDirtySign.[dOff + j] > 0
-                        then
-                            pair <- j
-                        else
-                            j <- j + 1
-
-                    if pair >= 0 then
-                        usedDirty <- usedDirty ||| (1 <<< i) ||| (1 <<< pair)
-                        let addSq = frameDirtySq.[dOff + pair]
-                        Accumulator.addFeaturePairAt
-                            acc
-                            accOff
-                            psq
-                            psqOff
-                            halfWeights
-                            halfPsqt
-                            (Accumulator.makeIndex pColor pc sq ksq)
-                            (Accumulator.makeIndex pColor pc addSq ksq)
-                            Accumulator.UseAvx2
-                    else
-                        usedDirty <- usedDirty ||| (1 <<< i)
-                        Accumulator.addFeatureAt acc accOff psq psqOff halfWeights halfPsqt (Accumulator.makeIndex pColor pc sq ksq) sign Accumulator.UseAvx2
-                else
-                    usedDirty <- usedDirty ||| (1 <<< i)
-                    Accumulator.addFeatureAt acc accOff psq psqOff halfWeights halfPsqt (Accumulator.makeIndex pColor pc sq ksq) sign Accumulator.UseAvx2
-
+    /// Ensure `frame`'s physical threat edges are converted into per-perspective SIGNED index lists
+    /// (`frameChangedW/B` at ThreatOff frame; +(idx+1) = add, -(idx+1) = remove) valid for the CURRENT king
+    /// squares. Cached per frame; re-run when either king square changed since caching (threat orientation
+    /// depends on the own-king file mirror). No-op when the frame has no threat edges or no conversion
+    /// delegate is bound (frameChangedValid stays false and the fused apply skips threats -- the pre-fused
+    /// paths behaved identically).
+    member private this.EnsureChangedThreats(frame: int, ksqW: Square, ksqB: Square) =
         let threatN = frameThreatN.[frame]
 
-        if threatN <> 0 then
-            if frameChangedValid.[frame] && frameChangedKsqW.[frame] = ksqW && frameChangedKsqB.[frame] = ksqB then
+        if
+            threatN <> 0
+            && not (
+                frameChangedValid.[frame]
+                && frameChangedKsqW.[frame] = ksqW
+                && frameChangedKsqB.[frame] = ksqB
+            )
+        then
+            match threatFnChangedBoth with
+            | null -> ()
+            | f ->
                 let off = this.ThreatOff frame
-                if pColor = White then
-                    this.ApplySignedThreats(White, top, frameChangedW, off, frameChangedNW.[frame])
-                else
-                    this.ApplySignedThreats(Black, top, frameChangedB, off, frameChangedNB.[frame])
+                let packed = f.Invoke(this, frameThreats, off, threatN, changedW, changedB)
+                let nW = int (packed >>> 32)
+                let nB = int (packed &&& 0xFFFFFFFFL)
+                System.Array.Copy(changedW, 0, frameChangedW, off, nW)
+                System.Array.Copy(changedB, 0, frameChangedB, off, nB)
+                frameChangedNW.[frame] <- nW
+                frameChangedNB.[frame] <- nB
+                frameChangedKsqW.[frame] <- ksqW
+                frameChangedKsqB.[frame] <- ksqB
+                frameChangedValid.[frame] <- true
+
+    /// Fused replay of ONE frame's deltas for one perspective: gather the frame's HalfKA dirty pieces and
+    /// pre-converted signed threat rows (see EnsureChangedThreats -- callers run it first) into add/sub index
+    /// lists, then apply them in a single register-tiled pass reading the accumulator at `srcFrame` and
+    /// writing `dstFrame` (parent -> child materialization; the old sub/add pairing kernels are subsumed --
+    /// the fused kernel folds every row into one accumulator sweep regardless of pairing).
+    /// PRE for the HalfKA index math: no own-king move inside `frame` (walk callers stop at refresh barriers).
+    member private this.ApplyFrameFusedTo(pColor: Color, frame: int, srcFrame: int, dstFrame: int) =
+        let acc = if pColor = White then accW else accB
+        let psq = if pColor = White then psqW else psqB
+        let ksq = this.KingSquare pColor
+        let dOff = this.DirtyOff frame
+        let dirtyN = frameDirtyN.[frame]
+        let mutable nHalfAdd = 0
+        let mutable nHalfSub = 0
+
+        for i in 0 .. dirtyN - 1 do
+            let idx =
+                Accumulator.makeIndex pColor frameDirtyPc.[dOff + i] frameDirtySq.[dOff + i] ksq
+
+            if frameDirtySign.[dOff + i] > 0 then
+                fusedHalfAdd.[nHalfAdd] <- idx
+                nHalfAdd <- nHalfAdd + 1
             else
-                match threatFnChangedBoth with
-                | null -> ()
-                | f ->
-                    let packed = f.Invoke(this, frameThreats, this.ThreatOff frame, threatN, changedW, changedB)
-                    let nW = int (packed >>> 32)
-                    let nB = int (packed &&& 0xFFFFFFFFL)
-                    let off = this.ThreatOff frame
+                fusedHalfSub.[nHalfSub] <- idx
+                nHalfSub <- nHalfSub + 1
 
-                    System.Array.Copy(changedW, 0, frameChangedW, off, nW)
-                    System.Array.Copy(changedB, 0, frameChangedB, off, nB)
-                    frameChangedNW.[frame] <- nW
-                    frameChangedNB.[frame] <- nB
-                    frameChangedKsqW.[frame] <- ksqW
-                    frameChangedKsqB.[frame] <- ksqB
-                    frameChangedValid.[frame] <- true
+        let mutable nThrAdd = 0
+        let mutable nThrSub = 0
 
-                    if pColor = White then
-                        this.ApplySignedThreats(White, top, frameChangedW, off, nW)
-                    else
-                        this.ApplySignedThreats(Black, top, frameChangedB, off, nB)
+        if frameThreatN.[frame] <> 0 && frameChangedValid.[frame] then
+            let off = this.ThreatOff frame
+            let lst = if pColor = White then frameChangedW else frameChangedB
+            let n = if pColor = White then frameChangedNW.[frame] else frameChangedNB.[frame]
+
+            for i in 0 .. n - 1 do
+                let v = lst.[off + i]
+
+                if v > 0 then
+                    fusedThrAdd.[nThrAdd] <- v - 1
+                    nThrAdd <- nThrAdd + 1
+                else
+                    fusedThrSub.[nThrSub] <- -v - 1
+                    nThrSub <- nThrSub + 1
+
+        Accumulator.applyFused
+            acc
+            (this.AccOff srcFrame)
+            acc
+            (this.AccOff dstFrame)
+            psq
+            (this.PsqOff srcFrame)
+            psq
+            (this.PsqOff dstFrame)
+            halfWeights
+            halfPsqt
+            threatWeights
+            threatPsqt
+            fusedHalfAdd
+            nHalfAdd
+            fusedHalfSub
+            nHalfSub
+            fusedThrAdd
+            nThrAdd
+            fusedThrSub
+            nThrSub
+            Accumulator.UseAvx2
 
     member private this.EnsureComputed(pColor: Color) =
         if active then
@@ -897,104 +860,16 @@ type Position() =
                 if blocked || not computed.[baseFrame] then
                     this.BuildFull(pColor, top)
                 else
-                    this.CopyFrame(pColor, baseFrame, top)
+                    // Fused walk: materialize EVERY frame from its parent -- same store traffic as the old
+                    // apply-onto-top (one 2 KB store per walked frame), but sibling evals now reuse the
+                    // materialized ancestors instead of re-walking them.
+                    let ksqW = this.KingSquare White
+                    let ksqB = this.KingSquare Black
 
                     for f in baseFrame + 1 .. top do
-                        this.ApplyFrame(pColor, f)
-
-                    computed.[top] <- true
-
-    // Replay one frame's deltas onto the top accumulator for BOTH perspectives at once: one pass over the
-    // dirty-piece list (each acc only takes its own perspective's features), one shared changed-threat
-    // conversion. Bit-exact vs ApplyFrame(White)+ApplyFrame(Black).
-    member private this.ApplyFrameBoth(frame: int) =
-        let accOff = this.AccOff top
-        let psqOff = this.PsqOff top
-        let dOff = this.DirtyOff frame
-        let ksqW = this.KingSquare White
-        let ksqB = this.KingSquare Black
-
-        let dirtyN = frameDirtyN.[frame]
-        let mutable usedDirty = 0
-
-        for i in 0 .. dirtyN - 1 do
-            if (usedDirty &&& (1 <<< i)) = 0 then
-                let pc = frameDirtyPc.[dOff + i]
-                let sq = frameDirtySq.[dOff + i]
-                let sign = frameDirtySign.[dOff + i]
-
-                if sign < 0 then
-                    let mutable j = i + 1
-                    let mutable pair = -1
-
-                    while pair < 0 && j < dirtyN do
-                        if
-                            (usedDirty &&& (1 <<< j)) = 0
-                            && frameDirtyPc.[dOff + j] = pc
-                            && frameDirtySign.[dOff + j] > 0
-                        then
-                            pair <- j
-                        else
-                            j <- j + 1
-
-                    if pair >= 0 then
-                        usedDirty <- usedDirty ||| (1 <<< i) ||| (1 <<< pair)
-                        let addSq = frameDirtySq.[dOff + pair]
-                        Accumulator.addFeaturePairAt
-                            accW
-                            accOff
-                            psqW
-                            psqOff
-                            halfWeights
-                            halfPsqt
-                            (Accumulator.makeIndex White pc sq ksqW)
-                            (Accumulator.makeIndex White pc addSq ksqW)
-                            Accumulator.UseAvx2
-                        Accumulator.addFeaturePairAt
-                            accB
-                            accOff
-                            psqB
-                            psqOff
-                            halfWeights
-                            halfPsqt
-                            (Accumulator.makeIndex Black pc sq ksqB)
-                            (Accumulator.makeIndex Black pc addSq ksqB)
-                            Accumulator.UseAvx2
-                    else
-                        usedDirty <- usedDirty ||| (1 <<< i)
-                        Accumulator.addFeatureAt accW accOff psqW psqOff halfWeights halfPsqt (Accumulator.makeIndex White pc sq ksqW) sign Accumulator.UseAvx2
-                        Accumulator.addFeatureAt accB accOff psqB psqOff halfWeights halfPsqt (Accumulator.makeIndex Black pc sq ksqB) sign Accumulator.UseAvx2
-                else
-                    usedDirty <- usedDirty ||| (1 <<< i)
-                    Accumulator.addFeatureAt accW accOff psqW psqOff halfWeights halfPsqt (Accumulator.makeIndex White pc sq ksqW) sign Accumulator.UseAvx2
-                    Accumulator.addFeatureAt accB accOff psqB psqOff halfWeights halfPsqt (Accumulator.makeIndex Black pc sq ksqB) sign Accumulator.UseAvx2
-
-        let threatN = frameThreatN.[frame]
-
-        if threatN <> 0 then
-            let off = this.ThreatOff frame
-
-            if frameChangedValid.[frame] && frameChangedKsqW.[frame] = ksqW && frameChangedKsqB.[frame] = ksqB then
-                this.ApplySignedThreats(White, top, frameChangedW, off, frameChangedNW.[frame])
-                this.ApplySignedThreats(Black, top, frameChangedB, off, frameChangedNB.[frame])
-            else
-                match threatFnChangedBoth with
-                | null -> ()
-                | f ->
-                    let packed = f.Invoke(this, frameThreats, off, threatN, changedW, changedB)
-                    let nW = int (packed >>> 32)
-                    let nB = int (packed &&& 0xFFFFFFFFL)
-
-                    System.Array.Copy(changedW, 0, frameChangedW, off, nW)
-                    System.Array.Copy(changedB, 0, frameChangedB, off, nB)
-                    frameChangedNW.[frame] <- nW
-                    frameChangedNB.[frame] <- nB
-                    frameChangedKsqW.[frame] <- ksqW
-                    frameChangedKsqB.[frame] <- ksqB
-                    frameChangedValid.[frame] <- true
-
-                    this.ApplySignedThreats(White, top, frameChangedW, off, nW)
-                    this.ApplySignedThreats(Black, top, frameChangedB, off, nB)
+                        this.EnsureChangedThreats(f, ksqW, ksqB)
+                        this.ApplyFrameFusedTo(pColor, f, f - 1, f)
+                        computed.[f] <- true
 
     // Materialize BOTH perspectives at top in one frame walk (evalInternal always needs both). Takes the
     // merged path only when the two perspectives' back-walks agree (the common no-king-move/no-overflow
@@ -1086,14 +961,15 @@ type Position() =
             let rebuildB = blockedB || not computedB.[baseB]
 
             if not rebuildW && not rebuildB && baseW = baseB then
-                this.CopyFrame(White, baseW, top)
-                this.CopyFrame(Black, baseB, top)
+                let ksqW = this.KingSquare White
+                let ksqB = this.KingSquare Black
 
                 for f in baseW + 1 .. top do
-                    this.ApplyFrameBoth(f)
-
-                computedW.[top] <- true
-                computedB.[top] <- true
+                    this.EnsureChangedThreats(f, ksqW, ksqB)
+                    this.ApplyFrameFusedTo(White, f, f - 1, f)
+                    this.ApplyFrameFusedTo(Black, f, f - 1, f)
+                    computedW.[f] <- true
+                    computedB.[f] <- true
             elif rebuildW && rebuildB then
                 this.BuildFullBoth(top)
             else

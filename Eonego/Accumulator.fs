@@ -330,3 +330,227 @@ let addThreatPair2At
 [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
 let addThreat (acc: int16[]) (psqt: int[]) (threatWeights: sbyte[]) (threatPsqt: int[]) (idx: int) (sign: int) =
     addThreatAt acc 0 psqt 0 threatWeights threatPsqt idx sign UseAvx2
+
+// ---------------------------------------------------------------------------
+// Fused apply: ONE register-tiled pass over the accumulator applying ALL of a
+// frame's row deltas (HalfKA int16 rows + FullThreats int8 rows, adds and
+// subs), reading from a source slot and writing to a destination slot.
+// Replaces the feature-outer kernels above on the hot walk path: a move with
+// ~30 threat rows used to re-stream the full 2 KB accumulator ~8x; this
+// streams it once (src -> registers -> dst) while weight rows stream through.
+// src may equal dst exactly (in-place) or be a disjoint slot (parent->child
+// frame materialization, finny-entry -> frame fold).
+// ---------------------------------------------------------------------------
+
+/// Max weight rows folded into one accumulator pass. Larger row sets are split into multiple passes
+/// (first pass src->dst, remainder in-place on dst): L2 hardware prefetchers track only ~16-32 streams,
+/// and each pass adds just 4 KB of L1-resident accumulator traffic. Benchmark knob.
+[<Literal>]
+let FusedMaxRowsPerPass = 32
+
+/// One fused pass over a row-list SLICE: dst[j] = src[j] + Σ halfW[halfAdd[k]] − Σ halfW[halfSub[k]]
+/// + Σ thrW[thrAdd[k]] − Σ thrW[thrSub[k]] (j in [0,L1); psqt likewise over PsqtBuckets).
+/// PRE: src and dst ranges are identical or fully disjoint (asserted by the caller-facing applyFused).
+[<MethodImpl(MethodImplOptions.NoInlining)>]
+let private applyFusedPass
+    (srcAcc: int16[])
+    (srcOff: int)
+    (dstAcc: int16[])
+    (dstOff: int)
+    (srcPsq: int[])
+    (srcPsqOff: int)
+    (dstPsq: int[])
+    (dstPsqOff: int)
+    (halfW: int16[])
+    (halfPsqt: int[])
+    (thrW: sbyte[])
+    (thrPsqt: int[])
+    (halfAdd: int[])
+    (haOff: int)
+    (haN: int)
+    (halfSub: int[])
+    (hsOff: int)
+    (hsN: int)
+    (thrAdd: int[])
+    (taOff: int)
+    (taN: int)
+    (thrSub: int[])
+    (tsOff: int)
+    (tsN: int)
+    (useAvx2: bool)
+    =
+    if useAvx2 then
+        // 4-ymm tile (64 int16) x 16 tiles; the tile lives in registers while every row's chunk streams
+        // through (proven-safe register budget — mirrors the fc0 GEMV 4-accumulator blocking in NNUE.fs).
+        // Base-ref + element-offset loads/stores skip the bounds checks the JIT can't elide on runtime
+        // offsets; the small index lists use ordinary bounds-checked access (n <= 128, negligible).
+        let srcBase = &MemoryMarshal.GetArrayDataReference srcAcc
+        let dstBase = &MemoryMarshal.GetArrayDataReference dstAcc
+        let hwBase = &MemoryMarshal.GetArrayDataReference halfW
+        let twBase = &MemoryMarshal.GetArrayDataReference thrW
+        let mutable t = 0
+
+        while t < L1 do
+            let mutable a0 = Vector256.LoadUnsafe(&srcBase, unativeint (srcOff + t))
+            let mutable a1 = Vector256.LoadUnsafe(&srcBase, unativeint (srcOff + t + 16))
+            let mutable a2 = Vector256.LoadUnsafe(&srcBase, unativeint (srcOff + t + 32))
+            let mutable a3 = Vector256.LoadUnsafe(&srcBase, unativeint (srcOff + t + 48))
+
+            let mutable k = 0
+
+            while k < haN do
+                let rb = halfAdd.[haOff + k] * L1 + t
+                a0 <- Avx2.Add(a0, Vector256.LoadUnsafe(&hwBase, unativeint rb))
+                a1 <- Avx2.Add(a1, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 16)))
+                a2 <- Avx2.Add(a2, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 32)))
+                a3 <- Avx2.Add(a3, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 48)))
+                k <- k + 1
+
+            k <- 0
+
+            while k < hsN do
+                let rb = halfSub.[hsOff + k] * L1 + t
+                a0 <- Avx2.Subtract(a0, Vector256.LoadUnsafe(&hwBase, unativeint rb))
+                a1 <- Avx2.Subtract(a1, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 16)))
+                a2 <- Avx2.Subtract(a2, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 32)))
+                a3 <- Avx2.Subtract(a3, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 48)))
+                k <- k + 1
+
+            k <- 0
+
+            while k < taN do
+                let rb = thrAdd.[taOff + k] * L1 + t
+                a0 <- Avx2.Add(a0, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint rb)))
+                a1 <- Avx2.Add(a1, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 16))))
+                a2 <- Avx2.Add(a2, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 32))))
+                a3 <- Avx2.Add(a3, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 48))))
+                k <- k + 1
+
+            k <- 0
+
+            while k < tsN do
+                let rb = thrSub.[tsOff + k] * L1 + t
+                a0 <- Avx2.Subtract(a0, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint rb)))
+                a1 <- Avx2.Subtract(a1, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 16))))
+                a2 <- Avx2.Subtract(a2, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 32))))
+                a3 <- Avx2.Subtract(a3, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 48))))
+                k <- k + 1
+
+            Vector256.StoreUnsafe(a0, &dstBase, unativeint (dstOff + t))
+            Vector256.StoreUnsafe(a1, &dstBase, unativeint (dstOff + t + 16))
+            Vector256.StoreUnsafe(a2, &dstBase, unativeint (dstOff + t + 32))
+            Vector256.StoreUnsafe(a3, &dstBase, unativeint (dstOff + t + 48))
+            t <- t + 64
+    else
+        // Scalar reference: int32 accumulate then truncate to int16 — bit-identical to sequential int16
+        // wrapping adds (truncation mod 2^16 is a homomorphism over addition; |sum| << 2^31).
+        for j in 0 .. L1 - 1 do
+            let mutable s = int srcAcc.[srcOff + j]
+
+            for k in 0 .. haN - 1 do
+                s <- s + int halfW.[halfAdd.[haOff + k] * L1 + j]
+
+            for k in 0 .. hsN - 1 do
+                s <- s - int halfW.[halfSub.[hsOff + k] * L1 + j]
+
+            for k in 0 .. taN - 1 do
+                s <- s + int thrW.[thrAdd.[taOff + k] * L1 + j]
+
+            for k in 0 .. tsN - 1 do
+                s <- s - int thrW.[thrSub.[tsOff + k] * L1 + j]
+
+            dstAcc.[dstOff + j] <- int16 s
+
+    // PSQT: 8 int32 buckets = one pass (scalar; trivially cheap next to the L1 body).
+    for b in 0 .. PsqtBuckets - 1 do
+        let mutable s = srcPsq.[srcPsqOff + b]
+
+        for k in 0 .. haN - 1 do
+            s <- s + halfPsqt.[halfAdd.[haOff + k] * PsqtBuckets + b]
+
+        for k in 0 .. hsN - 1 do
+            s <- s - halfPsqt.[halfSub.[hsOff + k] * PsqtBuckets + b]
+
+        for k in 0 .. taN - 1 do
+            s <- s + thrPsqt.[thrAdd.[taOff + k] * PsqtBuckets + b]
+
+        for k in 0 .. tsN - 1 do
+            s <- s - thrPsqt.[thrSub.[tsOff + k] * PsqtBuckets + b]
+
+        dstPsq.[dstPsqOff + b] <- s
+
+/// Fused frame apply (see the section comment). Row lists larger than `FusedMaxRowsPerPass` in total are
+/// split: the first pass reads src and writes dst, the remaining passes run in place on dst. Order-of-
+/// application is irrelevant for the result (int16/int32 wrapping adds commute), so chunking is bit-exact.
+let applyFused
+    (srcAcc: int16[])
+    (srcOff: int)
+    (dstAcc: int16[])
+    (dstOff: int)
+    (srcPsq: int[])
+    (srcPsqOff: int)
+    (dstPsq: int[])
+    (dstPsqOff: int)
+    (halfW: int16[])
+    (halfPsqt: int[])
+    (thrW: sbyte[])
+    (thrPsqt: int[])
+    (halfAdd: int[])
+    (nHalfAdd: int)
+    (halfSub: int[])
+    (nHalfSub: int)
+    (thrAdd: int[])
+    (nThrAdd: int)
+    (thrSub: int[])
+    (nThrSub: int)
+    (useAvx2: bool)
+    =
+    System.Diagnostics.Debug.Assert(
+        (not (System.Object.ReferenceEquals(srcAcc, dstAcc)))
+        || srcOff = dstOff
+        || abs (srcOff - dstOff) >= L1,
+        "applyFused: partially overlapping src/dst ranges"
+    )
+
+    let total = nHalfAdd + nHalfSub + nThrAdd + nThrSub
+
+    if total <= FusedMaxRowsPerPass then
+        applyFusedPass
+            srcAcc srcOff dstAcc dstOff srcPsq srcPsqOff dstPsq dstPsqOff
+            halfW halfPsqt thrW thrPsqt
+            halfAdd 0 nHalfAdd halfSub 0 nHalfSub thrAdd 0 nThrAdd thrSub 0 nThrSub
+            useAvx2
+    else
+        // Slice the virtual concatenation (halfAdd ++ halfSub ++ thrAdd ++ thrSub) into passes.
+        let mutable consumed = 0
+        let mutable first = true
+
+        while consumed < total do
+            let take = min FusedMaxRowsPerPass (total - consumed)
+            let hi = consumed + take
+
+            let inline sliceOf (gBase: int) (n: int) =
+                let s = max 0 (min n (consumed - gBase))
+                let e = max 0 (min n (hi - gBase))
+                struct (s, e - s)
+
+            let struct (haO, haN) = sliceOf 0 nHalfAdd
+            let struct (hsO, hsN) = sliceOf nHalfAdd nHalfSub
+            let struct (taO, taN) = sliceOf (nHalfAdd + nHalfSub) nThrAdd
+            let struct (tsO, tsN) = sliceOf (nHalfAdd + nHalfSub + nThrAdd) nThrSub
+
+            if first then
+                applyFusedPass
+                    srcAcc srcOff dstAcc dstOff srcPsq srcPsqOff dstPsq dstPsqOff
+                    halfW halfPsqt thrW thrPsqt
+                    halfAdd haO haN halfSub hsO hsN thrAdd taO taN thrSub tsO tsN
+                    useAvx2
+            else
+                applyFusedPass
+                    dstAcc dstOff dstAcc dstOff dstPsq dstPsqOff dstPsq dstPsqOff
+                    halfW halfPsqt thrW thrPsqt
+                    halfAdd haO haN halfSub hsO hsN thrAdd taO taN thrSub tsO tsN
+                    useAvx2
+
+            first <- false
+            consumed <- hi

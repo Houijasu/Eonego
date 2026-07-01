@@ -62,3 +62,71 @@ let ``addThreat AVX2 equals scalar over random rows`` () =
 
     Assert.Equal<int16[]>(accA, accB) // scalar==AVX2 wrap agreement through int16 overflow
     Assert.Equal<int[]>(psqtA, psqtB)
+
+// The fused single-pass kernel must equal a sequence of the feature-outer reference kernels, for both SIMD
+// modes, for in-place AND parent->child (src<>dst) variants, and across the multi-pass chunking threshold
+// (row totals > FusedMaxRowsPerPass). Wrapping int16/int32 adds commute, so any mismatch is a kernel bug.
+[<Fact>]
+let ``applyFused equals sequential reference kernels (in-place, src->dst, chunked, both SIMD modes)`` () =
+    let rng = System.Random(424242)
+    let nHalfRows = 48
+    let nThrRows = 160
+    let halfW = Array.init (nHalfRows * L1) (fun _ -> int16 (rng.Next(-32768, 32768)))
+    let halfPsqt = Array.init (nHalfRows * PsqtBuckets) (fun _ -> rng.Next(-100000, 100000))
+    let thrW = Array.init (nThrRows * L1) (fun _ -> sbyte (rng.Next(-128, 128)))
+    let thrPsqt = Array.init (nThrRows * PsqtBuckets) (fun _ -> rng.Next(-100000, 100000))
+
+    for useAvx2 in [ false; true ] do
+        if not useAvx2 || System.Runtime.Intrinsics.X86.Avx2.IsSupported then
+            for trial in 0 .. 24 do
+                // Row-list sizes sweep from tiny to well past FusedMaxRowsPerPass (chunked path).
+                let nHA = rng.Next(0, 9)
+                let nHS = rng.Next(0, 9)
+                let nTA = rng.Next(0, 65)
+                let nTS = rng.Next(0, 65)
+                let halfAdd = Array.init nHA (fun _ -> rng.Next(0, nHalfRows))
+                let halfSub = Array.init nHS (fun _ -> rng.Next(0, nHalfRows))
+                let thrAdd = Array.init nTA (fun _ -> rng.Next(0, nThrRows))
+                let thrSub = Array.init nTS (fun _ -> rng.Next(0, nThrRows))
+                let src = Array.init L1 (fun _ -> int16 (rng.Next(-32768, 32768)))
+                let srcPsq = Array.init PsqtBuckets (fun _ -> rng.Next(-1000000, 1000000))
+
+                // Reference: copy src, then sequential feature-outer kernels.
+                let refAcc = Array.copy src
+                let refPsq = Array.copy srcPsq
+
+                for idx in halfAdd do
+                    addFeature refAcc refPsq halfW halfPsqt idx 1 useAvx2
+
+                for idx in halfSub do
+                    addFeature refAcc refPsq halfW halfPsqt idx -1 useAvx2
+
+                for idx in thrAdd do
+                    addThreatAt refAcc 0 refPsq 0 thrW thrPsqt idx 1 useAvx2
+
+                for idx in thrSub do
+                    addThreatAt refAcc 0 refPsq 0 thrW thrPsqt idx -1 useAvx2
+
+                // Fused, parent->child: dst is a separate buffer.
+                let dst = Array.zeroCreate<int16> L1
+                let dstPsq = Array.zeroCreate<int> PsqtBuckets
+
+                applyFused
+                    src 0 dst 0 srcPsq 0 dstPsq 0 halfW halfPsqt thrW thrPsqt
+                    halfAdd nHA halfSub nHS thrAdd nTA thrSub nTS useAvx2
+
+                Assert.Equal<int16[]>(refAcc, dst)
+                Assert.Equal<int[]>(refPsq, dstPsq)
+
+                // Fused, in-place: src buffer updated in situ.
+                let inPlace = Array.copy src
+                let inPlacePsq = Array.copy srcPsq
+
+                applyFused
+                    inPlace 0 inPlace 0 inPlacePsq 0 inPlacePsq 0 halfW halfPsqt thrW thrPsqt
+                    halfAdd nHA halfSub nHS thrAdd nTA thrSub nTS useAvx2
+
+                Assert.Equal<int16[]>(refAcc, inPlace)
+                Assert.Equal<int[]>(refPsq, inPlacePsq)
+
+                ignore trial
