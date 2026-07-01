@@ -48,6 +48,34 @@ let AccStackLimit = 255
 [<Literal>]
 let StartPosFen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 
+/// Opt-in per-search phase profiling (`EONEGO_PROF=1`): coarse Stopwatch-tick counters over the NNUE
+/// accumulator hot path, printed as one `info string prof ...` line by `Search.go`. Counters are plain
+/// static mutables — meaningful at Threads = 1 only (racy-but-harmless otherwise). Every write is gated on
+/// `Enabled` (a static readonly bool the JIT folds), so the disabled cost is one predictable branch.
+/// This exists because dotnet-trace sampling misattributes this workload (PollGC artifact, audit 2026-07-01).
+module PosProf =
+    let Enabled = System.Environment.GetEnvironmentVariable("EONEGO_PROF") = "1"
+    let mutable tMake = 0L // Position.Make total (incl. any eager accumulator work)
+    let mutable tEager = 0L // EagerUpdate total (subset of tMake)
+    let mutable tEnsure = 0L // EnsureBothComputed non-trivial body (lazy catch-up walks + cache probes)
+    let mutable tBuild = 0L // BuildFull/BuildFullBoth bodies (subset of tEager or tEnsure)
+    let mutable tEval = 0L // full forward evals (Search.evalPos)
+    let mutable nMake = 0L
+    let mutable nEnsure = 0L
+    let mutable nBuild = 0L
+    let mutable nEval = 0L
+
+    let reset () =
+        tMake <- 0L
+        tEager <- 0L
+        tEnsure <- 0L
+        tBuild <- 0L
+        tEval <- 0L
+        nMake <- 0L
+        nEnsure <- 0L
+        nBuild <- 0L
+        nEval <- 0L
+
 // ---------------------------------------------------------------------------
 // Module-level static tables — built once via `do initTables ()`. These read ONLY Bitboard [<Literal>]
 // consts (WK/WQ/BK/BQ), never Zobrist, so there is no cross-file static-ctor race.
@@ -565,9 +593,16 @@ type Position() =
             Accumulator.addThreatAt acc accOff psq psqOff threatWeights threatPsqt tmpW.[k] 1 Accumulator.UseAvx2
 
     member private this.BuildFull(pColor: Color, frame: int) =
+        let profT0 =
+            if PosProf.Enabled then System.Diagnostics.Stopwatch.GetTimestamp() else 0L
+
         this.BuildHalf(pColor, frame)
         this.AddActiveThreats(pColor, frame)
         if pColor = White then computedW.[frame] <- true else computedB.[frame] <- true
+
+        if PosProf.Enabled then
+            PosProf.tBuild <- PosProf.tBuild + (System.Diagnostics.Stopwatch.GetTimestamp() - profT0)
+            PosProf.nBuild <- PosProf.nBuild + 1L
 
     // Both perspectives' active threats from a SINGLE physical enumeration (slider rays walked once),
     // emitting per-perspective indices into tmpW/tmpB. Bit-exact vs two AddActiveThreats calls:
@@ -591,11 +626,18 @@ type Position() =
                 Accumulator.addThreatAt accB accOff psqB psqOff threatWeights threatPsqt tmpB.[k] 1 Accumulator.UseAvx2
 
     member private this.BuildFullBoth(frame: int) =
+        let profT0 =
+            if PosProf.Enabled then System.Diagnostics.Stopwatch.GetTimestamp() else 0L
+
         this.BuildHalf(White, frame)
         this.BuildHalf(Black, frame)
         this.AddActiveThreatsBoth(frame)
         computedW.[frame] <- true
         computedB.[frame] <- true
+
+        if PosProf.Enabled then
+            PosProf.tBuild <- PosProf.tBuild + (System.Diagnostics.Stopwatch.GetTimestamp() - profT0)
+            PosProf.nBuild <- PosProf.nBuild + 1L
 
     member private this.BeginFrame() =
         Debug.Assert((top + 1 < AccMaxPly), "BeginFrame: stack overflow")
@@ -665,6 +707,9 @@ type Position() =
     /// true and eval is O(1) — no lazy frame walk, no cache probe, no deferred delegate conversion at eval time.
     /// King moves or threat overflow force a full from-scratch rebuild (all HalfKA indices change).
     member private this.EagerUpdate() =
+        let profT0 =
+            if PosProf.Enabled then System.Diagnostics.Stopwatch.GetTimestamp() else 0L
+
         let frame = top
 
         if frameThreatOverflow.[frame] || frameWhiteKingMoved.[frame] || frameBlackKingMoved.[frame] then
@@ -675,6 +720,9 @@ type Position() =
             this.ApplyFrameBoth(frame)
             computedW.[frame] <- true
             computedB.[frame] <- true
+
+        if PosProf.Enabled then
+            PosProf.tEager <- PosProf.tEager + (System.Diagnostics.Stopwatch.GetTimestamp() - profT0)
 
     member private this.CopyFrame(pColor: Color, src: int, dst: int) =
         let acc = if pColor = White then accW else accB
@@ -942,6 +990,9 @@ type Position() =
     // case); falls back to the per-perspective EnsureComputed otherwise (byte-identical to that path).
     member this.EnsureBothComputed() =
         if active && not (computedW.[top] && computedB.[top]) then
+            let profT0 =
+                if PosProf.Enabled then System.Diagnostics.Stopwatch.GetTimestamp() else 0L
+
             // Phase 1 fast-path: best-effort checkpoint cache. A validated hit pays an O(1) snapshot copy
             // instead of the O(distance) frame-delta walk below. Stored snapshots are bit-exact for any given
             // position regardless of the make/unmake path that reached it, so a hit is provably equivalent
@@ -969,6 +1020,10 @@ type Position() =
                     | cache ->
                         cache.Store(this.Key, accW, accOff, accB, accOff, psqW, psqOff, psqB, psqOff)
 
+            if PosProf.Enabled then
+                PosProf.tEnsure <- PosProf.tEnsure + (System.Diagnostics.Stopwatch.GetTimestamp() - profT0)
+                PosProf.nEnsure <- PosProf.nEnsure + 1L
+
     /// Bind the per-worker checkpoint cache. Pass `null` to disable (tests, from-scratch eval, etc.).
     /// `SearchControl` owns the table lifecycle; this Position merely holds a borrowed reference for the
     /// duration of a search.
@@ -977,6 +1032,11 @@ type Position() =
     /// Detach the cache (no-op if already detached). Called by `SearchControl` once the search has joined to
     /// release the worker's borrowed reference; the position can continue to be reused by tests/tools.
     member _.UnbindCheckpoint() : unit = checkpoint <- null
+
+    /// TEST HOOK: toggle eager materialization after `EnableNnue` (which sets the production default).
+    /// With `false`, Make records dirty frames only and evaluation pays the lazy multi-frame catch-up walk —
+    /// the path the guardrail tests exercise. Production call sites never touch this.
+    member internal _.SetEagerUpdates(v: bool) : unit = eagerUpdates <- v
 
     /// Unconditionally publish the current frame's computed accumulator snapshot to the bound checkpoint
     /// cache, if any. Used by `Worker.SetupRoot` to seed the root after `EnableNnue` has already set the
@@ -1672,6 +1732,9 @@ type Position() =
     // --- make / unmake -----------------------------------------------------
     /// Apply a LEGAL move (see file header — no legality validation here).
     member this.Make(m: Move) : unit =
+        let profT0 =
+            if PosProf.Enabled then System.Diagnostics.Stopwatch.GetTimestamp() else 0L
+
         Debug.Assert((stPly + 1 < MaxPly), "Make: stack overflow")
         let us = sideToMove
         let them = flipColor us
@@ -1767,6 +1830,10 @@ type Position() =
         if active then
             this.CommitFrame()
             if eagerUpdates then this.EagerUpdate()
+
+        if PosProf.Enabled then
+            PosProf.tMake <- PosProf.tMake + (System.Diagnostics.Stopwatch.GetTimestamp() - profT0)
+            PosProf.nMake <- PosProf.nMake + 1L
 
     /// Undo the move applied by Make. Pure board restore — NO key math (the parent frame holds the key).
     member this.Unmake(m: Move) : unit =

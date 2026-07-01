@@ -559,7 +559,15 @@ let private writeLine (s: string) = System.Console.Out.WriteLine(s)
 
 let evalPos (w: Worker) (pos: Position) : int =
     match w.Control.Net with
-    | Some net -> Nnue.evalCp net pos
+    | Some net ->
+        if PosProf.Enabled then
+            let profT0 = System.Diagnostics.Stopwatch.GetTimestamp()
+            let v = Nnue.evalCp net pos
+            PosProf.tEval <- PosProf.tEval + (System.Diagnostics.Stopwatch.GetTimestamp() - profT0)
+            PosProf.nEval <- PosProf.nEval + 1L
+            v
+        else
+            Nnue.evalCp net pos
     | None -> 0 // unreachable in play: UCI refuses to search with no net (see UCI.startSearch)
 
 let private updatePv (w: Worker) (ply: int) (m: Move) =
@@ -1674,6 +1682,9 @@ let computeTimes (moveOverhead: int) (l: SearchLimits) (stm: Color) : int64 * in
 let go (control: SearchControl) : Move =
     control.Reset()
     control.NewSearch()
+
+    if PosProf.Enabled then
+        PosProf.reset ()
     let n = max 1 control.Config.Threads
     let workers = Array.init n (fun i -> Worker(i, (i = 0), control))
 
@@ -1769,6 +1780,24 @@ let go (control: SearchControl) : Move =
 
         for t in threads do
             t.Join()
+
+    // EONEGO_PROF=1: one-line phase breakdown (Threads=1 semantics; see PosProf doc). String concat, not
+    // sprintf — Printf formatters crash under NativeAOT (see fsharp-dotnet-aot-gotchas).
+    if PosProf.Enabled then
+        let ms (t: int64) =
+            (double t * 1000.0 / double System.Diagnostics.Stopwatch.Frequency).ToString("F0")
+
+        writeLine (
+            "info string prof makeMs=" + ms PosProf.tMake
+            + " eagerMs=" + ms PosProf.tEager
+            + " ensureMs=" + ms PosProf.tEnsure
+            + " buildMs=" + ms PosProf.tBuild
+            + " evalMs=" + ms PosProf.tEval
+            + " nMake=" + string PosProf.nMake
+            + " nEnsure=" + string PosProf.nEnsure
+            + " nBuild=" + string PosProf.nBuild
+            + " nEval=" + string PosProf.nEval
+        )
 
     let rb = workers.[0].RootBest
 
