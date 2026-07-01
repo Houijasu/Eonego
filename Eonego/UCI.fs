@@ -202,7 +202,10 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
               UseAspTweaks = true
               MoveOverhead = st.MoveOverhead
               AccCheckpointMb = 0
-              DagHashMb = 2
+              // DAG node table only for SMP: at Threads=1 it measurably costs nps (~4-5%) AND inflated the
+              // search tree (+15% nodes on the audit midgame; DAG-off tree == pre-DAG tree exactly). Its SMP
+              // value is unproven pending an SPRT-style match — see the 2026-07-01 audit.
+              DagHashMb = (if st.Threads > 1 then 2 else 0)
               UseWorkQueue = st.UseWorkQueue
               MultiPv = st.MultiPv }
 

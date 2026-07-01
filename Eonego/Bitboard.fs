@@ -601,8 +601,30 @@ let private buildMagic
 
         offset <- offset + (1 <<< n)
 
-do buildMagic RookMasks RookMagic RookTable rookAttacksClassical
-do buildMagic BishopMasks BishopMagic BishopTable bishopAttacksClassical
+// Magic tables are the FALLBACK slider path, used only when BMI2/PEXT is absent (see rookAttacks below —
+// the dispatch is constant-folded on Bmi2.X64.IsSupported). Building them runs a randomized findMagic
+// search per square (~seconds of startup, measured ~8.5s on a 13980HX), so on PEXT CPUs we skip them
+// entirely; the PEXT tables (built below) are a disjoint, independently-indexed set.
+let mutable private magicBuilt = false
+let private magicBuildLock = obj ()
+
+let private buildMagicTables () =
+    buildMagic RookMasks RookMagic RookTable rookAttacksClassical
+    buildMagic BishopMasks BishopMagic BishopTable bishopAttacksClassical
+
+do
+    if not System.Runtime.Intrinsics.X86.Bmi2.X64.IsSupported then
+        buildMagicTables ()
+        magicBuilt <- true
+
+/// TEST HOOK: force the magic fallback tables to exist on PEXT CPUs so magic==classical parity tests can
+/// run everywhere. Idempotent; locked because xunit may run test classes in parallel.
+let internal ensureMagicBuilt () =
+    if not magicBuilt then
+        lock magicBuildLock (fun () ->
+            if not magicBuilt then
+                buildMagicTables ()
+                magicBuilt <- true)
 
 [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
 let rookAttacksMagic (sq: Square) (occ: Bitboard) : Bitboard =

@@ -466,6 +466,7 @@ let ``carry-rippler enumerates exactly the subsets of a mask`` () =
 
 [<Fact>]
 let ``magic sliders equal classical over random occupancies`` () =
+    ensureMagicBuilt () // magic tables are lazily skipped on PEXT CPUs; force-build for the parity check
     let rng = System.Random(0xBEEF)
 
     for sq in 0..63 do
@@ -476,6 +477,7 @@ let ``magic sliders equal classical over random occupancies`` () =
 
 [<Fact>]
 let ``magic equals classical for every relevant subset on sample squares`` () =
+    ensureMagicBuilt () // magic tables are lazily skipped on PEXT CPUs; force-build for the parity check
     for sq in [ mkSquare 0 0; mkSquare 3 3; mkSquare 7 7; mkSquare 4 0; mkSquare 7 3 ] do
         for occ in subsetsOf (rookMask sq) do
             Assert.Equal(rookAttacksClassical sq occ, rookAttacksMagic sq occ)
