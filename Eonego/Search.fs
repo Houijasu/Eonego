@@ -137,7 +137,7 @@ let defaultConfig =
       UseLmrTweaks = true
       UseAspTweaks = true
       MoveOverhead = 10
-      AccCheckpointMb = 4
+      AccCheckpointMb = 0
       DagHashMb = 2 }
 
 let defaultLimits =

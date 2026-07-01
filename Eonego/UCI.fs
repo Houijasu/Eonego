@@ -194,7 +194,7 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
               UseLmrTweaks = true
               UseAspTweaks = true
               MoveOverhead = st.MoveOverhead
-              AccCheckpointMb = 4
+              AccCheckpointMb = 0
               DagHashMb = 2 }
 
         let control =

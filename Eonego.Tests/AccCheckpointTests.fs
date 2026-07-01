@@ -290,35 +290,29 @@ let ``SfEnsureBothComputed cache hit yields bit-exact acc vs from-scratch`` () =
                 Assert.Equal(psqBArr.[i], dPB.[i]))
 
 [<Fact>]
-let ``SfEnsureBothComputed populates cache after a real Make (non-root materialization)`` () =
+let ``eager accumulator materializes during Make (no cache needed)`` () =
     withNet
         (fun net ->
             let pos = Position()
             pos.LoadFen StartPosFen
             bindNnue net pos
-            let cache = AccCheckpointTable(4)
-            pos.SfBindCheckpoint cache
-            // Make a move so sfTop=1 and the per-frame computed flags at frame 1 are false — the next eval
-            // goes through the full materialize-and-populate path (the non-root path that matters in search).
+            // With eager accumulator updates, Make itself computes both perspectives. After Make, eval is O(1).
             let moves = collectLegal pos
             Assert.True(moves.Length > 0)
             pos.Make moves.[0]
-            let _ = evalCp net pos
-
-            let dAW = Array.zeroCreate L1
-            let dAB = Array.zeroCreate L1
-            let dPW = Array.zeroCreate PsqtBuckets
-            let dPB = Array.zeroCreate PsqtBuckets
-
-            let hit = cache.TryProbe(pos.Key, dAW, 0, dAB, 0, dPW, 0, dPB, 0)
-            Assert.True(hit, "eval after a Make must have populated the cache for the child position")
-
+            // The accumulator at sfTop must already be materialized (eager update sets computed flags).
             let accWArr = pos.SfAccArray White
             let accBArr = pos.SfAccArray Black
 
-            for i in 0 .. L1 - 1 do
-                Assert.Equal(accWArr.[i], dAW.[i])
-                Assert.Equal(accBArr.[i], dAB.[i]))
+            // Verify the accumulator is non-trivial (not all zeros).
+            Assert.True(accWArr |> Array.exists (fun v -> v <> 0s), "white acc must be materialized")
+            Assert.True(accBArr |> Array.exists (fun v -> v <> 0s), "black acc must be materialized")
+
+            // Eval must produce the same value as the from-scratch oracle.
+            let oracle = Position.OfFen(pos.ToFen())
+            let oracleVal = evalCp net oracle
+            let boundVal = evalCp net pos
+            Assert.Equal(oracleVal, boundVal))
 
 [<Fact>]
 let ``concurrent store/probe stress: no crashes; every hit is bit-exact`` () =

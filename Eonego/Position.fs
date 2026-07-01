@@ -184,7 +184,11 @@ type Position() =
     [<Literal>]
     let SfMaxThreats = 256
 
+    [<Literal>]
+    let SfMaxPly = 246
+
     let mutable sfActive = false
+    let mutable sfEagerUpdates = false
     let mutable sfTop = 0
     // Phase 1 — optional lock-free NNUE accumulator checkpoint cache. When non-null, `SfEnsureBothComputed`
     // consults it as a fast-path before walking the lazy frame stack, and populates it on a successful
@@ -483,28 +487,28 @@ type Position() =
 
     member private _.SfEnsureStorage() =
         if Array.isEmpty sfAccW then
-            sfAccW <- Array.zeroCreate<int16> (MaxPly * Accumulator.L1)
-            sfAccB <- Array.zeroCreate<int16> (MaxPly * Accumulator.L1)
-            sfPsqW <- Array.zeroCreate (MaxPly * Accumulator.PsqtBuckets)
-            sfPsqB <- Array.zeroCreate (MaxPly * Accumulator.PsqtBuckets)
-            sfComputedW <- Array.zeroCreate MaxPly
-            sfComputedB <- Array.zeroCreate MaxPly
-            sfFrameDirtyPc <- Array.zeroCreate (MaxPly * Accumulator.MaxDirtyPieces)
-            sfFrameDirtySq <- Array.zeroCreate (MaxPly * Accumulator.MaxDirtyPieces)
-            sfFrameDirtySign <- Array.zeroCreate (MaxPly * Accumulator.MaxDirtyPieces)
-            sfFrameDirtyN <- Array.zeroCreate MaxPly
-            sfFrameThreats <- Array.zeroCreate (MaxPly * Accumulator.MaxDirtyThreats)
-            sfFrameThreatN <- Array.zeroCreate MaxPly
-            sfFrameChangedW <- Array.zeroCreate (MaxPly * Accumulator.MaxDirtyThreats)
-            sfFrameChangedB <- Array.zeroCreate (MaxPly * Accumulator.MaxDirtyThreats)
-            sfFrameChangedNW <- Array.zeroCreate MaxPly
-            sfFrameChangedNB <- Array.zeroCreate MaxPly
-            sfFrameChangedValid <- Array.zeroCreate MaxPly
-            sfFrameChangedKsqW <- Array.create MaxPly NoSquare
-            sfFrameChangedKsqB <- Array.create MaxPly NoSquare
-            sfFrameWhiteKingMoved <- Array.zeroCreate MaxPly
-            sfFrameBlackKingMoved <- Array.zeroCreate MaxPly
-            sfFrameThreatOverflow <- Array.zeroCreate MaxPly
+            sfAccW <- Array.zeroCreate<int16> (SfMaxPly * Accumulator.L1)
+            sfAccB <- Array.zeroCreate<int16> (SfMaxPly * Accumulator.L1)
+            sfPsqW <- Array.zeroCreate (SfMaxPly * Accumulator.PsqtBuckets)
+            sfPsqB <- Array.zeroCreate (SfMaxPly * Accumulator.PsqtBuckets)
+            sfComputedW <- Array.zeroCreate SfMaxPly
+            sfComputedB <- Array.zeroCreate SfMaxPly
+            sfFrameDirtyPc <- Array.zeroCreate Accumulator.MaxDirtyPieces
+            sfFrameDirtySq <- Array.zeroCreate Accumulator.MaxDirtyPieces
+            sfFrameDirtySign <- Array.zeroCreate Accumulator.MaxDirtyPieces
+            sfFrameDirtyN <- Array.zeroCreate SfMaxPly
+            sfFrameThreats <- Array.zeroCreate Accumulator.MaxDirtyThreats
+            sfFrameThreatN <- Array.zeroCreate SfMaxPly
+            sfFrameChangedW <- Array.zeroCreate Accumulator.MaxDirtyThreats
+            sfFrameChangedB <- Array.zeroCreate Accumulator.MaxDirtyThreats
+            sfFrameChangedNW <- Array.zeroCreate SfMaxPly
+            sfFrameChangedNB <- Array.zeroCreate SfMaxPly
+            sfFrameChangedValid <- Array.zeroCreate SfMaxPly
+            sfFrameChangedKsqW <- Array.create SfMaxPly NoSquare
+            sfFrameChangedKsqB <- Array.create SfMaxPly NoSquare
+            sfFrameWhiteKingMoved <- Array.zeroCreate SfMaxPly
+            sfFrameBlackKingMoved <- Array.zeroCreate SfMaxPly
+            sfFrameThreatOverflow <- Array.zeroCreate SfMaxPly
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member private _.SfAccOff(frame: int) = frame * Accumulator.L1
@@ -513,10 +517,10 @@ type Position() =
     member private _.SfPsqOff(frame: int) = frame * Accumulator.PsqtBuckets
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-    member private _.SfDirtyOff(frame: int) = frame * Accumulator.MaxDirtyPieces
+    member private _.SfDirtyOff(frame: int) = 0
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-    member private _.SfThreatOff(frame: int) = frame * Accumulator.MaxDirtyThreats
+    member private _.SfThreatOff(frame: int) = 0
 
     member private this.SfEnumThreats(pColor: Color, buf: int[]) : int =
         match sfThreatFn with
@@ -585,7 +589,7 @@ type Position() =
         sfComputedB.[frame] <- true
 
     member private this.SfBeginFrame() =
-        Debug.Assert((sfTop + 1 < MaxPly), "SfBeginFrame: stack overflow")
+        Debug.Assert((sfTop + 1 < SfMaxPly), "SfBeginFrame: stack overflow")
         sfTop <- sfTop + 1
         sfDirtyN <- 0
         sfDirtyThreatN <- 0
@@ -646,6 +650,22 @@ type Position() =
         sfFrameThreatOverflow.[frame]
         || (pColor = White && sfFrameWhiteKingMoved.[frame])
         || (pColor = Black && sfFrameBlackKingMoved.[frame])
+
+    /// Eagerly materialize the current frame's accumulator during Make: copy the parent (sfTop-1) into sfTop,
+    /// then apply this frame's dirty piece + threat deltas immediately. After this, sfComputedW/B.[sfTop] are
+    /// true and eval is O(1) — no lazy frame walk, no cache probe, no deferred delegate conversion at eval time.
+    /// King moves or threat overflow force a full from-scratch rebuild (all HalfKA indices change).
+    member private this.SfEagerUpdate() =
+        let frame = sfTop
+
+        if sfFrameThreatOverflow.[frame] || sfFrameWhiteKingMoved.[frame] || sfFrameBlackKingMoved.[frame] then
+            this.SfBuildFullBoth(frame)
+        else
+            this.SfCopyFrame(White, frame - 1, frame)
+            this.SfCopyFrame(Black, frame - 1, frame)
+            this.SfApplyFrameBoth(frame)
+            sfComputedW.[frame] <- true
+            sfComputedB.[frame] <- true
 
     member private this.SfCopyFrame(pColor: Color, src: int, dst: int) =
         let acc = if pColor = White then sfAccW else sfAccB
@@ -1075,6 +1095,7 @@ type Position() =
         sfFrameBlackKingMoved.[0] <- false
         sfFrameThreatOverflow.[0] <- false
         sfActive <- true
+        sfEagerUpdates <- true
         this.SfBuildFull(White, 0)
         this.SfBuildFull(Black, 0)
 
@@ -1731,8 +1752,11 @@ type Position() =
         sideToMove <- them
         st.Key <- currentKey
         this.SetCheckInfo()
-        // SF NNUE: persist dirty pieces + physical FullThreats deltas; materialization is deferred to eval.
-        if sfActive then this.SfCommitFrame()
+        // SF NNUE: persist dirty pieces + physical FullThreats deltas, then eagerly materialize the child
+        // accumulator (copy parent + apply deltas). Eval becomes O(1) — no lazy frame walk at eval time.
+        if sfActive then
+            this.SfCommitFrame()
+            if sfEagerUpdates then this.SfEagerUpdate()
 
     /// Undo the move applied by Make. Pure board restore — NO key math (the parent frame holds the key).
     member this.Unmake(m: Move) : unit =

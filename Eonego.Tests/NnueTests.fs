@@ -197,7 +197,7 @@ let ``null moves preserve sfTop and replay across following real move`` () =
         assertRawAccEqualsOracle net bound oracle)
 
 [<Fact>]
-let ``changed threat indices are materialized lazily after make`` () =
+let ``changed threat indices are materialized eagerly during make`` () =
     withNet (fun net ->
         let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"
         let scout = Position.OfFen fen
@@ -218,10 +218,10 @@ let ``changed threat indices are materialized lazily after make`` () =
             (System.Func<Position, int[], int, int, int[], int[], int64>(fun p dirty off n bw bb ->
                 changedCalls <- changedCalls + 1
                 Eonego.Threats.appendChangedThreatsBothAt p dirty off n bw bb))
+        // With eager accumulator updates, the changed-threat delegate fires DURING Make (not deferred to eval).
         bound.Make move
-        Assert.Equal(0, changedCalls)
+        Assert.True(changedCalls > 0, "eager Make must have converted dirty threats")
         evalCp net bound |> ignore
-        Assert.True(changedCalls > 0)
         bound.Unmake move)
 
 
