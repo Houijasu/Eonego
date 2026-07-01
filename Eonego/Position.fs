@@ -185,7 +185,7 @@ type Position() =
     let MaxThreats = 256
 
     [<Literal>]
-    let AccMaxPly = 246
+    let AccMaxPly = 256
 
     let mutable active = false
     let mutable eagerUpdates = false
