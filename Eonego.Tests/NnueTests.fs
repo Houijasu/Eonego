@@ -241,6 +241,35 @@ let ``lazy multi-frame walk replays long unevaluated chains bit-exact`` () =
 
             assertRawAccEqualsOracle net bound oracle)
 
+// FINNY guardrail: a king-move-dense walk with eval at EVERY node hits the refresh barrier constantly;
+// after the first visit each king square's finny entry is WARM, so every later refresh runs the board-diff
+// path against a stale snapshot (different piece placements per branch). Any diff/entry bug shows up as a
+// raw-accumulator mismatch vs the from-scratch oracle.
+[<Fact>]
+let ``finny warm-entry refresh stays bit-exact over king-heavy walks`` () =
+    withNet (fun net ->
+        let cases =
+            [ "8/8/8/3k4/8/3K4/4P3/8 w - - 0 1", 3 // king shuffles + pawn pushes (entries revisited often)
+              "n1n5/PPPk4/8/8/8/8/4Kppp/5N1N b - - 0 1", 2 ] // kings + promotions (diffs with piece-type changes)
+
+        let rec walk (b: Position) (o: Position) (depth: int) =
+            assertRawAccEqualsOracle net b o
+            Assert.Equal(evalCp net o, evalCp net b)
+
+            if depth > 0 then
+                for m in collectLegal b do
+                    b.Make m
+                    o.Make m
+                    walk b o (depth - 1)
+                    b.Unmake m
+                    o.Unmake m
+
+        for fen, depth in cases do
+            let bound = Position.OfFen fen
+            bindNnue net bound
+            let oracle = Position.OfFen fen
+            walk bound oracle depth)
+
 [<Fact>]
 let ``null moves preserve top and replay across following real move`` () =
     withNet (fun net ->

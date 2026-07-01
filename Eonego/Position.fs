@@ -53,6 +53,11 @@ let StartPosFen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 /// static mutables — meaningful at Threads = 1 only (racy-but-harmless otherwise). Every write is gated on
 /// `Enabled` (a static readonly bool the JIT folds), so the disabled cost is one predictable branch.
 /// This exists because dotnet-trace sampling misattributes this workload (PollGC artifact, audit 2026-07-01).
+/// EONEGO_FINNY=0 falls back to the from-scratch BuildFull refresh path (A/B + reference oracle for the
+/// finny-table refresh; see Position.RefreshFromFinny). Default ON.
+let UseFinny =
+    System.Environment.GetEnvironmentVariable("EONEGO_FINNY") <> "0"
+
 module PosProf =
     let Enabled = System.Environment.GetEnvironmentVariable("EONEGO_PROF") = "1"
     let mutable tMake = 0L // Position.Make total (incl. any eager accumulator work)
@@ -251,6 +256,16 @@ type Position() =
     let fusedHalfSub: int[] = Array.zeroCreate 40
     let fusedThrAdd: int[] = Array.zeroCreate Accumulator.MaxDirtyThreats
     let fusedThrSub: int[] = Array.zeroCreate Accumulator.MaxDirtyThreats
+    // Finny table ("AccumulatorCaches"): per (king square x perspective) cached HalfKA-only accumulator
+    // (bias + Σ HalfKA rows for the snapshot board) + the board snapshot it was built from. A refresh
+    // (own-king move / threat overflow barrier) becomes a board DIFF against the entry instead of a
+    // from-scratch rebuild; threats are NEVER cached (re-enumerated fresh — they depend on the live board).
+    // Entry state is path-independent (add/sub are exact modular inverses), so entries survive unmakes and
+    // whole searches; the only invalidation point is EnableNnue (net rebind) via ResetFinny.
+    // ~292 KB per Position: acc 64*2*L1 int16 + psqt 64*2*8 int32 + board 64*2*64 int32.
+    let mutable finnyAcc: int16[] = Array.empty
+    let mutable finnyPsqt: int[] = Array.empty
+    let mutable finnyBoard: int[] = Array.empty
     let mutable biases: int16[] = Array.empty
     let mutable halfWeights: int16[] = Array.empty
     let mutable halfPsqt: int[] = Array.empty
@@ -556,6 +571,11 @@ type Position() =
             frameWhiteKingMoved <- Array.zeroCreate AccMaxPly
             frameBlackKingMoved <- Array.zeroCreate AccMaxPly
             frameThreatOverflow <- Array.zeroCreate AccMaxPly
+            finnyAcc <- Array.zeroCreate (64 * 2 * Accumulator.L1)
+            finnyPsqt <- Array.zeroCreate (64 * 2 * Accumulator.PsqtBuckets)
+            // NoPiece <> 0: zeroCreate would claim a white pawn on every square (the Position.fs board-array
+            // trap) — ResetFinny fills with NoPiece before first use; allocate only here.
+            finnyBoard <- Array.zeroCreate (64 * 2 * 64)
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member private _.AccOff(frame: int) = frame * Accumulator.L1
@@ -731,7 +751,10 @@ type Position() =
         let frame = top
 
         if frameThreatOverflow.[frame] || frameWhiteKingMoved.[frame] || frameBlackKingMoved.[frame] then
-            this.BuildFullBoth(frame)
+            if UseFinny then
+                this.RefreshFromFinnyBoth(frame)
+            else
+                this.BuildFullBoth(frame)
         else
             let ksqW = this.KingSquare White
             let ksqB = this.KingSquare Black
@@ -843,6 +866,146 @@ type Position() =
             nThrSub
             Accumulator.UseAvx2
 
+    /// Re-seed every finny entry to the empty-board state (acc = biases, board = NoPiece). Called by
+    /// EnableNnue only — entries are otherwise self-correcting via the board diff and survive unmakes and
+    /// whole searches (path independence: HalfKA add/sub are exact modular inverses).
+    member private _.ResetFinny() =
+        for e in 0 .. 127 do
+            let aOff = e * Accumulator.L1
+
+            for j in 0 .. Accumulator.L1 - 1 do
+                finnyAcc.[aOff + j] <- biases.[j]
+
+        System.Array.Clear(finnyPsqt, 0, finnyPsqt.Length)
+        System.Array.Fill(finnyBoard, NoPiece)
+
+    /// Finny pass 1: diff the entry for `pColor`'s CURRENT king square against the live board, fold the
+    /// changed HalfKA rows into the ENTRY accumulator in place, and update the board snapshot.
+    /// Returns the entry index.
+    member private this.RefreshFinnyEntry(pColor: Color) : int =
+        let ksq = this.KingSquare pColor
+        let e = ksq * 2 + int pColor
+        let eAcc = e * Accumulator.L1
+        let ePsq = e * Accumulator.PsqtBuckets
+        let eB = e * 64
+        let mutable nAdd = 0
+        let mutable nSub = 0
+
+        for sq in 0 .. 63 do
+            let cur = board.[sq]
+            let old = finnyBoard.[eB + sq]
+
+            if cur <> old then
+                if old <> NoPiece then
+                    fusedHalfSub.[nSub] <- Accumulator.makeIndex pColor old sq ksq
+                    nSub <- nSub + 1
+
+                if cur <> NoPiece then
+                    fusedHalfAdd.[nAdd] <- Accumulator.makeIndex pColor cur sq ksq
+                    nAdd <- nAdd + 1
+
+                finnyBoard.[eB + sq] <- cur
+
+        Debug.Assert((nAdd <= 32 && nSub <= 32), "RefreshFinnyEntry: diff exceeds board piece bound")
+
+        if nAdd + nSub > 0 then
+            Accumulator.applyFused
+                finnyAcc
+                eAcc
+                finnyAcc
+                eAcc
+                finnyPsqt
+                ePsq
+                finnyPsqt
+                ePsq
+                halfWeights
+                halfPsqt
+                threatWeights
+                threatPsqt
+                fusedHalfAdd
+                nAdd
+                fusedHalfSub
+                nSub
+                fusedThrAdd
+                0
+                fusedThrSub
+                0
+                Accumulator.UseAvx2
+
+        e
+
+    /// Finny pass 2: materialize `frame` for `pColor` as ENTRY + active threat rows in one fused pass
+    /// (the entry->frame copy IS the first threat pass; nThr = 0 degenerates to a pure copy).
+    member private this.FinnyFoldToFrame(pColor: Color, e: int, frame: int, thrList: int[], nThr: int) =
+        let acc = if pColor = White then accW else accB
+        let psq = if pColor = White then psqW else psqB
+
+        Accumulator.applyFused
+            finnyAcc
+            (e * Accumulator.L1)
+            acc
+            (this.AccOff frame)
+            finnyPsqt
+            (e * Accumulator.PsqtBuckets)
+            psq
+            (this.PsqOff frame)
+            halfWeights
+            halfPsqt
+            threatWeights
+            threatPsqt
+            fusedHalfAdd
+            0
+            fusedHalfSub
+            0
+            thrList
+            nThr
+            fusedThrSub
+            0
+            Accumulator.UseAvx2
+
+        if pColor = White then
+            computedW.[frame] <- true
+        else
+            computedB.[frame] <- true
+
+    /// Finny-table refresh: replaces the from-scratch BuildFull at refresh barriers (own-king move /
+    /// threat overflow). Cost = 64-square diff + a few HalfKA rows into the entry + one entry->frame fold
+    /// with the active threats, instead of bias-init + ~30 HalfKA rows + all threat rows from zero.
+    member private this.RefreshFromFinny(pColor: Color, frame: int) =
+        let profT0 =
+            if PosProf.Enabled then System.Diagnostics.Stopwatch.GetTimestamp() else 0L
+
+        let e = this.RefreshFinnyEntry pColor
+        let buf = if pColor = White then tmpW else tmpB
+        let nThr = this.EnumThreats(pColor, buf)
+        this.FinnyFoldToFrame(pColor, e, frame, buf, nThr)
+
+        if PosProf.Enabled then
+            PosProf.tBuild <- PosProf.tBuild + (System.Diagnostics.Stopwatch.GetTimestamp() - profT0)
+            PosProf.nBuild <- PosProf.nBuild + 1L
+
+    /// Both-perspective finny refresh: one shared physical threat enumeration (like BuildFullBoth).
+    member private this.RefreshFromFinnyBoth(frame: int) =
+        match threatFnBoth with
+        | null ->
+            this.RefreshFromFinny(White, frame)
+            this.RefreshFromFinny(Black, frame)
+        | fb ->
+            let profT0 =
+                if PosProf.Enabled then System.Diagnostics.Stopwatch.GetTimestamp() else 0L
+
+            let eW = this.RefreshFinnyEntry White
+            let eB = this.RefreshFinnyEntry Black
+            let packed = fb.Invoke(this, tmpW, tmpB)
+            let nW = int (packed >>> 32)
+            let nB = int (packed &&& 0xFFFFFFFFL)
+            this.FinnyFoldToFrame(White, eW, frame, tmpW, nW)
+            this.FinnyFoldToFrame(Black, eB, frame, tmpB, nB)
+
+            if PosProf.Enabled then
+                PosProf.tBuild <- PosProf.tBuild + (System.Diagnostics.Stopwatch.GetTimestamp() - profT0)
+                PosProf.nBuild <- PosProf.nBuild + 1L
+
     member private this.EnsureComputed(pColor: Color) =
         if active then
             let computed = if pColor = White then computedW else computedB
@@ -858,7 +1021,10 @@ type Position() =
                         baseFrame <- baseFrame - 1
 
                 if blocked || not computed.[baseFrame] then
-                    this.BuildFull(pColor, top)
+                    if UseFinny then
+                        this.RefreshFromFinny(pColor, top)
+                    else
+                        this.BuildFull(pColor, top)
                 else
                     // Fused walk: materialize EVERY frame from its parent -- same store traffic as the old
                     // apply-onto-top (one 2 KB store per walked frame), but sibling evals now reuse the
@@ -971,7 +1137,10 @@ type Position() =
                     computedW.[f] <- true
                     computedB.[f] <- true
             elif rebuildW && rebuildB then
-                this.BuildFullBoth(top)
+                if UseFinny then
+                    this.RefreshFromFinnyBoth(top)
+                else
+                    this.BuildFullBoth(top)
             else
                 this.EnsureComputed White
                 this.EnsureComputed Black
@@ -1055,6 +1224,7 @@ type Position() =
         // refresh is per-perspective — measured ~+10% nps over eager materialization on bit-identical trees.
         // Tests flip this via SetEagerUpdates to cover the eager machinery.
         eagerUpdates <- false
+        this.ResetFinny()
         this.BuildFull(White, 0)
         this.BuildFull(Black, 0)
 
