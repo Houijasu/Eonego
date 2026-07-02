@@ -67,9 +67,13 @@ let inline valueFromTt (v: int) (ply: int) : int =
 let private Reductions: int[] =
     let t = Array.zeroCreate (64 * 64)
 
+    // Tunables is compiled first, so its statics are initialized before this table builds.
+    let div = float Tunables.LmrDiv100 / 100.0
+    let off = float Tunables.LmrOff100 / 100.0
+
     for d in 1..63 do
         for m in 1..63 do
-            t.[d * 64 + m] <- int (0.5 + log (float d) * log (float m) / 2.2)
+            t.[d * 64 + m] <- int (off + log (float d) * log (float m) / div)
 
     t
 
@@ -699,7 +703,7 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
             // for the TT stores below).
             let rawSp =
                 if usePruning && cfg.UseCorrHist then
-                    rawSp + w.Tables.CorrHist pos.SideToMove pos.PawnKey / 16
+                    rawSp + w.Tables.CorrHist pos.SideToMove pos.PawnKey / Tunables.CorrApplyDiv
                 else
                     rawSp
 
@@ -772,7 +776,7 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
                                                 if isEnPassant m then pieceValueOf Pawn
                                                 else pieceValueOf (pieceType dst)
 
-                                            rawEval + 200 + capturedValue <= alpha)))))
+                                            rawEval + Tunables.QsDeltaBase + capturedValue <= alpha)))))
 
                 if legal && not prune then
                     movesPlayed <- movesPlayed + 1
@@ -941,7 +945,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
             staticEval <-
                 if rawStaticEval <> VALUE_NONE && usePruning && cfg.UseCorrHist then
-                    rawStaticEval + w.Tables.CorrHist pos.SideToMove pos.PawnKey / 16
+                    rawStaticEval + w.Tables.CorrHist pos.SideToMove pos.PawnKey / Tunables.CorrApplyDiv
                 else
                     rawStaticEval
 
@@ -973,7 +977,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
         if not produced && usePruning && not isPv && not inCheck && excludedMove = MoveNone then
             if
                 depthIn <= 6
-                && workingEval - 120 * depthIn - (if ttPv then 20 else 0) >= beta
+                && workingEval - Tunables.RfpMargin * depthIn - (if ttPv then Tunables.RfpTtPvBonus else 0) >= beta
                 && abs beta < MATE_IN_MAX_PLY
             then
                 result <- workingEval
@@ -984,7 +988,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                 cfg.UseRazoring
                 && depthIn <= 3
                 && abs alpha < MATE_IN_MAX_PLY
-                && workingEval + (240 + 200 * depthIn) <= alpha
+                && workingEval + (Tunables.RazorBase + Tunables.RazorSlope * depthIn) <= alpha
             then
                 let v = qsearch w pos alpha (alpha + 1) ply
 
@@ -998,7 +1002,10 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                 && workingEval >= beta
                 && hasNonPawnMaterial pos
             then
-                let r = 3 + depthIn / 4 + (if workingEval - beta > 200 then 1 else 0)
+                let r =
+                    Tunables.NmpBase
+                    + depthIn / Tunables.NmpDepthDiv
+                    + (if workingEval - beta > Tunables.NmpEvalMargin then 1 else 0)
                 w.Stack.[ssCur].CurrentMove <- MoveNull
                 w.Stack.[ssCur].MovedPiece <- NoPiece
                 pos.MakeNull()
@@ -1036,7 +1043,8 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
             && depthIn >= 5
             && abs beta < MATE_IN_MAX_PLY
         then
-            let probCutBeta = beta + 200 - (if improving then 50 else 0)
+            let probCutBeta =
+                beta + Tunables.ProbCutMargin - (if improving then Tunables.ProbCutImproving else 0)
             // Conservative skip heuristic (NOT a proof the node can't reach probCutBeta).
             let ttBlocks =
                 ttHit && ttDepth >= depthIn - 3 && ttScore <> VALUE_NONE && ttScore < probCutBeta
@@ -1209,7 +1217,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                             // late-move (move-count) pruning — stop trying quiets once deep into the list
                             if
                                 depth <= 8
-                                && moveCount >= (3 + depth * depth) / (if improving then 1 else 2)
+                                && moveCount >= (Tunables.LmpBase + depth * depth) / (if improving then 1 else 2)
                             then
                                 skipQuiets <- true
                                 doMove <- false
@@ -1220,11 +1228,15 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                                 cfg.UseHistoryPruning
                                 && lmrDepth <= 6
                                 && moveCount > 3
-                                && w.Tables.MainHistory us (fromTo m) < -500 - 800 * lmrDepth
+                                && w.Tables.MainHistory us (fromTo m) < -Tunables.HistPruneBase - Tunables.HistPruneSlope * lmrDepth
                             then
                                 doMove <- false
                             // futility — a quiet that can't lift alpha at shallow (reduced) depth
-                            elif (not givesCheck) && lmrDepth <= 6 && staticEval + 120 + 110 * lmrDepth <= alpha then
+                            elif
+                                (not givesCheck)
+                                && lmrDepth <= 6
+                                && staticEval + Tunables.FutBase + Tunables.FutSlope * lmrDepth <= alpha
+                            then
                                 skipQuiets <- true
                                 doMove <- false
                             // SEE — a quiet that walks into a losing exchange. For a checking move, probe the
@@ -1236,12 +1248,12 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                                 && (if givesCheck then
                                         see0Known <- true
                                         see0Val <- pos.SeeGe m 0
-                                        not see0Val && not (pos.SeeGe m (-25 * lmrDepth * lmrDepth))
+                                        not see0Val && not (pos.SeeGe m (-Tunables.SeeQuietMult * lmrDepth * lmrDepth))
                                     else
-                                        not (pos.SeeGe m (-25 * lmrDepth * lmrDepth)))
+                                        not (pos.SeeGe m (-Tunables.SeeQuietMult * lmrDepth * lmrDepth)))
                             then
                                 doMove <- false
-                        elif (not givesCheck) && depth <= 6 && not (pos.SeeGe m (-90 * depth)) then
+                        elif (not givesCheck) && depth <= 6 && not (pos.SeeGe m (-Tunables.SeeCaptMult * depth)) then
                             // SEE — a capture that loses material by static exchange at shallow depth
                             doMove <- false
 
@@ -1272,7 +1284,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                             && (ttBound &&& BoundLower) <> 0
                             && abs ttScore < MATE_IN_MAX_PLY
                         then
-                            let singularBeta = ttScore - 2 * depth
+                            let singularBeta = ttScore - Tunables.SingularMul16 * depth / 16
                             let sDepth = (depth - 1) / 2
                             w.Stack.[ssCur].ExcludedMove <- m
                             let sv = negamax w pos (singularBeta - 1) singularBeta sDepth ply false cutNode
@@ -1280,7 +1292,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
                             if not (pollStop w) then
                                 if sv < singularBeta then
-                                    ext <- ext + (if (not isPv) && sv < singularBeta - 16 then 2 else 1)
+                                    ext <- ext + (if (not isPv) && sv < singularBeta - Tunables.DoubleExtMargin then 2 else 1)
                                 elif ply > 0 && sv >= beta && abs sv < MATE_IN_MAX_PLY then
                                     multicut <- true
                                     best <- sv
@@ -1347,7 +1359,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                                             + w.Tables.ContHistory1 prev1Pc prev1To pc (toSq m)
                                             + w.Tables.ContHistory2 prev2Pc prev2To pc (toSq m)
 
-                                        if hist < -12000 then
+                                        if hist < Tunables.LmrHistThresh then
                                             rr <- rr + 1
 
                                     rr
@@ -1462,7 +1474,8 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                     && not (best >= beta && best <= staticEval)
                     && not (bestMove = MoveNone && best >= staticEval)
                 then
-                    let bonus = max -256 (min 256 ((best - staticEval) * depth / 8))
+                    let bonus =
+                        max -Tunables.CorrClamp (min Tunables.CorrClamp ((best - staticEval) * depth / Tunables.CorrDepthDiv))
                     w.Tables.UpdateCorr pos.SideToMove pos.PawnKey bonus
 
                 result <- best
@@ -1582,7 +1595,10 @@ let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
             let prev = prevScores.[pvIdx]
             // Tweaked: initial window scaled by score magnitude (tighter near equal scores). OFF => flat 16.
             let mutable delta =
-                if cfg.UseAspTweaks then 10 + prev * prev / 15000 else 16
+                if cfg.UseAspTweaks then
+                    Tunables.AspInitDelta + prev * prev / Tunables.AspSqDiv
+                else
+                    16
 
             let fullWindow = depth <= 4 || abs prev >= MATE_IN_MAX_PLY
             let mutable alpha = if fullWindow then -INF else max (-INF) (prev - delta)
@@ -1693,7 +1709,11 @@ let iterativeDeepeningRootPar (w: Worker) (maxDepth: int) (barrier: Threading.Ba
 
         if w.IsMain then
             // Phase 1: search the first (best) root move with the aspiration window (same loop as ID).
-            let mutable delta = if cfg.UseAspTweaks then 10 + prev * prev / 15000 else 16
+            let mutable delta =
+                if cfg.UseAspTweaks then
+                    Tunables.AspInitDelta + prev * prev / Tunables.AspSqDiv
+                else
+                    16
             let fullWindow = depth <= 4 || abs prev >= MATE_IN_MAX_PLY
             let mutable aspAlpha = if fullWindow then -INF else max (-INF) (prev - delta)
             let mutable aspBeta = if fullWindow then INF else min INF (prev + delta)

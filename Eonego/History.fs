@@ -21,21 +21,17 @@ open Eonego.Bitboard
 open Eonego.Move
 open Eonego.Position
 
-// Gravity divisors (also the bonus clamp bound). Both < int16 max (32767) so the store can't overflow.
-[<Literal>]
-let MainHistD = 7183 // butterfly (main) history divisor
+// Gravity divisors (also the bonus clamp bound). All < int16 max (32767) so the store can't overflow —
+// the contract is enforced by the Tunables clamps. Names kept so consumers/tests compile unchanged;
+// values now come from the tuning-campaign env statics (defaults identical to the old literals).
+let MainHistD = Tunables.MainHistD // butterfly (main) history divisor
+let CaptureHistD = Tunables.CaptureHistD // capture history divisor
+let ContHistD = Tunables.ContHistD // continuation history divisor
+let CorrHistD = Tunables.CorrHistD // correction-history divisor
 
-[<Literal>]
-let CaptureHistD = 10692 // capture history divisor
-
-[<Literal>]
-let ContHistD = 29952 // continuation history divisor; < int16 max so the gravity store can't overflow
-
-[<Literal>]
-let CorrHistD = 2048 // correction-history divisor: entries saturate within ±D; applied /16 ⇒ ≤ ±128 cp
-
-/// Stat bonus as a function of depth (representative shape; tunable when the search lands).
-let inline statBonus (depth: int) : int = min (160 * depth - 100) 1700
+/// Stat bonus as a function of depth (shape tunable via EONEGO_T_STATB_*).
+let inline statBonus (depth: int) : int =
+    min (Tunables.StatBonusMul * depth - 100) Tunables.StatBonusCap
 
 [<Sealed>]
 type Tables() =

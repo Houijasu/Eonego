@@ -200,11 +200,12 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
               UseNmpVerify = true
               UseLmrTweaks = true
               UseAspTweaks = true
-              UseQsTt = true
-              UseTtEvalAdjust = true
-              UseCheckExt = false
-              UseQsEvasionCap = false
-              // EONEGO_CORRHIST=0 disables correction history (A/B knob for match.py env overrides).
+              // A/B env knobs for match.py per-player overrides (campaign step B4): defaults preserve
+              // release behaviour; each flag flips for one player without a rebuild.
+              UseQsTt = (Environment.GetEnvironmentVariable("EONEGO_QSTT") <> "0")
+              UseTtEvalAdjust = (Environment.GetEnvironmentVariable("EONEGO_TTEVADJ") <> "0")
+              UseCheckExt = (Environment.GetEnvironmentVariable("EONEGO_CHECKEXT") = "1")
+              UseQsEvasionCap = (Environment.GetEnvironmentVariable("EONEGO_QSEVCAP") = "1")
               UseCorrHist = (Environment.GetEnvironmentVariable("EONEGO_CORRHIST") <> "0")
               MoveOverhead = st.MoveOverhead
               AccCheckpointMb = 0
