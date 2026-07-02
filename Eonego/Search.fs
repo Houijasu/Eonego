@@ -107,6 +107,11 @@ type SearchConfig =
       // Stack.StaticEval, `improving`, move-loop futility and every TT store keep the RAW eval (SF's
       // `unadjustedStaticEval` contract; correction history depends on it staying raw).
       UseTtEvalAdjust: bool
+      // Extend every SEE>=0 checking move by one ply (legacy behaviour). The reference engine dropped its
+      // generic check extension years ago — the singular machinery and LMR cover the useful cases, and the
+      // unconditional +1 inflates every subtree containing a safe check. OFF by default (2026-07-02 A/B);
+      // the flag preserves the legacy arm for SPRT.
+      UseCheckExt: bool
       MoveOverhead: int
       // Phase 1: NNUE accumulator checkpoint cache. Set to 0 to disable; ~4 MiB is the recommended default
       // (1024 slots, ~4.1 KiB/slot). Cleared per search by `SearchControl.NewSearch` (alongside the TT gen
@@ -159,6 +164,7 @@ let defaultConfig =
       UseAspTweaks = true
       UseQsTt = true
       UseTtEvalAdjust = true
+      UseCheckExt = false
       MoveOverhead = 10
       AccCheckpointMb = 0
       DagHashMb = 0
@@ -1195,7 +1201,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                     let mutable ext = 0
 
                     if doMove then
-                        if usePruning && givesCheck then
+                        if usePruning && cfg.UseCheckExt && givesCheck then
                             let see0 = if see0Known then see0Val else pos.SeeGe m 0
                             ext <- if see0 then 1 else 0
 
