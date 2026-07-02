@@ -30,7 +30,8 @@ let private cfgBase =
         UseSingular = false
         UseNmpVerify = false
         UseLmrTweaks = false
-        UseAspTweaks = false }
+        UseAspTweaks = false
+        UseQsTt = false }
 
 let private cfgOn = cfgBase                                         // UseProbCut = true
 let private cfgOff = { cfgBase with UseProbCut = false }

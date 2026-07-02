@@ -97,6 +97,11 @@ type SearchConfig =
       UseNmpVerify: bool
       UseLmrTweaks: bool
       UseAspTweaks: bool
+      // Qsearch TT protocol: non-PV bound cutoffs at qsearch entry + a BoundLower store on stand-pat
+      // fail-highs. The store is tree-neutral (a revisit reaches the identical stand-pat value) and only
+      // skips repeated NNUE evals; the cutoff changes tree shape (suite-total nodes -3..-9% at d13-d15,
+      // per-position volatile) — keep it toggleable for SPRT.
+      UseQsTt: bool
       MoveOverhead: int
       // Phase 1: NNUE accumulator checkpoint cache. Set to 0 to disable; ~4 MiB is the recommended default
       // (1024 slots, ~4.1 KiB/slot). Cleared per search by `SearchControl.NewSearch` (alongside the TT gen
@@ -147,6 +152,7 @@ let defaultConfig =
       UseNmpVerify = true
       UseLmrTweaks = true
       UseAspTweaks = true
+      UseQsTt = true
       MoveOverhead = 10
       AccCheckpointMb = 0
       DagHashMb = 0
@@ -612,24 +618,45 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
         let useTt = cfg.UseTt
         let usePruning = cfg.UsePruning
         let inCheck = pos.InCheck
+        let isPvNode = betaIn - alphaIn > 1
         let mutable alpha = alphaIn
         let beta = betaIn
+        let mutable ttHit = false
         let mutable ttMove = MoveNone
         let mutable ttEval = VALUE_NONE
+        let mutable ttScore = 0
+        let mutable ttBound = BoundNone
 
         if useTt then
-            let struct (hit, m, _, ev, _, _, _) = w.Control.Tt.Probe pos.Key
+            let struct (hit, m, sc, ev, _, bd, _) = w.Control.Tt.Probe pos.Key
 
             if hit then
+                ttHit <- true
                 ttMove <- m
                 ttEval <- ev
+                ttScore <- valueFromTt sc ply
+                ttBound <- bd
 
         let mutable best = -INF
         let mutable bestMove = MoveNone
         let mutable rawEval = VALUE_NONE
         let mutable cutoff = false
 
-        if not inCheck then
+        // TT cutoff (non-PV): every entry is depth-sufficient here (qsearch stores at depth 0, negamax
+        // deeper), so only the bound has to agree with the window — the same gate as negamax step 2.
+        if
+            useTt
+            && cfg.UseQsTt
+            && ttHit
+            && not isPvNode
+            && (ttBound = BoundExact
+                || (ttBound = BoundLower && ttScore >= beta)
+                || (ttBound = BoundUpper && ttScore <= alpha))
+        then
+            best <- ttScore
+            cutoff <- true
+
+        if not inCheck && not cutoff then
             // Stand-pat: reuse the TT-stored static eval when present (it is the same deterministic
             // evalPos value qsearch would recompute and store), mirroring negamax. Bit-exact, skips the
             // NNUE forward on a TT hit.
@@ -639,6 +666,11 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
 
             if sp >= beta then
                 cutoff <- true
+                // Stand-pat fail-high: without a store, a transposed re-visit repeats the eval (and its
+                // lazy-accumulator catch-up walk). sp is this node's genuine fail-soft return value, so a
+                // depth-0 BoundLower entry is sound; only written on a TT miss (never clobber deeper data).
+                if useTt && cfg.UseQsTt && not ttHit then
+                    w.Control.Tt.Store pos.Key 0 BoundLower (valueToTt sp ply) rawEval MoveNone false
             elif sp > alpha then
                 alpha <- sp
 
