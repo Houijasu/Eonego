@@ -185,6 +185,8 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
         writeLine ("bestmove " + toUci (Search.firstLegalMove p))
     | Some _ ->
         // All search toggles are hardwired ON; Threads/Hash/MultiPV/MoveOverhead come from state.
+        let useAbdada = Environment.GetEnvironmentVariable("EONEGO_ABDADA") = "1"
+
         let cfg =
             { Threads = st.Threads
               HashMb = st.HashMb
@@ -209,12 +211,12 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
               UseCorrHist = (Environment.GetEnvironmentVariable("EONEGO_CORRHIST") <> "0")
               MoveOverhead = st.MoveOverhead
               AccCheckpointMb = 0
-              // DAG node table disabled at every thread count: at 1T it measurably cost nps (~4-5%) AND
-              // inflated the tree (+15% nodes on the audit midgame); at SMP it probes+CASes every interior
-              // node without the ABDADA-style deferral (StatusExpanding is never acted on) that would let it
-              // pay for itself — and 8T time-to-depth measured at parity with 1T (2026-07-02 audit). Turn it
-              // back on only behind an SPRT-style match result.
-              DagHashMb = 0
+              // ABDADA (EONEGO_ABDADA=1, SMP only): claim-only DAG table + move-loop deferral — threads
+              // skip subtrees a sibling already owns at sufficient depth. The legacy StatusDone-cutoff
+              // mode stays retired (measured −4-5% nps, +15% tree). Live claims are transient (~threads ×
+              // depth), so 8 MB is generous. Default OFF pending its SPRT vs the voting-lazy arm.
+              UseAbdada = useAbdada
+              DagHashMb = (if useAbdada && st.Threads > 1 then 8 else 0)
               UseWorkQueue = st.UseWorkQueue
               MultiPv = st.MultiPv }
 

@@ -127,6 +127,10 @@ type SearchConfig =
       // qsearch stand-pat). Every TT store keeps the RAW eval. Adjudicated by self-play match — node
       // counts cannot judge an eval-accuracy feature.
       UseCorrHist: bool
+      // ABDADA (SMP only, needs DagHashMb > 0): claim nodes in the DAG table while searching them and
+      // DEFER moves whose child a sibling thread already owns at sufficient depth — de-duplicates
+      // concurrent subtree work. Claim-only: the old StatusDone cutoff is retired (measured harmful).
+      UseAbdada: bool
       MoveOverhead: int
       // Phase 1: NNUE accumulator checkpoint cache. Set to 0 to disable; ~4 MiB is the recommended default
       // (1024 slots, ~4.1 KiB/slot). Cleared per search by `SearchControl.NewSearch` (alongside the TT gen
@@ -182,6 +186,7 @@ let defaultConfig =
       UseCheckExt = false
       UseQsEvasionCap = false
       UseCorrHist = true
+      UseAbdada = false
       MoveOverhead = 10
       AccCheckpointMb = 0
       DagHashMb = 0
@@ -473,6 +478,9 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     let exclMoveBuf: Move[] = Array.zeroCreate (MaxSearchPly * MaxMoves)
     let exclScoreBuf: int[] = Array.zeroCreate (MaxSearchPly * MaxMoves)
     let exclQuietsBuf: Move[] = Array.zeroCreate (MaxSearchPly * MaxMoves)
+    // ABDADA: per-ply buffer of moves deferred because a sibling thread owned the child position
+    // (exclusion searches never defer, so no Excl variant is needed).
+    let deferBuf: Move[] = Array.zeroCreate (MaxSearchPly * MaxMoves)
     let pv: Move[] = Array.zeroCreate (MaxSearchPly * MaxSearchPly)
     let mutable nodes = 0L
     let mutable selDepth = 0
@@ -497,6 +505,7 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     member _.ExclMoveBuf = exclMoveBuf
     member _.ExclScoreBuf = exclScoreBuf
     member _.ExclQuietsBuf = exclQuietsBuf
+    member _.DeferBuf = deferBuf
     member _.Pv = pv
 
     member _.Nodes
@@ -858,13 +867,9 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
         let mutable ttEval = VALUE_NONE
         let mutable ttDepth = 0
         let mutable ttBound = BoundNone
-        // Phase 2: claim->expand->complete lifecycle. `dagClaim` is the table slot token returned by
-        // `TryClaim`; it must be passed back to Complete/Cancel so only the claimant can publish or release
-        // the node. The claim window is captured before alpha mutates during the move loop.
+        // ABDADA claim token: `TryClaim` marks this node StatusExpanding so sibling threads defer their
+        // entry into the same subtree; Cancel-on-exit (the function tail) is the sole release.
         let mutable dagClaim = NoClaim
-        let mutable dagClaimAlpha = 0
-        let mutable dagClaimBeta = 0
-        let mutable dagCompleted = false
         // ttPv: this node is (or was) on a PV. Sticky — start from isPv, OR in a probed former-PV mark.
         let mutable ttPv = isPv
 
@@ -902,32 +907,27 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                         result <- ttScore
                         produced <- true
 
-        // 2b. DAG probe + claim (Phase 2). The DAG carries the alpha/beta-window context the TT cannot encode: a
-        // hit with `status = Done` AND `windowContains(storedAlpha, storedBeta, alpha, beta)` permits a verbatim
-        // cutoff (the original search was under a window that *contains* ours, so its bound applies here —
-        // the alpha-beta transposition soundness theorem). The TT may have a looser or unrelated bound, so
-        // the DAG can cutoff where the TT cannot. Claim is best-effort: on race/cluster-full the caller
-        // silently proceeds to plain recursion (semantically identical), exactly like a TT miss. Both the
-        // probe and the claim gate on `excludedMove = MoveNone` to avoid recording singular-extension nodes
-        // whose key is identical to a normal search's.
-        if not produced && useTt && excludedMove = MoveNone then
+        // 2b. ABDADA claim: publish "this node is being searched at depthIn" so sibling threads defer
+        // their entry into the same subtree (the move-loop probe below). Claim-ONLY — the original DAG
+        // design's StatusDone verbatim cutoff is retired for good (measured −4-5% nps AND +15% tree at
+        // 1T; its cutoff semantics are dominated by the TT's fail-soft bound logic). Best-effort: on
+        // race/cluster-full the search proceeds unclaimed, exactly like before. Gated off during
+        // exclusion searches (their key equals a normal search's) and at shallow depth (table churn).
+        if
+            not produced
+            && cfg.UseAbdada
+            && excludedMove = MoveNone
+            && depthIn >= Tunables.AbdadaClaimMinDepth
+        then
             match w.Control.DagTable with
             | null -> ()
             | dag ->
-                let struct (st, dm, ds, da, db, dd) = dag.Probe pos.Key
+                // Probe-before-claim: skips TryClaim's cluster-reservation CAS when another worker
+                // already owns the key (the common contended case).
+                let struct (st, _, _, _, _, _) = dag.Probe pos.Key
 
-                if st = StatusDone && dd >= depthIn && windowContains da db alpha beta then
-                    // Mirror the TT cutoff gate: non-PV nodes only (PV nodes must re-examine the full PV
-                    // to populate `w.Pv`. The TT cutoff applies the same `not isPv` rule).
-                    if not isPv then
-                        result <- valueFromTt ds ply
-                        produced <- true
-                elif st = StatusEmpty then
-                    let claim = dag.TryClaim pos.Key alpha beta depthIn
-                    if claim <> NoClaim then
-                        dagClaim <- claim
-                        dagClaimAlpha <- alpha
-                        dagClaimBeta <- beta
+                if st = StatusEmpty then
+                    dagClaim <- dag.TryClaim pos.Key alpha beta depthIn
 
         // 3. static eval (+ "improving": static eval higher than 2 plies ago — hoisted up so ProbCut/pruning
         //    can read it; prunes less when our position is improving). `staticEval` is the CORRECTED value
@@ -1165,6 +1165,21 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
             // Multicut (set in the singular block): the node fails high on TWO moves at reduced depth, so
             // the whole move loop is abandoned and `best` returned WITHOUT a TT store.
             let mutable multicut = false
+            // ABDADA deferral: moves skipped because a sibling thread already owns the child at
+            // sufficient depth land in deferSpan and are re-tried in ONE pass after the picker drains.
+            // Disabled during exclusion searches (same-ply recursion shares this ply's buffer slice, and
+            // deferring inside a singular probe is semantically wrong anyway).
+            let abdadaDefer =
+                cfg.UseAbdada
+                && excludedMove = MoveNone
+                && (match w.Control.DagTable with
+                    | null -> false
+                    | _ -> true)
+
+            let deferSpan = w.DeferBuf.AsSpan(bufBase, MaxMoves)
+            let mutable nDeferred = 0
+            let mutable deferIdx = 0
+            let mutable deferredPass = false
             let mutable m = nextMove &mp skipQuiets
 
             while m <> MoveNone && not cutoff do
@@ -1302,6 +1317,9 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                                 elif ply > 0 && cutNode then
                                     ext <- ext - 2
 
+                    let mutable newDepth = 0
+                    let mutable deferredNow = false
+
                     if doMove && not multicut then
                         // Cap so check + double extensions can't push newDepth past depthIn + 1.
                         let maxExt = depthIn + 1 - (depth - 1)
@@ -1309,16 +1327,41 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                         if ext > maxExt then
                             ext <- max 0 maxExt
 
-                        let newDepth = depth - 1 + ext
+                        newDepth <- depth - 1 + ext
                         w.Stack.[ssCur].CurrentMove <- m
                         w.Stack.[ssCur].MovedPiece <- pos.PieceOn(fromSq m)
 
+                        pos.Make m
+                        w.Control.Tt.Prefetch pos.Key // child probes this exact key at entry
+
+                        // ABDADA: if a sibling thread owns this exact child at >= our target depth, defer
+                        // the move instead of duplicating its subtree. Never the first move (the PV move
+                        // is searched here regardless), never on the deferred pass itself. On defer:
+                        // unmake and roll back moveCount — LMP/futility/LMR all key on it, and the quiets
+                        // append below runs only for moves actually searched.
+                        if
+                            abdadaDefer
+                            && not deferredPass
+                            && moveCount > 1
+                            && newDepth >= Tunables.AbdadaDeferMinDepth
+                        then
+                            match w.Control.DagTable with
+                            | null -> ()
+                            | dag ->
+                                let struct (childStatus, _, _, _, _, childDepth) = dag.Probe pos.Key
+
+                                if childStatus = StatusExpanding && childDepth >= newDepth then
+                                    deferredNow <- true
+                                    pos.Unmake m
+                                    moveCount <- moveCount - 1
+                                    deferSpan.[nDeferred] <- m
+                                    nDeferred <- nDeferred + 1
+
+                    if doMove && not multicut && not deferredNow then
                         if isQuiet && nQuiets < MaxMoves - 1 then
                             quietsBuf.[quietsBase + nQuiets] <- m
                             nQuiets <- nQuiets + 1
 
-                        pos.Make m
-                        w.Control.Tt.Prefetch pos.Key // child probes this exact key at entry
                         let mutable v = 0
 
                         if moveCount = 1 then
@@ -1432,7 +1475,24 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
                                         w.Tables.UpdateCapture (pos.PieceOn(fromSq m)) (toSq m) capPt bonus
 
-                m <- if cutoff then MoveNone else nextMove &mp skipQuiets
+                m <-
+                    if cutoff then
+                        MoveNone
+                    else
+                        let nm = if deferredPass then MoveNone else nextMove &mp skipQuiets
+
+                        if nm <> MoveNone then
+                            nm
+                        elif deferIdx < nDeferred then
+                            // Picker drained: single pass over the deferred moves. deferredPass blocks
+                            // re-deferral; each move re-enters the full legality/pruning body at the
+                            // CURRENT alpha (a deferred move getting LMP'd now is a feature).
+                            deferredPass <- true
+                            let dm = deferSpan.[deferIdx]
+                            deferIdx <- deferIdx + 1
+                            dm
+                        else
+                            MoveNone
 
             if moveCount = 0 then
                 // No legal move searched. During an exclusion search this means the excluded move was the
@@ -1446,16 +1506,6 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                         else BoundExact
 
                     w.Control.Tt.Store pos.Key depth bound (valueToTt best ply) rawStaticEval bestMove ttPv
-
-                    // Phase 2: publish the result under the original claimed window. `alpha` is mutated by
-                    // searched moves, so using it here would make the reusable window narrower than the
-                    // actual search window.
-                    if dagClaim <> NoClaim then
-                        match w.Control.DagTable with
-                        | null -> () // claimed against a since-disabled table; ignore
-                        | dag ->
-                            dagCompleted <-
-                                dag.Complete dagClaim pos.Key bestMove (valueToTt best ply) dagClaimAlpha dagClaimBeta depth
 
                 // Correction history: teach the table this pawn structure's persistent eval error. Only
                 // when the result is eval-like (not in check, best move not a capture) and the bound
@@ -1480,7 +1530,9 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
                 result <- best
 
-        if dagClaim <> NoClaim && not dagCompleted then
+        // Sole claim release (ABDADA is claim-only; `Complete` is unused). The single-exit structure
+        // guarantees this runs on every path — early cutoffs, multicut, stop, no-legal-moves.
+        if dagClaim <> NoClaim then
             match w.Control.DagTable with
             | null -> ()
             | dag -> dag.Cancel(dagClaim, pos.Key) |> ignore

@@ -34,7 +34,8 @@ let private cfgBase =
         UseQsTt = false
         UseTtEvalAdjust = false
         UseQsEvasionCap = false
-        UseCorrHist = false }
+        UseCorrHist = false
+        UseAbdada = false }
 
 let private cfgOn = cfgBase                                         // UseProbCut = true
 let private cfgOff = { cfgBase with UseProbCut = false }
