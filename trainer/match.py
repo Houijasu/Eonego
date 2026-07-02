@@ -1,16 +1,27 @@
 """Self-contained UCI match driver + SPRT for Eonego processes.
 
-The release engine exposes only `Threads` and `Move Overhead` via UCI. `--a`/`--b`
-remain available as comma-separated per-subprocess environment overrides for comparing
-different launches or binaries, but Eonego itself does not consume search-mode env knobs.
+Per-player channels:
+  --a / --b / --shared          env-var overrides ('NAME=VAL,NAME2=VAL2') — the engine's EONEGO_* knobs
+  --options-a / --options-b / --options
+                                UCI options sent via `setoption` after `uciok` (same grammar)
+  --exe / --exe-b               different binaries (old-vs-new matches)
 
-    python match.py --a "" --b "" --movetime 200 --openings 200 --sprt
+Concurrency: --concurrency N runs N worker threads, each owning ONE engine pair and playing whole
+color-swapped opening PAIRS (both games of a pair on the same worker, so a thermally-throttled or
+E-core slot penalizes both players symmetrically). Openings are generated once from --seed and
+assigned deterministically by pair index; only completion order varies between runs.
+
+    python match.py --a "" --b "" --movetime 200 --openings 200 --sprt --concurrency 8
+
+`run_match(args)` is importable (used by spsa.py); `main()` is a thin CLI wrapper.
 """
 
 import argparse
 import math
 import os
+import queue
 import subprocess
+import threading
 
 import chess
 
@@ -21,7 +32,7 @@ START_FEN = chess.STARTING_FEN
 
 
 class UciEngine:
-    def __init__(self, name, exe, env_overrides):
+    def __init__(self, name, exe, env_overrides, uci_options=None):
         env = dict(os.environ)
         env.update(env_overrides)
         self.proc = subprocess.Popen([exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -29,7 +40,12 @@ class UciEngine:
         self.name = name
         self._send("uci")
         self._wait("uciok")
-        self._send("setoption name Threads value 1")
+        opts = dict(uci_options or {})
+        # Legacy default: pin Threads=1 unless the caller overrides it explicitly.
+        if "Threads" not in opts:
+            opts["Threads"] = "1"
+        for k, v in opts.items():
+            self._send(f"setoption name {k} value {v}")
         self._send("isready")
         self._wait("readyok")
 
@@ -84,6 +100,10 @@ def parse_env(spec):
         k, v = part.split("=", 1)
         out[k.strip()] = v.strip()
     return out
+
+
+# Same grammar as parse_env; separate name so call sites read as intended.
+parse_options = parse_env
 
 
 def gen_openings(root_fen, n, plies, seed):
@@ -165,11 +185,114 @@ def elo_estimate(W, D, L):
     return elo, (elo_hi - elo_lo) / 2.0
 
 
-def main():
+def run_match(args, quiet=False):
+    """Play the configured match; returns dict(W, D, L, games, elo, err, llr, verdict).
+
+    Thread-pool design: each worker owns one (engA, engB) pair for its lifetime and plays whole
+    color-swapped opening pairs pulled from a shared queue. SPRT stop is evaluated on the aggregate
+    tally after every game; workers finish their in-flight game, then drain.
+    """
+    exe_a = args.exe
+    exe_b = getattr(args, "exe_b", "") or args.exe
+    if not os.path.exists(exe_a):
+        raise SystemExit(f"engine not found: {exe_a}\n(build it, or pass --exe)")
+    if not os.path.exists(exe_b):
+        raise SystemExit(f"engine B not found: {exe_b}")
+
+    go_cmd = f"go nodes {args.nodes}" if args.nodes > 0 else f"go movetime {args.movetime}"
+
+    shared_env = parse_env(args.shared)
+    env_a = {**shared_env, **parse_env(args.a)}
+    env_b = {**shared_env, **parse_env(args.b)}
+    shared_opt = parse_options(getattr(args, "options", ""))
+    opt_a = {**shared_opt, **parse_options(getattr(args, "options_a", ""))}
+    opt_b = {**shared_opt, **parse_options(getattr(args, "options_b", ""))}
+
+    lower = math.log(args.beta / (1 - args.alpha))
+    upper = math.log((1 - args.beta) / args.alpha)
+
+    openings = gen_openings(args.root, args.openings, args.opening_plies, args.seed)
+    work = queue.Queue()
+    for i in range(len(openings)):
+        work.put(i)
+
+    tally = {"W": 0, "D": 0, "L": 0, "games": 0}
+    lock = threading.Lock()
+    stop = threading.Event()
+    errors = []
+
+    def record(res, a_is_white):
+        """Post one game result; returns True when the SPRT says stop."""
+        with lock:
+            if res == "1/2-1/2":
+                tally["D"] += 1
+            elif (res == "1-0") == a_is_white:
+                tally["W"] += 1
+            else:
+                tally["L"] += 1
+            tally["games"] += 1
+            W, D, L, g = tally["W"], tally["D"], tally["L"], tally["games"]
+            llr = sprt_llr(W, D, L, args.elo0, args.elo1)
+            if not quiet and g % 10 == 0:
+                elo, err = elo_estimate(W, D, L)
+                print(f"g{g:4d}  W{W} D{D} L{L}  elo {elo:+.1f}+-{err:.1f}  LLR {llr:+.2f} "
+                      f"[{lower:.2f},{upper:.2f}]", flush=True)
+            return args.sprt and g >= args.min_games and (llr >= upper or llr <= lower)
+
+    def worker():
+        engA = engB = None
+        try:
+            engA = UciEngine("A", exe_a, env_a, opt_a)
+            engB = UciEngine("B", exe_b, env_b, opt_b)
+            while not stop.is_set():
+                try:
+                    idx = work.get_nowait()
+                except queue.Empty:
+                    return
+                op = openings[idx]
+                for a_is_white in (True, False):
+                    if stop.is_set():
+                        return
+                    engA.newgame()
+                    engB.newgame()
+                    ew, eb = (engA, engB) if a_is_white else (engB, engA)
+                    res = play_game(args.root, ew, eb, op, go_cmd, max_plies=args.max_plies)
+                    if record(res, a_is_white):
+                        stop.set()
+        except Exception as ex:  # engine crash etc. — stop the match, surface the error
+            with lock:
+                errors.append(f"{type(ex).__name__}: {ex}")
+            stop.set()
+        finally:
+            for e in (engA, engB):
+                if e is not None:
+                    e.quit()
+
+    n_workers = max(1, min(args.concurrency, len(openings)))
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(n_workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    W, D, L, g = tally["W"], tally["D"], tally["L"], tally["games"]
+    llr = sprt_llr(W, D, L, args.elo0, args.elo1)
+    elo, err = elo_estimate(W, D, L)
+    verdict = ("H1 (A stronger)" if llr >= upper
+               else "H0 (not stronger)" if llr <= lower
+               else "inconclusive")
+    return {"W": W, "D": D, "L": L, "games": g, "elo": elo, "err": err,
+            "llr": llr, "verdict": verdict, "errors": errors}
+
+
+def build_parser():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--a", required=True, help="env overrides for player A, e.g. 'COMPlus_TieredCompilation=0'")
-    ap.add_argument("--b", required=True, help="env overrides for player B, e.g. 'COMPlus_TieredCompilation=1'")
+    ap.add_argument("--a", required=True, help="env overrides for player A, e.g. 'EONEGO_T_RFP_MARGIN=130'")
+    ap.add_argument("--b", required=True, help="env overrides for player B")
     ap.add_argument("--shared", default="", help="env overrides applied to BOTH players")
+    ap.add_argument("--options-a", default="", help="UCI options for player A, e.g. 'Threads=16,Hash=1024'")
+    ap.add_argument("--options-b", default="", help="UCI options for player B")
+    ap.add_argument("--options", default="", help="UCI options applied to BOTH players")
     ap.add_argument("--exe", default=DEFAULT_EXE, help="path to Eonego.exe (default: AOT publish build)")
     ap.add_argument("--exe-b", default="", help="path to player B's exe (default: same as --exe) — for old-vs-new binary matches")
     ap.add_argument("--root", default=START_FEN, help="opening root FEN (default: startpos)")
@@ -187,65 +310,23 @@ def main():
     ap.add_argument("--max-plies", type=int, default=600,
                     help="adjudicate as draw past this many plies; use <=240 when a pre-2d3fd08 binary "
                          "plays (their accumulator stack crashed past ~255 game plies)")
-    args = ap.parse_args()
+    ap.add_argument("--concurrency", type=int, default=1,
+                    help="worker threads, each owning one engine pair and playing whole opening pairs; "
+                         "use 8 for 1T-vs-1T matches, 1 when any player runs Threads>=8")
+    return ap
 
-    if not os.path.exists(args.exe):
-        raise SystemExit(f"engine not found: {args.exe}\n(build it, or pass --exe)")
 
-    exe_b = args.exe_b or args.exe
-    if not os.path.exists(exe_b):
-        raise SystemExit(f"engine B not found: {exe_b}")
-
-    go_cmd = f"go nodes {args.nodes}" if args.nodes > 0 else f"go movetime {args.movetime}"
-
-    shared = parse_env(args.shared)
-    env_a = {**shared, **parse_env(args.a)}
-    env_b = {**shared, **parse_env(args.b)}
-
-    lower = math.log(args.beta / (1 - args.alpha))
-    upper = math.log((1 - args.beta) / args.alpha)
-
-    engA = UciEngine("A", args.exe, env_a)
-    engB = UciEngine("B", exe_b, env_b)
-    openings = gen_openings(args.root, args.openings, args.opening_plies, args.seed)
-
-    W = D = L = 0  # from A's perspective
-    games = 0
-    try:
-        for op in openings:
-            for a_is_white in (True, False):
-                engA.newgame()
-                engB.newgame()
-                ew, eb = (engA, engB) if a_is_white else (engB, engA)
-                res = play_game(args.root, ew, eb, op, go_cmd, max_plies=args.max_plies)
-                if res == "1/2-1/2":
-                    D += 1
-                elif (res == "1-0") == a_is_white:
-                    W += 1
-                else:
-                    L += 1
-                games += 1
-                llr = sprt_llr(W, D, L, args.elo0, args.elo1)
-                if games % 10 == 0:
-                    elo, err = elo_estimate(W, D, L)
-                    print(f"g{games:4d}  W{W} D{D} L{L}  elo {elo:+.1f}+-{err:.1f}  LLR {llr:+.2f} "
-                          f"[{lower:.2f},{upper:.2f}]", flush=True)
-                if args.sprt and games >= args.min_games and (llr >= upper or llr <= lower):
-                    break
-            else:
-                continue
-            break
-    finally:
-        engA.quit()
-        engB.quit()
-
-    llr = sprt_llr(W, D, L, args.elo0, args.elo1)
-    elo, err = elo_estimate(W, D, L)
-    verdict = "H1 (A stronger)" if llr >= upper else "H0 (not stronger)" if llr <= lower else "inconclusive"
-    print(f"\nFINAL  A=[{args.a}]  B=[{args.b}]  budget={go_cmd}")
-    print(f"  games {games}  W{W} D{D} L{L}  score {(W+0.5*D)/max(1,games):.3f}")
-    print(f"  Elo(A-B) {elo:+.1f} +- {err:.1f}   LLR {llr:+.2f}  -> {verdict}")
-    return 0
+def main():
+    args = build_parser().parse_args()
+    r = run_match(args)
+    print(f"\nFINAL  A=[{args.a}|{args.options_a}]  B=[{args.b}|{args.options_b}]  "
+          f"budget={'go nodes ' + str(args.nodes) if args.nodes > 0 else 'go movetime ' + str(args.movetime)}"
+          f"  concurrency={args.concurrency}")
+    print(f"  games {r['games']}  W{r['W']} D{r['D']} L{r['L']}  score {(r['W'] + 0.5 * r['D']) / max(1, r['games']):.3f}")
+    print(f"  Elo(A-B) {r['elo']:+.1f} +- {r['err']:.1f}   LLR {r['llr']:+.2f}  -> {r['verdict']}")
+    for e in r["errors"]:
+        print(f"  ERROR: {e}")
+    return 1 if r["errors"] else 0
 
 
 if __name__ == "__main__":
