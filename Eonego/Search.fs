@@ -1101,6 +1101,9 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
             let mutable nQuiets = 0
             let mutable skipQuiets = false
             let mutable cutoff = false
+            // Multicut (set in the singular block): the node fails high on TWO moves at reduced depth, so
+            // the whole move loop is abandoned and `best` returned WITHOUT a TT store.
+            let mutable multicut = false
             let mutable m = nextMove &mp skipQuiets
 
             while m <> MoveNone && not cutoff do
@@ -1189,17 +1192,23 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                             // SEE — a capture that loses material by static exchange at shallow depth
                             doMove <- false
 
+                    let mutable ext = 0
+
                     if doMove then
-                        let mutable ext =
-                            if usePruning && givesCheck then
-                                let see0 = if see0Known then see0Val else pos.SeeGe m 0
-                                if see0 then 1 else 0
-                            else
-                                0
+                        if usePruning && givesCheck then
+                            let see0 = if see0Known then see0Val else pos.SeeGe m 0
+                            ext <- if see0 then 1 else 0
 
                         // Singular / double extension: the TT move, at depth >= 8 with a depth-sufficient
                         // lower-bound TT score, is "singular" if every OTHER move fails low against a
                         // reduced exclusion window. Extend it (twice if it fails low by a clear margin).
+                        // A fail-HIGH exclusion search is informative too (SF-master else-branches):
+                        // multicut — some OTHER move also beats beta at reduced depth, so with the TT move's
+                        // own lower bound this node is a proven cut-node: return sv without searching a
+                        // single move (and without a TT store — the bound is only reduced-depth);
+                        // negative extensions — the TT move is NOT singular here, so trim its depth when
+                        // its TT score already beats beta, or at expected cut-nodes. All ply > 0 only
+                        // (the root must always search and produce a move).
                         if
                             usePruning
                             && cfg.UseSingular
@@ -1216,9 +1225,19 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                             let sv = negamax w pos (singularBeta - 1) singularBeta sDepth ply false cutNode
                             w.Stack.[ssCur].ExcludedMove <- MoveNone
 
-                            if not (pollStop w) && sv < singularBeta then
-                                ext <- ext + (if (not isPv) && sv < singularBeta - 16 then 2 else 1)
+                            if not (pollStop w) then
+                                if sv < singularBeta then
+                                    ext <- ext + (if (not isPv) && sv < singularBeta - 16 then 2 else 1)
+                                elif ply > 0 && sv >= beta && abs sv < MATE_IN_MAX_PLY then
+                                    multicut <- true
+                                    best <- sv
+                                    cutoff <- true
+                                elif ply > 0 && ttScore >= beta then
+                                    ext <- ext - 2
+                                elif ply > 0 && cutNode then
+                                    ext <- ext - 2
 
+                    if doMove && not multicut then
                         // Cap so check + double extensions can't push newDepth past depthIn + 1.
                         let maxExt = depthIn + 1 - (depth - 1)
 
@@ -1355,7 +1374,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                 // only move -> report a fail-low so the caller treats it as singular (don't store).
                 result <- (if excludedMove <> MoveNone then alpha elif inCheck then -MATE + ply else 0)
             else
-                if useTt && not (pollStop w) && excludedMove = MoveNone then
+                if useTt && not multicut && not (pollStop w) && excludedMove = MoveNone then
                     let bound =
                         if best <= alphaIn then BoundUpper
                         elif best >= beta then BoundLower
