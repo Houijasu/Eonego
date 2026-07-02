@@ -118,6 +118,11 @@ type SearchConfig =
       // +35% suite-node REGRESSION at d14/d15 (2026-07-02) — the pessimistic leaf values it injects
       // cost more tree than the skipped evasions save. Kept behind the flag for a future SPRT only.
       UseQsEvasionCap: bool
+      // Correction history: a per-(stm, pawn-structure) gravity table of persistent (bestValue −
+      // staticEval) error corrects the WORKING static eval wherever it feeds pruning (negamax step 3 +
+      // qsearch stand-pat). Every TT store keeps the RAW eval. Adjudicated by self-play match — node
+      // counts cannot judge an eval-accuracy feature.
+      UseCorrHist: bool
       MoveOverhead: int
       // Phase 1: NNUE accumulator checkpoint cache. Set to 0 to disable; ~4 MiB is the recommended default
       // (1024 slots, ~4.1 KiB/slot). Cleared per search by `SearchControl.NewSearch` (alongside the TT gen
@@ -172,6 +177,7 @@ let defaultConfig =
       UseTtEvalAdjust = true
       UseCheckExt = false
       UseQsEvasionCap = false
+      UseCorrHist = true
       MoveOverhead = 10
       AccCheckpointMb = 0
       DagHashMb = 0
@@ -682,6 +688,14 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
             let rawSp = if ttEval <> VALUE_NONE then ttEval else evalPos w pos
             rawEval <- rawSp
 
+            // Correction history: same corrected-working-eval rule as negamax step 3 (rawEval stays raw
+            // for the TT stores below).
+            let rawSp =
+                if usePruning && cfg.UseCorrHist then
+                    rawSp + w.Tables.CorrHist pos.SideToMove pos.PawnKey / 16
+                else
+                    rawSp
+
             // TT score as a better stand-pat (same bound-consistency rule as negamax step 3b). rawEval —
             // what a fail-high store below and the post-move-loop store persist — stays the raw eval.
             let sp =
@@ -903,15 +917,24 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                         dagClaimBeta <- beta
 
         // 3. static eval (+ "improving": static eval higher than 2 plies ago — hoisted up so ProbCut/pruning
-        //    can read it; prunes less when our position is improving)
+        //    can read it; prunes less when our position is improving). `staticEval` is the CORRECTED value
+        //    (correction history) consumed by Stack/improving/pruning; `rawStaticEval` is what the TT store
+        //    persists (the unadjusted contract — the ttEval-reuse path above depends on it staying raw).
         let mutable staticEval = VALUE_NONE
+        let mutable rawStaticEval = VALUE_NONE
         let mutable improving = false
 
         if not produced then
-            staticEval <-
+            rawStaticEval <-
                 if inCheck then VALUE_NONE
                 elif ttHit && ttEval <> VALUE_NONE then ttEval
                 else evalPos w pos
+
+            staticEval <-
+                if rawStaticEval <> VALUE_NONE && usePruning && cfg.UseCorrHist then
+                    rawStaticEval + w.Tables.CorrHist pos.SideToMove pos.PawnKey / 16
+                else
+                    rawStaticEval
 
             w.Stack.[ssCur].StaticEval <- staticEval
 
@@ -1401,7 +1424,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                         elif best >= beta then BoundLower
                         else BoundExact
 
-                    w.Control.Tt.Store pos.Key depth bound (valueToTt best ply) staticEval bestMove ttPv
+                    w.Control.Tt.Store pos.Key depth bound (valueToTt best ply) rawStaticEval bestMove ttPv
 
                     // Phase 2: publish the result under the original claimed window. `alpha` is mutated by
                     // searched moves, so using it here would make the reusable window narrower than the
@@ -1412,6 +1435,26 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                         | dag ->
                             dagCompleted <-
                                 dag.Complete dagClaim pos.Key bestMove (valueToTt best ply) dagClaimAlpha dagClaimBeta depth
+
+                // Correction history: teach the table this pawn structure's persistent eval error. Only
+                // when the result is eval-like (not in check, best move not a capture) and the bound
+                // direction doesn't contradict the sign (SF gates): a fail-high below staticEval or a
+                // fail-low above it carries no usable signal.
+                if
+                    usePruning
+                    && cfg.UseCorrHist
+                    && not multicut
+                    && not inCheck
+                    && excludedMove = MoveNone
+                    && not (pollStop w)
+                    && rawStaticEval <> VALUE_NONE
+                    && (bestMove = MoveNone
+                        || (pos.PieceOn(toSq bestMove) = NoPiece && not (isEnPassant bestMove)))
+                    && not (best >= beta && best <= staticEval)
+                    && not (bestMove = MoveNone && best >= staticEval)
+                then
+                    let bonus = max -256 (min 256 ((best - staticEval) * depth / 8))
+                    w.Tables.UpdateCorr pos.SideToMove pos.PawnKey bonus
 
                 result <- best
 

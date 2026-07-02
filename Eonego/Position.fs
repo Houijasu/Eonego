@@ -202,6 +202,9 @@ let pieceValueOf (pt: PieceType) : int = pieceValue.[pt]
 type StateInfo =
     { // irreversible / restore-on-unmake
       mutable Key: uint64
+      // Pawn-only Zobrist key (both colors' pawns, piece-square terms only — no castle/ep/side). Feeds the
+      // correction-history index; maintained by the same mutation choke points as Key.
+      mutable PawnKey: uint64
       mutable CastlingRights: int
       mutable EpSquare: Square // landing square, or NoSquare (64)
       mutable Rule50: int
@@ -231,6 +234,7 @@ type Position() =
     let mutable sideToMove = White
     let mutable gamePly = 0
     let mutable currentKey = 0UL
+    let mutable currentPawnKey = 0UL
     let states: StateInfo[] = Array.zeroCreate MaxPly
     let mutable stPly = 0
 
@@ -451,6 +455,8 @@ type Position() =
         byColorBB.[c] <- byColorBB.[c] ||| b
         board.[sq] <- pc
         currentKey <- currentKey ^^^ zPiece pc sq
+        if pt = Pawn then
+            currentPawnKey <- currentPawnKey ^^^ zPiece pc sq
         if active then
             dirtyPc.[dirtyN] <- pc; dirtySq.[dirtyN] <- sq; dirtySign.[dirtyN] <- 1; dirtyN <- dirtyN + 1
             this.UpdatePieceThreats(pc, true, sq, true, System.UInt64.MaxValue)
@@ -469,6 +475,8 @@ type Position() =
         byColorBB.[c] <- byColorBB.[c] ^^^ b
         board.[sq] <- NoPiece
         currentKey <- currentKey ^^^ zPiece pc sq
+        if pt = Pawn then
+            currentPawnKey <- currentPawnKey ^^^ zPiece pc sq
         if active then
             dirtyPc.[dirtyN] <- pc; dirtySq.[dirtyN] <- sq; dirtySign.[dirtyN] <- -1; dirtyN <- dirtyN + 1
 
@@ -488,6 +496,8 @@ type Position() =
         board.[from] <- NoPiece
         board.[dst] <- pc
         currentKey <- currentKey ^^^ zPiece pc from ^^^ zPiece pc dst
+        if pt = Pawn then
+            currentPawnKey <- currentPawnKey ^^^ zPiece pc from ^^^ zPiece pc dst
         if active then
             dirtyPc.[dirtyN] <- pc; dirtySq.[dirtyN] <- from; dirtySign.[dirtyN] <- -1; dirtyN <- dirtyN + 1
             dirtyPc.[dirtyN] <- pc; dirtySq.[dirtyN] <- dst;  dirtySign.[dirtyN] <- 1;  dirtyN <- dirtyN + 1
@@ -503,6 +513,8 @@ type Position() =
         byColorBB.[pieceColor oldPc] <- byColorBB.[pieceColor oldPc] ^^^ b
         board.[sq] <- NoPiece
         currentKey <- currentKey ^^^ zPiece oldPc sq
+        if pieceType oldPc = Pawn then
+            currentPawnKey <- currentPawnKey ^^^ zPiece oldPc sq
         if active then
             dirtyPc.[dirtyN] <- oldPc; dirtySq.[dirtyN] <- sq; dirtySign.[dirtyN] <- -1; dirtyN <- dirtyN + 1
             this.UpdatePieceThreats(oldPc, false, sq, false, 0UL)
@@ -512,6 +524,8 @@ type Position() =
         byColorBB.[pieceColor newPc] <- byColorBB.[pieceColor newPc] ||| b
         board.[sq] <- newPc
         currentKey <- currentKey ^^^ zPiece newPc sq
+        if pieceType newPc = Pawn then
+            currentPawnKey <- currentPawnKey ^^^ zPiece newPc sq
         if active then
             dirtyPc.[dirtyN] <- newPc; dirtySq.[dirtyN] <- sq; dirtySign.[dirtyN] <- 1; dirtyN <- dirtyN + 1
             this.UpdatePieceThreats(newPc, true, sq, false, 0UL)
@@ -1395,6 +1409,7 @@ type Position() =
     // Plies since the last null move (search-only; bounds the null-safe repetition walk). Mirrors Rule50.
     member _.PliesFromNull: int = let st = &states.[stPly] in st.PliesFromNull
     member _.Key: uint64 = let st = &states.[stPly] in st.Key
+    member _.PawnKey: uint64 = let st = &states.[stPly] in st.PawnKey
     member _.StPly: int = stPly
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
@@ -1684,6 +1699,17 @@ type Position() =
 
         key
 
+    /// From-scratch pawn-key oracle (piece-square terms of both colors' pawns only).
+    member _.RecomputePawnKey() : uint64 =
+        let mutable key = 0UL
+        let mutable occ = byTypeBB.[Pawn]
+
+        while occ <> 0UL do
+            let sq = popLsb &occ
+            key <- key ^^^ zPiece board.[sq] sq
+
+        key
+
     // --- shared en-passant capturer test (the pawn-inversion, single source) -
     /// True iff a `capturer`-colored pawn can legally capture onto `epSq` (squares a `capturer` pawn
     /// attacks `epSq` from = pawnAttacks (flipColor capturer) epSq). Reused by Make / LoadFen / ToFen.
@@ -1704,6 +1730,7 @@ type Position() =
         System.Array.Clear(byTypeBB, 0, byTypeBB.Length)
         System.Array.Clear(byColorBB, 0, byColorBB.Length)
         currentKey <- 0UL
+        currentPawnKey <- 0UL
         stPly <- 0
         gamePly <- 0
         // A bulk board load invalidates the incremental accumulator: disable it so the piece-placement
@@ -1832,6 +1859,7 @@ type Position() =
         // 6. seed states.[0] (every scalar explicit — zeroCreate leaves EpSquare=0=a1, CapturedPiece=0=wP)
         let st = &states.[0]
         st.Key <- currentKey
+        st.PawnKey <- currentPawnKey
         st.CastlingRights <- rights
         st.EpSquare <- ep
         st.Rule50 <- rule50
@@ -1857,6 +1885,7 @@ type Position() =
 
         this.SetCheckInfo()
         Debug.Assert((this.RecomputeKey() = currentKey), "LoadFen: incremental key != from-scratch")
+        Debug.Assert((this.RecomputePawnKey() = currentPawnKey), "LoadFen: incremental pawn key != from-scratch")
 
     member _.ToFen() : string =
         let sb = System.Text.StringBuilder()
@@ -1934,6 +1963,7 @@ type Position() =
         // 1. seed key from the parent frame, clear stale ep term, advance the stack
         let prev = &states.[stPly]
         currentKey <- prev.Key ^^^ Side
+        currentPawnKey <- prev.PawnKey // no side/ep/castle terms; the choke points do the rest
 
         if prev.EpSquare <> NoSquare then
             currentKey <- currentKey ^^^ zEp (fileOf prev.EpSquare)
@@ -2014,6 +2044,7 @@ type Position() =
         // 5. commit
         sideToMove <- them
         st.Key <- currentKey
+        st.PawnKey <- currentPawnKey
         this.SetCheckInfo()
         // NNUE: persist dirty pieces + physical FullThreats deltas, then eagerly materialize the child
         // accumulator (copy parent + apply deltas). Eval becomes O(1) — no lazy frame walk at eval time.
@@ -2059,6 +2090,7 @@ type Position() =
         stPly <- stPly - 1
         gamePly <- gamePly - 1
         currentKey <- (let p = &states.[stPly] in p.Key)
+        currentPawnKey <- (let p = &states.[stPly] in p.PawnKey)
         // NNUE: pop the lazy frame. Parent materialization, if needed, is computed on demand.
         if active then
             Debug.Assert((top > 0), "Unmake: top underflow")
@@ -2089,6 +2121,7 @@ type Position() =
         st.Repetition <- 0
         sideToMove <- flipColor sideToMove
         st.Key <- currentKey
+        st.PawnKey <- currentPawnKey // null move touches no pawns
         this.SetCheckInfo()
 
     member this.UnmakeNull() : unit =
@@ -2097,6 +2130,7 @@ type Position() =
         gamePly <- gamePly - 1
         sideToMove <- flipColor sideToMove
         currentKey <- (let p = &states.[stPly] in p.Key)
+        currentPawnKey <- (let p = &states.[stPly] in p.PawnKey)
         // NNUE: a null move left the accumulator unchanged ⇒ nothing to restore.
 
     // --- GivesCheck: does `m` give check? (search/movegen; perft does not use it) -------------------

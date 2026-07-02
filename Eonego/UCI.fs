@@ -204,6 +204,8 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
               UseTtEvalAdjust = true
               UseCheckExt = false
               UseQsEvasionCap = false
+              // EONEGO_CORRHIST=0 disables correction history (A/B knob for match.py env overrides).
+              UseCorrHist = (Environment.GetEnvironmentVariable("EONEGO_CORRHIST") <> "0")
               MoveOverhead = st.MoveOverhead
               AccCheckpointMb = 0
               // DAG node table disabled at every thread count: at 1T it measurably cost nps (~4-5%) AND

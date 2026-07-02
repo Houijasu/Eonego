@@ -171,6 +171,7 @@ def main():
     ap.add_argument("--b", required=True, help="env overrides for player B, e.g. 'COMPlus_TieredCompilation=1'")
     ap.add_argument("--shared", default="", help="env overrides applied to BOTH players")
     ap.add_argument("--exe", default=DEFAULT_EXE, help="path to Eonego.exe (default: AOT publish build)")
+    ap.add_argument("--exe-b", default="", help="path to player B's exe (default: same as --exe) — for old-vs-new binary matches")
     ap.add_argument("--root", default=START_FEN, help="opening root FEN (default: startpos)")
     ap.add_argument("--movetime", type=int, default=200, help="ms per move")
     ap.add_argument("--nodes", type=int, default=0, help="alt budget: go nodes N")
@@ -188,6 +189,10 @@ def main():
     if not os.path.exists(args.exe):
         raise SystemExit(f"engine not found: {args.exe}\n(build it, or pass --exe)")
 
+    exe_b = args.exe_b or args.exe
+    if not os.path.exists(exe_b):
+        raise SystemExit(f"engine B not found: {exe_b}")
+
     go_cmd = f"go nodes {args.nodes}" if args.nodes > 0 else f"go movetime {args.movetime}"
 
     shared = parse_env(args.shared)
@@ -198,7 +203,7 @@ def main():
     upper = math.log((1 - args.beta) / args.alpha)
 
     engA = UciEngine("A", args.exe, env_a)
-    engB = UciEngine("B", args.exe, env_b)
+    engB = UciEngine("B", exe_b, env_b)
     openings = gen_openings(args.root, args.openings, args.opening_plies, args.seed)
 
     W = D = L = 0  # from A's perspective

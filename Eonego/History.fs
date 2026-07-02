@@ -31,6 +31,9 @@ let CaptureHistD = 10692 // capture history divisor
 [<Literal>]
 let ContHistD = 29952 // continuation history divisor; < int16 max so the gravity store can't overflow
 
+[<Literal>]
+let CorrHistD = 2048 // correction-history divisor: entries saturate within ±D; applied /16 ⇒ ≤ ±128 cp
+
 /// Stat bonus as a function of depth (representative shape; tunable when the search lands).
 let inline statBonus (depth: int) : int = min (160 * depth - 100) 1700
 
@@ -48,6 +51,9 @@ type Tables() =
     // 1-ply-back move (ss-1), cont2 by the 2-ply-back move (ss-2). 768 = 12 pieces * 64 squares.
     let cont1: int16[] = Array.zeroCreate (768 * 768)
     let cont2: int16[] = Array.zeroCreate (768 * 768)
+    // Correction history: [stm<<<14 | pawnKey&16383] -> persistent (bestValue - staticEval) error for this
+    // side's pawn structure, gravity-updated. Read as a static-eval correction wherever eval feeds pruning.
+    let corr: int16[] = Array.zeroCreate (2 * 16384)
 
     /// Zero every table (new game / clear between searches).
     member _.Clear() : unit =
@@ -57,6 +63,7 @@ type Tables() =
         Array.Fill(killers, MoveNone)
         Array.Clear(cont1, 0, cont1.Length)
         Array.Clear(cont2, 0, cont2.Length)
+        Array.Clear(corr, 0, corr.Length)
 
     // --- reads (AggressiveInlining ATTRIBUTE: they touch the private arrays yet inline in-assembly) ---
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
@@ -86,6 +93,11 @@ type Tables() =
             0
         else
             int cont2.[(prevPc * 64 + prevTo) * 768 + (pc * 64 + dst)]
+
+    /// Raw correction-history entry for (side to move, pawn structure); callers scale (/16) into eval units.
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+    member _.CorrHist (c: Color) (pawnKey: uint64) : int =
+        int corr.[(c <<< 14) ||| int (pawnKey &&& 16383UL)]
 
     // --- writes -----------------------------------------------------------------------------------
     member _.SetCounter (prevPc: Piece) (prevTo: Square) (m: Move) : unit = counter.[prevPc * 64 + prevTo] <- m
@@ -119,6 +131,13 @@ type Tables() =
             let b = max -ContHistD (min ContHistD bonus)
             let v = int cont1.[i]
             cont1.[i] <- int16 (v + b - v * (abs b) / ContHistD)
+
+    /// Gravity update of correction history (bonus pre-clamped by the caller; re-clamped for safety).
+    member _.UpdateCorr (c: Color) (pawnKey: uint64) (bonus: int) : unit =
+        let i = (c <<< 14) ||| int (pawnKey &&& 16383UL)
+        let b = max -CorrHistD (min CorrHistD bonus)
+        let v = int corr.[i]
+        corr.[i] <- int16 (v + b - v * (abs b) / CorrHistD)
 
     /// Gravity update of 2-ply continuation history (no-op when prevPc < 0).
     member _.UpdateCont2 (prevPc: int) (prevTo: int) (pc: Piece) (dst: Square) (bonus: int) : unit =
