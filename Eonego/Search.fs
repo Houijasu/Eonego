@@ -112,6 +112,12 @@ type SearchConfig =
       // unconditional +1 inflates every subtree containing a safe check. OFF by default (2026-07-02 A/B);
       // the flag preserves the legacy arm for SPRT.
       UseCheckExt: bool
+      // In-check qsearch: once one evasion has produced a non-mated score, skip the remaining QUIET
+      // evasions (captures still searched; the mate-detection path needs movesPlayed >= 1 and the cap
+      // can only fire after a move was searched, so it never masks a mate). Default OFF: measured a
+      // +35% suite-node REGRESSION at d14/d15 (2026-07-02) — the pessimistic leaf values it injects
+      // cost more tree than the skipped evasions save. Kept behind the flag for a future SPRT only.
+      UseQsEvasionCap: bool
       MoveOverhead: int
       // Phase 1: NNUE accumulator checkpoint cache. Set to 0 to disable; ~4 MiB is the recommended default
       // (1024 slots, ~4.1 KiB/slot). Cleared per search by `SearchControl.NewSearch` (alongside the TT gen
@@ -165,6 +171,7 @@ let defaultConfig =
       UseQsTt = true
       UseTtEvalAdjust = true
       UseCheckExt = false
+      UseQsEvasionCap = false
       MoveOverhead = 10
       AccCheckpointMb = 0
       DagHashMb = 0
@@ -723,20 +730,28 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
 
                 let prune =
                     usePruning
-                    && not inCheck
-                    && not (isPromotion m)
-                    && not (pos.GivesCheck m)
-                    && (not (pos.SeeGe m 1) // existing SEE prune
-                        // delta pruning: a capture that can't lift alpha even after winning the
-                        // piece (captures only — guard pieceType against an empty destination).
-                        || (cfg.UseDeltaPruning
-                            && (let dst = pos.PieceOn(toSq m) in
-                                (isEnPassant m || dst <> NoPiece)
-                                && (let capturedValue =
-                                        if isEnPassant m then pieceValueOf Pawn
-                                        else pieceValueOf (pieceType dst)
+                    && (if inCheck then
+                            // Quiet-evasion cap: `best` only rises above the mated band after a searched
+                            // evasion, so this can never leave a node move-less (see UseQsEvasionCap doc).
+                            cfg.UseQsEvasionCap
+                            && best > -MATE_IN_MAX_PLY
+                            && pos.PieceOn(toSq m) = NoPiece
+                            && not (isEnPassant m)
+                            && not (isPromotion m)
+                        else
+                            not (isPromotion m)
+                            && not (pos.GivesCheck m)
+                            && (not (pos.SeeGe m 1) // existing SEE prune
+                                // delta pruning: a capture that can't lift alpha even after winning the
+                                // piece (captures only — guard pieceType against an empty destination).
+                                || (cfg.UseDeltaPruning
+                                    && (let dst = pos.PieceOn(toSq m) in
+                                        (isEnPassant m || dst <> NoPiece)
+                                        && (let capturedValue =
+                                                if isEnPassant m then pieceValueOf Pawn
+                                                else pieceValueOf (pieceType dst)
 
-                                    rawEval + 200 + capturedValue <= alpha))))
+                                            rawEval + 200 + capturedValue <= alpha)))))
 
                 if legal && not prune then
                     movesPlayed <- movesPlayed + 1

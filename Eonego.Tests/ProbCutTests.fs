@@ -32,7 +32,8 @@ let private cfgBase =
         UseLmrTweaks = false
         UseAspTweaks = false
         UseQsTt = false
-        UseTtEvalAdjust = false }
+        UseTtEvalAdjust = false
+        UseQsEvasionCap = false }
 
 let private cfgOn = cfgBase                                         // UseProbCut = true
 let private cfgOff = { cfgBase with UseProbCut = false }

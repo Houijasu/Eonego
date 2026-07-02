@@ -203,6 +203,7 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
               UseQsTt = true
               UseTtEvalAdjust = true
               UseCheckExt = false
+              UseQsEvasionCap = false
               MoveOverhead = st.MoveOverhead
               AccCheckpointMb = 0
               // DAG node table disabled at every thread count: at 1T it measurably cost nps (~4-5%) AND
