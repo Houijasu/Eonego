@@ -549,12 +549,17 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     member _.SetupRoot() =
         pos.LoadFen control.RootFen
 
+        // Replay the game history BEFORE binding NNUE: with the net bound, every Make pushes an
+        // accumulator frame, and a `position ... moves` list longer than AccMaxPly (256) overflowed the
+        // frame stack (real crash: long games in a GUI / the match harness). Binding after the replay
+        // rebases the accumulator stack at the search root (EnableNnue materializes frame 0 from the
+        // current board), so search depth alone bounds frame usage.
+        for m in control.RootMoves do
+            pos.Make m
+
         match control.Net with
         | Some net -> Nnue.bindNnue net pos
         | None -> ()
-
-        for m in control.RootMoves do
-            pos.Make m
 
         // Phase 1: borrow the per-search checkpoint cache so `EnsureBothComputed` can probe/store snapshots
         // during the upcoming search. `null` disables the fast-path entirely. Seed the root snapshot now —
@@ -636,7 +641,9 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
         0
     elif ply > 0 && isImmediateDraw pos then
         0
-    elif ply >= MaxSearchPly || pos.StPly >= Position.AccStackLimit then
+    // Acc-frame guard on pos.Top (search frames since the root rebase), NOT StPly: StPly includes the
+    // GAME history, so after ~255 game plies the old guard bailed to a raw eval at every node.
+    elif ply >= MaxSearchPly || pos.Top >= Position.AccStackLimit then
         (if pos.InCheck then 0 else evalPos w pos)
     else
         let cfg = w.Control.Config
@@ -821,7 +828,9 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
         0
     elif ply > 0 && isImmediateDraw pos then
         0
-    elif ply >= MaxSearchPly || pos.StPly >= Position.AccStackLimit then
+    // Acc-frame guard on pos.Top (search frames since the root rebase), NOT StPly: StPly includes the
+    // GAME history, so after ~255 game plies the old guard bailed to a raw eval at every node.
+    elif ply >= MaxSearchPly || pos.Top >= Position.AccStackLimit then
         (if pos.InCheck then 0 else evalPos w pos)
     elif depthIn <= 0 then
         qsearch w pos alphaIn betaIn ply

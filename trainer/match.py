@@ -112,7 +112,7 @@ def gen_openings(root_fen, n, plies, seed):
     return out
 
 
-def play_game(root_fen, eng_white, eng_black, opening, go_cmd, max_plies=300):
+def play_game(root_fen, eng_white, eng_black, opening, go_cmd, max_plies=600):
     board = chess.Board(root_fen)
     for u in opening:
         board.push_uci(u)
@@ -184,6 +184,9 @@ def main():
     ap.add_argument("--beta", type=float, default=0.05)
     ap.add_argument("--sprt", action="store_true", help="enable early stop on SPRT bounds")
     ap.add_argument("--min-games", type=int, default=40)
+    ap.add_argument("--max-plies", type=int, default=600,
+                    help="adjudicate as draw past this many plies; use <=240 when a pre-2d3fd08 binary "
+                         "plays (their accumulator stack crashed past ~255 game plies)")
     args = ap.parse_args()
 
     if not os.path.exists(args.exe):
@@ -214,7 +217,7 @@ def main():
                 engA.newgame()
                 engB.newgame()
                 ew, eb = (engA, engB) if a_is_white else (engB, engA)
-                res = play_game(args.root, ew, eb, op, go_cmd)
+                res = play_game(args.root, ew, eb, op, go_cmd, max_plies=args.max_plies)
                 if res == "1/2-1/2":
                     D += 1
                 elif (res == "1-0") == a_is_white:

@@ -1335,7 +1335,9 @@ type Position() =
         (threatFnBothIn: System.Func<Position, int[], int[], int64>)
         (threatFnChangedBothIn: System.Func<Position, int[], int, int, int[], int[], int64>)
         =
-        Debug.Assert((stPly = 0), "EnableNnue must be called at the root (stPly = 0)")
+        // Callable at ANY stPly: it rebases the accumulator stack (top <- 0, frame 0 rebuilt from the
+        // CURRENT board), which is exactly what Worker.SetupRoot needs after replaying a long game
+        // history. The undo stack (states/stPly) is untouched — repetition detection keeps its keys.
         this.EnsureStorage()
         biases <- biasesIn
         halfWeights <- halfWeightsIn

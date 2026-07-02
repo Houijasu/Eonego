@@ -147,6 +147,26 @@ let ``TT-on score equals TT-off score at fixed depth (pruning off)`` (fen: strin
     Assert.Equal(s1, s2)
 
 [<Fact>]
+let ``search survives a game history longer than the accumulator stack`` () =
+    // Regression: SetupRoot bound NNUE before replaying `position ... moves`, so a history longer than
+    // AccMaxPly (256) overflowed the accumulator frame stack (IndexOutOfRange crash in long GUI/match
+    // games) — and the old StPly-based frame guard silently degraded every eval past ~255 game plies.
+    // 300 plies of knight shuffles, then a normal search, must produce a legal move. Net-dependent
+    // (frames are only pushed with NNUE active); soft-skip without the net file.
+    match tryLoadNet () with
+    | None -> ()
+    | Some net ->
+        let history =
+            [| for _ in 1..75 do
+                   yield mkMove 6 21 // g1f3
+                   yield mkMove 62 45 // g8f6
+                   yield mkMove 21 6 // f3g1
+                   yield mkMove 45 62 |] // f6g8
+
+        let struct (_, _, m) = searchToDepthNet StartPosFen history 4 defaultConfig (Some net)
+        Assert.NotEqual(MoveNone, m)
+
+[<Fact>]
 let ``mate in one is found with the correct ply-adjusted score`` () =
     let struct (score, _, m) =
         searchToDepth "k7/8/1K6/8/8/8/8/7R w - - 0 1" [||] 2 defaultConfig
