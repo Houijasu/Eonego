@@ -70,6 +70,13 @@ module PosProf =
     let mutable nBuild = 0L
     let mutable nEval = 0L
     let mutable maxThreatN = 0L // high-water mark of per-move physical dirty-threat edges (sizing data)
+    // Ensure-bucket sub-counters (2026-07-02 speed audit): where do the ~48%-of-wall catch-up walks go?
+    let mutable tEnumThreats = 0L // Threats enumeration calls (subset of tBuild — BuildFull/finny refresh)
+    let mutable tGather = 0L // EnsureChangedThreats (dirty-threat diff conversion; subset of tEnsure)
+    let mutable tApply = 0L // ApplyFrameFusedTo (gather + fused kernel; subset of tEnsure walks)
+    let mutable nEnumThreats = 0L
+    let mutable nGather = 0L // calls that did WORK (missed the per-frame changed cache)
+    let mutable nApply = 0L // perspective-frames materialized by walks
 
     let reset () =
         tMake <- 0L
@@ -82,6 +89,12 @@ module PosProf =
         nBuild <- 0L
         nEval <- 0L
         maxThreatN <- 0L
+        tEnumThreats <- 0L
+        tGather <- 0L
+        tApply <- 0L
+        nEnumThreats <- 0L
+        nGather <- 0L
+        nApply <- 0L
 
 // ---------------------------------------------------------------------------
 // Module-level static tables — built once via `do initTables ()`. These read ONLY Bitboard [<Literal>]
@@ -271,6 +284,18 @@ type Position() =
     let mutable halfPsqt: int[] = Array.empty
     let mutable threatWeights: sbyte[] = Array.empty
     let mutable threatPsqt: int[] = Array.empty
+    // 64B-alignment element offsets (2026-07-02): row 0 / frame 0 of the corresponding array starts at this
+    // element so that its address is 64B-aligned (allocAligned64/copyAligned64). Frame and row strides are
+    // all 64B multiples, so a single base offset aligns every frame/row. halfW/threatW come from the
+    // Network (EnableNnue); the accumulator-stack and finny bases are set by EnsureStorage.
+    let mutable halfWBase = 0
+    let mutable threatWBase = 0
+    let mutable accBaseW = 0
+    let mutable accBaseB = 0
+    let mutable psqBaseW = 0
+    let mutable psqBaseB = 0
+    let mutable finnyAccBase = 0
+    let mutable finnyPsqBase = 0
     let mutable threatFn: (System.Func<Position, int, int[], int>) | null = null
     let mutable threatFnBoth: (System.Func<Position, int[], int[], int64>) | null = null
     let mutable threatFnChangedBoth: (System.Func<Position, int[], int, int, int[], int[], int64>) | null = null
@@ -548,10 +573,21 @@ type Position() =
 
     member private _.EnsureStorage() =
         if Array.isEmpty accW then
-            accW <- Array.zeroCreate<int16> (AccMaxPly * Accumulator.L1)
-            accB <- Array.zeroCreate<int16> (AccMaxPly * Accumulator.L1)
-            psqW <- Array.zeroCreate (AccMaxPly * Accumulator.PsqtBuckets)
-            psqB <- Array.zeroCreate (AccMaxPly * Accumulator.PsqtBuckets)
+            // 64B-aligned + pinned: frame strides (2048B acc / 32B psqt) keep every frame's vector ops
+            // split-free once the base is aligned (psqt's 32B stride lands frames at 0 or 32 mod 64 —
+            // both fit a 32B load). Offsets fold into AccOff/PsqOff.
+            let struct (aW, aWOff) = Accumulator.allocAligned64<int16> (AccMaxPly * Accumulator.L1)
+            let struct (aB, aBOff) = Accumulator.allocAligned64<int16> (AccMaxPly * Accumulator.L1)
+            let struct (pW, pWOff) = Accumulator.allocAligned64<int> (AccMaxPly * Accumulator.PsqtBuckets)
+            let struct (pB, pBOff) = Accumulator.allocAligned64<int> (AccMaxPly * Accumulator.PsqtBuckets)
+            accW <- aW
+            accB <- aB
+            psqW <- pW
+            psqB <- pB
+            accBaseW <- aWOff
+            accBaseB <- aBOff
+            psqBaseW <- pWOff
+            psqBaseB <- pBOff
             computedW <- Array.zeroCreate AccMaxPly
             computedB <- Array.zeroCreate AccMaxPly
             // Delta payloads are PER-FRAME (offsets via DirtyOff/ThreatOff) — see the comment on those.
@@ -571,17 +607,24 @@ type Position() =
             frameWhiteKingMoved <- Array.zeroCreate AccMaxPly
             frameBlackKingMoved <- Array.zeroCreate AccMaxPly
             frameThreatOverflow <- Array.zeroCreate AccMaxPly
-            finnyAcc <- Array.zeroCreate (64 * 2 * Accumulator.L1)
-            finnyPsqt <- Array.zeroCreate (64 * 2 * Accumulator.PsqtBuckets)
+            let struct (fA, fAOff) = Accumulator.allocAligned64<int16> (64 * 2 * Accumulator.L1)
+            let struct (fP, fPOff) = Accumulator.allocAligned64<int> (64 * 2 * Accumulator.PsqtBuckets)
+            finnyAcc <- fA
+            finnyPsqt <- fP
+            finnyAccBase <- fAOff
+            finnyPsqBase <- fPOff
             // NoPiece <> 0: zeroCreate would claim a white pawn on every square (the Position.fs board-array
             // trap) — ResetFinny fills with NoPiece before first use; allocate only here.
             finnyBoard <- Array.zeroCreate (64 * 2 * 64)
 
+    // Per-color: the aligned bases of accW/accB (independent pinned allocations) generally differ.
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-    member private _.AccOff(frame: int) = frame * Accumulator.L1
+    member private _.AccOff (pColor: Color) (frame: int) =
+        (if pColor = White then accBaseW else accBaseB) + frame * Accumulator.L1
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-    member private _.PsqOff(frame: int) = frame * Accumulator.PsqtBuckets
+    member private _.PsqOff (pColor: Color) (frame: int) =
+        (if pColor = White then psqBaseW else psqBaseB) + frame * Accumulator.PsqtBuckets
 
     // Per-frame offsets into the delta-payload arrays. These MUST be frame-multiplied: the lazy catch-up
     // walk (EnsureComputed/EnsureBothComputedCore) replays SEVERAL frames' payloads, so flattening these to a
@@ -597,13 +640,21 @@ type Position() =
     member private this.EnumThreats(pColor: Color, buf: int[]) : int =
         match threatFn with
         | null -> 0
-        | f -> f.Invoke(this, pColor, buf)
+        | f ->
+            if PosProf.Enabled then
+                let profT0 = System.Diagnostics.Stopwatch.GetTimestamp()
+                let n = f.Invoke(this, pColor, buf)
+                PosProf.tEnumThreats <- PosProf.tEnumThreats + (System.Diagnostics.Stopwatch.GetTimestamp() - profT0)
+                PosProf.nEnumThreats <- PosProf.nEnumThreats + 1L
+                n
+            else
+                f.Invoke(this, pColor, buf)
 
     member private this.BuildHalf(pColor: Color, frame: int) =
         let acc = if pColor = White then accW else accB
         let psq = if pColor = White then psqW else psqB
-        let accOff = this.AccOff frame
-        let psqOff = this.PsqOff frame
+        let accOff = this.AccOff pColor frame
+        let psqOff = this.PsqOff pColor frame
         let ksq = this.KingSquare pColor
 
         for j in 0 .. Accumulator.L1 - 1 do
@@ -615,17 +666,17 @@ type Position() =
             let pc = board.[sq]
 
             if pc <> NoPiece then
-                Accumulator.addFeatureAt acc accOff psq psqOff halfWeights halfPsqt (Accumulator.makeIndex pColor pc sq ksq) 1 Accumulator.UseAvx2
+                Accumulator.addFeatureAt acc accOff psq psqOff halfWeights halfWBase halfPsqt (Accumulator.makeIndex pColor pc sq ksq) 1 Accumulator.UseAvx2
 
     member private this.AddActiveThreats(pColor: Color, frame: int) =
         let acc = if pColor = White then accW else accB
         let psq = if pColor = White then psqW else psqB
-        let accOff = this.AccOff frame
-        let psqOff = this.PsqOff frame
+        let accOff = this.AccOff pColor frame
+        let psqOff = this.PsqOff pColor frame
         let n = this.EnumThreats(pColor, tmpW)
 
         for k in 0 .. n - 1 do
-            Accumulator.addThreatAt acc accOff psq psqOff threatWeights threatPsqt tmpW.[k] 1 Accumulator.UseAvx2
+            Accumulator.addThreatAt acc accOff psq psqOff threatWeights threatWBase threatPsqt tmpW.[k] 1 Accumulator.UseAvx2
 
     member private this.BuildFull(pColor: Color, frame: int) =
         let profT0 =
@@ -648,17 +699,24 @@ type Position() =
             this.AddActiveThreats(White, frame)
             this.AddActiveThreats(Black, frame)
         | f ->
-            let packed = f.Invoke(this, tmpW, tmpB)
+            let packed =
+                if PosProf.Enabled then
+                    let enumT0 = System.Diagnostics.Stopwatch.GetTimestamp()
+                    let p = f.Invoke(this, tmpW, tmpB)
+                    PosProf.tEnumThreats <- PosProf.tEnumThreats + (System.Diagnostics.Stopwatch.GetTimestamp() - enumT0)
+                    PosProf.nEnumThreats <- PosProf.nEnumThreats + 1L
+                    p
+                else
+                    f.Invoke(this, tmpW, tmpB)
+
             let nW = int (packed >>> 32)
             let nB = int (packed &&& 0xFFFFFFFFL)
-            let accOff = this.AccOff frame
-            let psqOff = this.PsqOff frame
 
             for k in 0 .. nW - 1 do
-                Accumulator.addThreatAt accW accOff psqW psqOff threatWeights threatPsqt tmpW.[k] 1 Accumulator.UseAvx2
+                Accumulator.addThreatAt accW (this.AccOff White frame) psqW (this.PsqOff White frame) threatWeights threatWBase threatPsqt tmpW.[k] 1 Accumulator.UseAvx2
 
             for k in 0 .. nB - 1 do
-                Accumulator.addThreatAt accB accOff psqB psqOff threatWeights threatPsqt tmpB.[k] 1 Accumulator.UseAvx2
+                Accumulator.addThreatAt accB (this.AccOff Black frame) psqB (this.PsqOff Black frame) threatWeights threatWBase threatPsqt tmpB.[k] 1 Accumulator.UseAvx2
 
     member private this.BuildFullBoth(frame: int) =
         let profT0 =
@@ -787,6 +845,9 @@ type Position() =
             match threatFnChangedBoth with
             | null -> ()
             | f ->
+                let profT0 =
+                    if PosProf.Enabled then System.Diagnostics.Stopwatch.GetTimestamp() else 0L
+
                 let off = this.ThreatOff frame
                 let packed = f.Invoke(this, frameThreats, off, threatN, changedW, changedB)
                 let nW = int (packed >>> 32)
@@ -799,6 +860,10 @@ type Position() =
                 frameChangedKsqB.[frame] <- ksqB
                 frameChangedValid.[frame] <- true
 
+                if PosProf.Enabled then
+                    PosProf.tGather <- PosProf.tGather + (System.Diagnostics.Stopwatch.GetTimestamp() - profT0)
+                    PosProf.nGather <- PosProf.nGather + 1L
+
     /// Fused replay of ONE frame's deltas for one perspective: gather the frame's HalfKA dirty pieces and
     /// pre-converted signed threat rows (see EnsureChangedThreats -- callers run it first) into add/sub index
     /// lists, then apply them in a single register-tiled pass reading the accumulator at `srcFrame` and
@@ -806,6 +871,9 @@ type Position() =
     /// the fused kernel folds every row into one accumulator sweep regardless of pairing).
     /// PRE for the HalfKA index math: no own-king move inside `frame` (walk callers stop at refresh barriers).
     member private this.ApplyFrameFusedTo(pColor: Color, frame: int, srcFrame: int, dstFrame: int) =
+        let profT0 =
+            if PosProf.Enabled then System.Diagnostics.Stopwatch.GetTimestamp() else 0L
+
         let acc = if pColor = White then accW else accB
         let psq = if pColor = White then psqW else psqB
         let ksq = this.KingSquare pColor
@@ -845,16 +913,18 @@ type Position() =
 
         Accumulator.applyFused
             acc
-            (this.AccOff srcFrame)
+            (this.AccOff pColor srcFrame)
             acc
-            (this.AccOff dstFrame)
+            (this.AccOff pColor dstFrame)
             psq
-            (this.PsqOff srcFrame)
+            (this.PsqOff pColor srcFrame)
             psq
-            (this.PsqOff dstFrame)
+            (this.PsqOff pColor dstFrame)
             halfWeights
+            halfWBase
             halfPsqt
             threatWeights
+            threatWBase
             threatPsqt
             fusedHalfAdd
             nHalfAdd
@@ -866,17 +936,21 @@ type Position() =
             nThrSub
             Accumulator.UseAvx2
 
+        if PosProf.Enabled then
+            PosProf.tApply <- PosProf.tApply + (System.Diagnostics.Stopwatch.GetTimestamp() - profT0)
+            PosProf.nApply <- PosProf.nApply + 1L
+
     /// Re-seed every finny entry to the empty-board state (acc = biases, board = NoPiece). Called by
     /// EnableNnue only — entries are otherwise self-correcting via the board diff and survive unmakes and
     /// whole searches (path independence: HalfKA add/sub are exact modular inverses).
     member private _.ResetFinny() =
         for e in 0 .. 127 do
-            let aOff = e * Accumulator.L1
+            let aOff = finnyAccBase + e * Accumulator.L1
 
             for j in 0 .. Accumulator.L1 - 1 do
                 finnyAcc.[aOff + j] <- biases.[j]
 
-        System.Array.Clear(finnyPsqt, 0, finnyPsqt.Length)
+        System.Array.Clear(finnyPsqt, finnyPsqBase, 64 * 2 * Accumulator.PsqtBuckets)
         System.Array.Fill(finnyBoard, NoPiece)
 
     /// Finny pass 1: diff the entry for `pColor`'s CURRENT king square against the live board, fold the
@@ -885,8 +959,8 @@ type Position() =
     member private this.RefreshFinnyEntry(pColor: Color) : int =
         let ksq = this.KingSquare pColor
         let e = ksq * 2 + int pColor
-        let eAcc = e * Accumulator.L1
-        let ePsq = e * Accumulator.PsqtBuckets
+        let eAcc = finnyAccBase + e * Accumulator.L1
+        let ePsq = finnyPsqBase + e * Accumulator.PsqtBuckets
         let eB = e * 64
         let mutable nAdd = 0
         let mutable nSub = 0
@@ -919,8 +993,10 @@ type Position() =
                 finnyPsqt
                 ePsq
                 halfWeights
+                halfWBase
                 halfPsqt
                 threatWeights
+                threatWBase
                 threatPsqt
                 fusedHalfAdd
                 nAdd
@@ -942,16 +1018,18 @@ type Position() =
 
         Accumulator.applyFused
             finnyAcc
-            (e * Accumulator.L1)
+            (finnyAccBase + e * Accumulator.L1)
             acc
-            (this.AccOff frame)
+            (this.AccOff pColor frame)
             finnyPsqt
-            (e * Accumulator.PsqtBuckets)
+            (finnyPsqBase + e * Accumulator.PsqtBuckets)
             psq
-            (this.PsqOff frame)
+            (this.PsqOff pColor frame)
             halfWeights
+            halfWBase
             halfPsqt
             threatWeights
+            threatWBase
             threatPsqt
             fusedHalfAdd
             0
@@ -996,7 +1074,17 @@ type Position() =
 
             let eW = this.RefreshFinnyEntry White
             let eB = this.RefreshFinnyEntry Black
-            let packed = fb.Invoke(this, tmpW, tmpB)
+
+            let packed =
+                if PosProf.Enabled then
+                    let enumT0 = System.Diagnostics.Stopwatch.GetTimestamp()
+                    let p = fb.Invoke(this, tmpW, tmpB)
+                    PosProf.tEnumThreats <- PosProf.tEnumThreats + (System.Diagnostics.Stopwatch.GetTimestamp() - enumT0)
+                    PosProf.nEnumThreats <- PosProf.nEnumThreats + 1L
+                    p
+                else
+                    fb.Invoke(this, tmpW, tmpB)
+
             let nW = int (packed >>> 32)
             let nB = int (packed &&& 0xFFFFFFFFL)
             this.FinnyFoldToFrame(White, eW, frame, tmpW, nW)
@@ -1049,14 +1137,16 @@ type Position() =
             // instead of the O(distance) frame-delta walk below. Stored snapshots are bit-exact for any given
             // position regardless of the make/unmake path that reached it, so a hit is provably equivalent
             // to re-running the lazy walk.
-            let accOff = this.AccOff top
-            let psqOff = this.PsqOff top
+            let accOffW = this.AccOff White top
+            let accOffB = this.AccOff Black top
+            let psqOffW = this.PsqOff White top
+            let psqOffB = this.PsqOff Black top
 
             let cached =
                 match checkpoint with
                 | null -> false
                 | cache ->
-                    cache.TryProbe(this.Key, accW, accOff, accB, accOff, psqW, psqOff, psqB, psqOff)
+                    cache.TryProbe(this.Key, accW, accOffW, accB, accOffB, psqW, psqOffW, psqB, psqOffB)
 
             if cached then
                 computedW.[top] <- true
@@ -1070,11 +1160,39 @@ type Position() =
                     match checkpoint with
                     | null -> ()
                     | cache ->
-                        cache.Store(this.Key, accW, accOff, accB, accOff, psqW, psqOff, psqB, psqOff)
+                        cache.Store(this.Key, accW, accOffW, accB, accOffB, psqW, psqOffW, psqB, psqOffB)
 
             if PosProf.Enabled then
                 PosProf.tEnsure <- PosProf.tEnsure + (System.Diagnostics.Stopwatch.GetTimestamp() - profT0)
                 PosProf.nEnsure <- PosProf.nEnsure + 1L
+
+    /// EONEGO_PROF support: data-start address mod 64 for every hot accumulator/weight array (the 64B-
+    /// alignment audit premise check). All targets are LOH-resident, so a momentary pin reads a stable
+    /// address. Frame strides are 64B multiples (L1*2 = 2048B), so the base residue governs every frame.
+    member _.ProfAlignReport() : string =
+        // byteOff = the aligned base offset in BYTES (element offset * element size): the report shows the
+        // residue of the EFFECTIVE data start, so post-alignment every entry should read 0.
+        let m (name: string) (o: System.Array) (byteOff: int) =
+            if isNull (box o) then
+                name + "=?"
+            else
+                let h =
+                    System.Runtime.InteropServices.GCHandle.Alloc(o, System.Runtime.InteropServices.GCHandleType.Pinned)
+
+                let v = int ((h.AddrOfPinnedObject().ToInt64() + int64 byteOff) % 64L)
+                h.Free()
+                name + "=" + string v
+
+        m "accW" accW (accBaseW * 2)
+        + " " + m "accB" accB (accBaseB * 2)
+        + " " + m "psqW" psqW (psqBaseW * 4)
+        + " " + m "psqB" psqB (psqBaseB * 4)
+        + " " + m "finnyAcc" finnyAcc (finnyAccBase * 2)
+        + " " + m "finnyPsqt" finnyPsqt (finnyPsqBase * 4)
+        + " " + m "halfW" halfWeights (halfWBase * 2)
+        + " " + m "halfPsqt" halfPsqt 0
+        + " " + m "thrW" threatWeights threatWBase
+        + " " + m "thrPsqt" threatPsqt 0
 
     /// Bind the per-worker checkpoint cache. Pass `null` to disable (tests, from-scratch eval, etc.).
     /// `SearchControl` owns the table lifecycle; this Position merely holds a borrowed reference for the
@@ -1099,9 +1217,17 @@ type Position() =
             match checkpoint with
             | null -> ()
             | cache ->
-                let accOff = this.AccOff top
-                let psqOff = this.PsqOff top
-                cache.Store(this.Key, accW, accOff, accB, accOff, psqW, psqOff, psqB, psqOff)
+                cache.Store(
+                    this.Key,
+                    accW,
+                    this.AccOff White top,
+                    accB,
+                    this.AccOff Black top,
+                    psqW,
+                    this.PsqOff White top,
+                    psqB,
+                    this.PsqOff Black top
+                )
 
     /// Phase 1 — the unchanged frame-walk materialization used when the checkpoint cache misses (or is
     /// null). Byte-for-byte identical to the pre-Phase-1 `EnsureBothComputed`; retained verbatim so that
@@ -1150,44 +1276,46 @@ type Position() =
         this.EnsureComputed pColor
         let m = if pColor = White then accW else accB
         let mp = if pColor = White then psqW else psqB
-        System.Span<int16>(m, this.AccOff top, Accumulator.L1).CopyTo(acc)
-        System.Span<int>(mp, this.PsqOff top, Accumulator.PsqtBuckets).CopyTo(psqt)
+        System.Span<int16>(m, this.AccOff pColor top, Accumulator.L1).CopyTo(acc)
+        System.Span<int>(mp, this.PsqOff pColor top, Accumulator.PsqtBuckets).CopyTo(psqt)
 
     member this.AccSpan(pColor: Color) : System.Span<int16> =
         this.EnsureComputed pColor
         let m = if pColor = White then accW else accB
-        System.Span<int16>(m, this.AccOff top, Accumulator.L1)
+        System.Span<int16>(m, this.AccOff pColor top, Accumulator.L1)
 
     member this.PsqtSpan(pColor: Color) : System.Span<int> =
         this.EnsureComputed pColor
         let mp = if pColor = White then psqW else psqB
-        System.Span<int>(mp, this.PsqOff top, Accumulator.PsqtBuckets)
+        System.Span<int>(mp, this.PsqOff pColor top, Accumulator.PsqtBuckets)
 
     member this.AccSpanComputed(pColor: Color) : System.Span<int16> =
         let m = if pColor = White then accW else accB
-        System.Span<int16>(m, this.AccOff top, Accumulator.L1)
+        System.Span<int16>(m, this.AccOff pColor top, Accumulator.L1)
 
     member this.PsqtSpanComputed(pColor: Color) : System.Span<int> =
         let mp = if pColor = White then psqW else psqB
-        System.Span<int>(mp, this.PsqOff top, Accumulator.PsqtBuckets)
+        System.Span<int>(mp, this.PsqOff pColor top, Accumulator.PsqtBuckets)
 
     /// Compatibility escape hatch for tests/probes that still want an array. Prefer AccSpan in hot code.
     member this.AccArray(pColor: Color) : int16[] =
         this.EnsureComputed pColor
         let src = if pColor = White then accW else accB
-        src.[this.AccOff top .. this.AccOff top + Accumulator.L1 - 1]
+        src.[this.AccOff pColor top .. this.AccOff pColor top + Accumulator.L1 - 1]
 
     member this.PsqtArray(pColor: Color) : int[] =
         this.EnsureComputed pColor
         let src = if pColor = White then psqW else psqB
-        src.[this.PsqOff top .. this.PsqOff top + Accumulator.PsqtBuckets - 1]
+        src.[this.PsqOff pColor top .. this.PsqOff pColor top + Accumulator.PsqtBuckets - 1]
 
     /// Bind weights + threat enumerators + materialize root. ROOT ONLY.
     member this.EnableNnue
         (biasesIn: int16[])
         (halfWeightsIn: int16[])
+        (halfWOffIn: int)
         (halfPsqtIn: int[])
         (threatWeightsIn: sbyte[])
+        (threatWOffIn: int)
         (threatPsqtIn: int[])
         (threatFnIn: System.Func<Position, int, int[], int>)
         (threatFnBothIn: System.Func<Position, int[], int[], int64>)
@@ -1197,8 +1325,10 @@ type Position() =
         this.EnsureStorage()
         biases <- biasesIn
         halfWeights <- halfWeightsIn
+        halfWBase <- halfWOffIn
         halfPsqt <- halfPsqtIn
         threatWeights <- threatWeightsIn
+        threatWBase <- threatWOffIn
         threatPsqt <- threatPsqtIn
         threatFn <- threatFnIn
         threatFnBoth <- threatFnBothIn

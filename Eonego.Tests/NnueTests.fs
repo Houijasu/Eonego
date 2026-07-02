@@ -99,8 +99,10 @@ let ``loads to EOF with the FullThreats version`` () =
 let ``feature-transformer arrays have the dual-input FullThreats dimensions`` () =
     withNet (fun net ->
         Assert.Equal(L1, net.FtBiases.Length)
-        Assert.Equal(HalfKaDims * L1, net.Weights.Length)
-        Assert.Equal(ThreatDims * L1, net.ThreatWeights.Length)
+        // The two big FT tables are re-homed into 64B-aligned pinned buffers with a <=64B pad: assert the
+        // usable (offset) region has the exact dimensions and the aligned base really is 64B-aligned.
+        Assert.True(net.WOff >= 0 && net.WOff + HalfKaDims * L1 <= net.Weights.Length)
+        Assert.True(net.ThreatWOff >= 0 && net.ThreatWOff + ThreatDims * L1 <= net.ThreatWeights.Length)
         Assert.Equal(HalfKaDims * PsqtBuckets, net.PsqtWeights.Length)
         Assert.Equal(ThreatDims * PsqtBuckets, net.ThreatPsqtWeights.Length))
 
@@ -308,8 +310,10 @@ let ``changed threat conversion defers to eval under lazy, fires during make und
         bound.EnableNnue
             net.FtBiases
             net.Weights
+            net.WOff
             net.PsqtWeights
             net.ThreatWeights
+            net.ThreatWOff
             net.ThreatPsqtWeights
             (System.Func<Position, int, int[], int>(fun p persp buf -> Eonego.Threats.appendActiveThreats persp p buf))
             (System.Func<Position, int[], int[], int64>(fun p bw bb -> Eonego.Threats.appendActiveThreatsBoth p bw bb))

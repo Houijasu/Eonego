@@ -57,8 +57,8 @@ let ``addThreat AVX2 equals scalar over random rows`` () =
     for _ in 0 .. 200 do
         let idx = rng.Next(0, nFeatures)
         let sign = if rng.Next(0, 2) = 0 then 1 else -1
-        addThreatAt accA 0 psqtA 0 threatWeights threatPsqt idx sign false
-        addThreatAt accB 0 psqtB 0 threatWeights threatPsqt idx sign true
+        addThreatAt accA 0 psqtA 0 threatWeights 0 threatPsqt idx sign false
+        addThreatAt accB 0 psqtB 0 threatWeights 0 threatPsqt idx sign true
 
     Assert.Equal<int16[]>(accA, accB) // scalar==AVX2 wrap agreement through int16 overflow
     Assert.Equal<int[]>(psqtA, psqtB)
@@ -102,17 +102,17 @@ let ``applyFused equals sequential reference kernels (in-place, src->dst, chunke
                     addFeature refAcc refPsq halfW halfPsqt idx -1 useAvx2
 
                 for idx in thrAdd do
-                    addThreatAt refAcc 0 refPsq 0 thrW thrPsqt idx 1 useAvx2
+                    addThreatAt refAcc 0 refPsq 0 thrW 0 thrPsqt idx 1 useAvx2
 
                 for idx in thrSub do
-                    addThreatAt refAcc 0 refPsq 0 thrW thrPsqt idx -1 useAvx2
+                    addThreatAt refAcc 0 refPsq 0 thrW 0 thrPsqt idx -1 useAvx2
 
                 // Fused, parent->child: dst is a separate buffer.
                 let dst = Array.zeroCreate<int16> L1
                 let dstPsq = Array.zeroCreate<int> PsqtBuckets
 
                 applyFused
-                    src 0 dst 0 srcPsq 0 dstPsq 0 halfW halfPsqt thrW thrPsqt
+                    src 0 dst 0 srcPsq 0 dstPsq 0 halfW 0 halfPsqt thrW 0 thrPsqt
                     halfAdd nHA halfSub nHS thrAdd nTA thrSub nTS useAvx2
 
                 Assert.Equal<int16[]>(refAcc, dst)
@@ -123,7 +123,7 @@ let ``applyFused equals sequential reference kernels (in-place, src->dst, chunke
                 let inPlacePsq = Array.copy srcPsq
 
                 applyFused
-                    inPlace 0 inPlace 0 inPlacePsq 0 inPlacePsq 0 halfW halfPsqt thrW thrPsqt
+                    inPlace 0 inPlace 0 inPlacePsq 0 inPlacePsq 0 halfW 0 halfPsqt thrW 0 thrPsqt
                     halfAdd nHA halfSub nHS thrAdd nTA thrSub nTS useAvx2
 
                 Assert.Equal<int16[]>(refAcc, inPlace)

@@ -108,8 +108,10 @@ type Network =
       Desc: string
       FtHash: uint32
       FtBiases: int16[] // L1
-      Weights: int16[] // HalfKaDims * L1   (HalfKA -> accumulator, row-major [feature][L1])
-      ThreatWeights: sbyte[] // ThreatDims * L1   (Threats -> accumulator, row-major [feature][L1])
+      Weights: int16[] // HalfKaDims * L1   (HalfKA -> accumulator, row-major [feature][L1]; 64B-aligned at WOff)
+      WOff: int // element offset of row 0 in Weights (allocAligned64 pad — every 2KB row is 64B-aligned)
+      ThreatWeights: sbyte[] // ThreatDims * L1   (Threats -> accumulator, row-major [feature][L1]; aligned at ThreatWOff)
+      ThreatWOff: int // element offset of row 0 in ThreatWeights (every 1KB row is 64B-aligned)
       PsqtWeights: int[] // HalfKaDims * PsqtBuckets
       ThreatPsqtWeights: int[] // ThreatDims * PsqtBuckets
       Stacks: LayerStack[] }
@@ -282,14 +284,22 @@ let loadBytes (buf: byte[]) : LoadResult =
                 if not c.AtEnd then
                     Failed("trailing " + string c.Remaining + " bytes after parse (layout mismatch)")
                 else
+                    // Re-home the two big row-major FT tables into 64B-aligned pinned buffers (rows are
+                    // 2KB/1KB = 64B multiples, so aligning row 0 aligns every row). The raw parse arrays
+                    // become garbage; the one-time extra copy is ~106 MB at load.
+                    let struct (weightsAl, wOff) = Eonego.Accumulator.copyAligned64 weights
+                    let struct (threatWeightsAl, twOff) = Eonego.Accumulator.copyAligned64 threatWeights
+
                     Loaded
                         { Version = version
                           Hash = hash
                           Desc = desc
                           FtHash = ftHash
                           FtBiases = ftBiases
-                          Weights = weights
-                          ThreatWeights = threatWeights
+                          Weights = weightsAl
+                          WOff = wOff
+                          ThreatWeights = threatWeightsAl
+                          ThreatWOff = twOff
                           PsqtWeights = psqtWeights
                           ThreatPsqtWeights = threatPsqt
                           Stacks = stacks }
@@ -339,7 +349,7 @@ let private buildAcc (net: Network) (pos: Position) (pColor: Color) (acc: Span<i
 
         if pc <> NoPiece then
             let idx = Accumulator.makeIndex pColor pc sq ksq
-            let wb = idx * L1
+            let wb = net.WOff + idx * L1
 
             for j in 0 .. L1 - 1 do
                 acc.[j] <- acc.[j] + int net.Weights.[wb + j]
@@ -355,7 +365,7 @@ let private buildAcc (net: Network) (pos: Position) (pColor: Color) (acc: Span<i
 
     for k in 0 .. n - 1 do
         let idx = tbuf.[k]
-        let wb = idx * L1
+        let wb = net.ThreatWOff + idx * L1
 
         for j in 0 .. L1 - 1 do
             acc.[j] <- acc.[j] + int net.ThreatWeights.[wb + j]
@@ -756,8 +766,10 @@ let bindNnue (net: Network) (pos: Position) : unit =
     pos.EnableNnue
         net.FtBiases
         net.Weights
+        net.WOff
         net.PsqtWeights
         net.ThreatWeights
+        net.ThreatWOff
         net.ThreatPsqtWeights
         (System.Func<Position, int, int[], int>(fun p persp buf -> Threats.appendActiveThreats persp p buf))
         (System.Func<Position, int[], int[], int64>(fun p bw bb -> Threats.appendActiveThreatsBoth p bw bb))

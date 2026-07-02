@@ -1899,6 +1899,19 @@ let go (control: SearchControl) : Move =
             + " maxThreatN=" + string PosProf.maxThreatN
         )
 
+        // Ensure-bucket decomposition (all ⊂ ensureMs; enumMs ⊂ buildMs): walk applies vs dirty-threat
+        // gathers vs refresh threat enumeration, with call counts for per-op costs.
+        writeLine (
+            "info string prof2 applyMs=" + ms PosProf.tApply
+            + " gatherMs=" + ms PosProf.tGather
+            + " enumMs=" + ms PosProf.tEnumThreats
+            + " nApply=" + string PosProf.nApply
+            + " nGather=" + string PosProf.nGather
+            + " nEnum=" + string PosProf.nEnumThreats
+        )
+
+        writeLine ("info string prof3 align " + workers.[0].Pos.ProfAlignReport())
+
     let rb = workers.[0].RootBest
 
     let best =

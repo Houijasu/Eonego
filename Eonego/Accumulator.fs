@@ -22,6 +22,27 @@ let PsqtBuckets = 8
 let UseAvx2 =
     Avx2.IsSupported && System.Environment.GetEnvironmentVariable("EONEGO_FORCE_SCALAR") <> "1"
 
+/// Pinned (POH) allocation whose usable region starts 64-byte aligned: returns the array plus the element
+/// offset of the aligned region. Managed array bases land at arbitrary 8B residues (measured 16/24/32/40/56
+/// mod 64 on this runtime), which makes ~50% of the 32B accumulator/weight-row vector ops split cache lines;
+/// pinning makes the address — and therefore the alignment — stable for the array's lifetime.
+let allocAligned64<'T when 'T: unmanaged> (len: int) : struct ('T[] * int) =
+    let arr = System.GC.AllocateArray<'T>(len + 64 / sizeof<'T>, true)
+
+    let h =
+        System.Runtime.InteropServices.GCHandle.Alloc(arr, System.Runtime.InteropServices.GCHandleType.Pinned)
+
+    let addr = h.AddrOfPinnedObject().ToInt64()
+    h.Free()
+    let offBytes = int ((64L - addr % 64L) % 64L)
+    struct (arr, offBytes / sizeof<'T>)
+
+/// Copy `src` into a fresh 64B-aligned pinned array (see allocAligned64); returns (array, element offset).
+let copyAligned64<'T when 'T: unmanaged> (src: 'T[]) : struct ('T[] * int) =
+    let struct (arr, off) = allocAligned64<'T> src.Length
+    System.Array.Copy(src, 0, arr, off, src.Length)
+    struct (arr, off)
+
 let private psWhite = [| 0; 128; 256; 384; 512; 640; 64; 192; 320; 448; 576; 640 |]
 let private psBlack = [| 64; 192; 320; 448; 576; 640; 0; 128; 256; 384; 512; 640 |]
 
@@ -99,12 +120,13 @@ let addFeatureAt
     (psqt: int[])
     (psqtOff: int)
     (ftWeights: int16[])
+    (ftWOff: int)
     (ftPsqt: int[])
     (idx: int)
     (sign: int)
     (useAvx2: bool)
     =
-    let wb = idx * L1
+    let wb = ftWOff + idx * L1
 
     if useAvx2 then
         // Base-ref + element-offset loads/stores skip the per-iteration array bounds checks the JIT can't elide
@@ -177,7 +199,7 @@ let addFeaturePairAt
 /// Zero-offset compatibility wrapper.
 [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
 let addFeature (acc: int16[]) (psqt: int[]) (ftWeights: int16[]) (ftPsqt: int[]) (idx: int) (sign: int) (useAvx2: bool) =
-    addFeatureAt acc 0 psqt 0 ftWeights ftPsqt idx sign useAvx2
+    addFeatureAt acc 0 psqt 0 ftWeights 0 ftPsqt idx sign useAvx2
 
 /// As addFeatureAt but for a FullThreats feature (int8 weights -> int16 accumulator, int32 psqt).
 [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
@@ -187,12 +209,13 @@ let addThreatAt
     (psqt: int[])
     (psqtOff: int)
     (threatWeights: sbyte[])
+    (thrWOff: int)
     (threatPsqt: int[])
     (idx: int)
     (sign: int)
     (useAvx2: bool)
     =
-    let wb = idx * L1
+    let wb = thrWOff + idx * L1
 
     if useAvx2 then
         // sign-extend int8 weights to int16 (vpmovsxbw) and add/subtract 16 int16 lanes at a time; base-ref +
@@ -329,7 +352,7 @@ let addThreatPair2At
 /// Zero-offset compatibility wrapper.
 [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
 let addThreat (acc: int16[]) (psqt: int[]) (threatWeights: sbyte[]) (threatPsqt: int[]) (idx: int) (sign: int) =
-    addThreatAt acc 0 psqt 0 threatWeights threatPsqt idx sign UseAvx2
+    addThreatAt acc 0 psqt 0 threatWeights 0 threatPsqt idx sign UseAvx2
 
 // ---------------------------------------------------------------------------
 // Fused apply: ONE register-tiled pass over the accumulator applying ALL of a
@@ -367,8 +390,10 @@ let private applyFusedPass
     (dstPsq: int[])
     (dstPsqOff: int)
     (halfW: int16[])
+    (hwOff: int)
     (halfPsqt: int[])
     (thrW: sbyte[])
+    (twOff: int)
     (thrPsqt: int[])
     (halfAdd: int[])
     (haOff: int)
@@ -404,7 +429,7 @@ let private applyFusedPass
             let mutable k = 0
 
             while k < haN do
-                let rb = halfAdd.[haOff + k] * L1 + t
+                let rb = hwOff + halfAdd.[haOff + k] * L1 + t
                 a0 <- Avx2.Add(a0, Vector256.LoadUnsafe(&hwBase, unativeint rb))
                 a1 <- Avx2.Add(a1, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 16)))
                 a2 <- Avx2.Add(a2, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 32)))
@@ -414,7 +439,7 @@ let private applyFusedPass
             k <- 0
 
             while k < hsN do
-                let rb = halfSub.[hsOff + k] * L1 + t
+                let rb = hwOff + halfSub.[hsOff + k] * L1 + t
                 a0 <- Avx2.Subtract(a0, Vector256.LoadUnsafe(&hwBase, unativeint rb))
                 a1 <- Avx2.Subtract(a1, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 16)))
                 a2 <- Avx2.Subtract(a2, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 32)))
@@ -424,7 +449,7 @@ let private applyFusedPass
             k <- 0
 
             while k < taN do
-                let rb = thrAdd.[taOff + k] * L1 + t
+                let rb = twOff + thrAdd.[taOff + k] * L1 + t
                 a0 <- Avx2.Add(a0, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint rb)))
                 a1 <- Avx2.Add(a1, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 16))))
                 a2 <- Avx2.Add(a2, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 32))))
@@ -434,7 +459,7 @@ let private applyFusedPass
             k <- 0
 
             while k < tsN do
-                let rb = thrSub.[tsOff + k] * L1 + t
+                let rb = twOff + thrSub.[tsOff + k] * L1 + t
                 a0 <- Avx2.Subtract(a0, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint rb)))
                 a1 <- Avx2.Subtract(a1, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 16))))
                 a2 <- Avx2.Subtract(a2, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 32))))
@@ -453,16 +478,16 @@ let private applyFusedPass
             let mutable s = int srcAcc.[srcOff + j]
 
             for k in 0 .. haN - 1 do
-                s <- s + int halfW.[halfAdd.[haOff + k] * L1 + j]
+                s <- s + int halfW.[hwOff + halfAdd.[haOff + k] * L1 + j]
 
             for k in 0 .. hsN - 1 do
-                s <- s - int halfW.[halfSub.[hsOff + k] * L1 + j]
+                s <- s - int halfW.[hwOff + halfSub.[hsOff + k] * L1 + j]
 
             for k in 0 .. taN - 1 do
-                s <- s + int thrW.[thrAdd.[taOff + k] * L1 + j]
+                s <- s + int thrW.[twOff + thrAdd.[taOff + k] * L1 + j]
 
             for k in 0 .. tsN - 1 do
-                s <- s - int thrW.[thrSub.[tsOff + k] * L1 + j]
+                s <- s - int thrW.[twOff + thrSub.[tsOff + k] * L1 + j]
 
             dstAcc.[dstOff + j] <- int16 s
 
@@ -497,8 +522,10 @@ let applyFused
     (dstPsq: int[])
     (dstPsqOff: int)
     (halfW: int16[])
+    (hwOff: int)
     (halfPsqt: int[])
     (thrW: sbyte[])
+    (twOff: int)
     (thrPsqt: int[])
     (halfAdd: int[])
     (nHalfAdd: int)
@@ -522,7 +549,7 @@ let applyFused
     if total <= FusedMaxRowsPerPass then
         applyFusedPass
             srcAcc srcOff dstAcc dstOff srcPsq srcPsqOff dstPsq dstPsqOff
-            halfW halfPsqt thrW thrPsqt
+            halfW hwOff halfPsqt thrW twOff thrPsqt
             halfAdd 0 nHalfAdd halfSub 0 nHalfSub thrAdd 0 nThrAdd thrSub 0 nThrSub
             useAvx2
     else
@@ -547,13 +574,13 @@ let applyFused
             if first then
                 applyFusedPass
                     srcAcc srcOff dstAcc dstOff srcPsq srcPsqOff dstPsq dstPsqOff
-                    halfW halfPsqt thrW thrPsqt
+                    halfW hwOff halfPsqt thrW twOff thrPsqt
                     halfAdd haO haN halfSub hsO hsN thrAdd taO taN thrSub tsO tsN
                     useAvx2
             else
                 applyFusedPass
                     dstAcc dstOff dstAcc dstOff dstPsq dstPsqOff dstPsq dstPsqOff
-                    halfW halfPsqt thrW thrPsqt
+                    halfW hwOff halfPsqt thrW twOff thrPsqt
                     halfAdd haO haN halfSub hsO hsN thrAdd taO taN thrSub tsO tsN
                     useAvx2
 
