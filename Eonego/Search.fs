@@ -102,6 +102,11 @@ type SearchConfig =
       // skips repeated NNUE evals; the cutoff changes tree shape (suite-total nodes -3..-9% at d13-d15,
       // per-position volatile) — keep it toggleable for SPRT.
       UseQsTt: bool
+      // A bound-consistent TT score replaces the raw static eval as the WORKING eval that RFP/razoring/
+      // NMP (and the qsearch stand-pat) prune on — a real search result is tighter than a heuristic eval.
+      // Stack.StaticEval, `improving`, move-loop futility and every TT store keep the RAW eval (SF's
+      // `unadjustedStaticEval` contract; correction history depends on it staying raw).
+      UseTtEvalAdjust: bool
       MoveOverhead: int
       // Phase 1: NNUE accumulator checkpoint cache. Set to 0 to disable; ~4 MiB is the recommended default
       // (1024 slots, ~4.1 KiB/slot). Cleared per search by `SearchControl.NewSearch` (alongside the TT gen
@@ -153,6 +158,7 @@ let defaultConfig =
       UseLmrTweaks = true
       UseAspTweaks = true
       UseQsTt = true
+      UseTtEvalAdjust = true
       MoveOverhead = 10
       AccCheckpointMb = 0
       DagHashMb = 0
@@ -660,8 +666,23 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
             // Stand-pat: reuse the TT-stored static eval when present (it is the same deterministic
             // evalPos value qsearch would recompute and store), mirroring negamax. Bit-exact, skips the
             // NNUE forward on a TT hit.
-            let sp = if ttEval <> VALUE_NONE then ttEval else evalPos w pos
-            rawEval <- sp
+            let rawSp = if ttEval <> VALUE_NONE then ttEval else evalPos w pos
+            rawEval <- rawSp
+
+            // TT score as a better stand-pat (same bound-consistency rule as negamax step 3b). rawEval —
+            // what a fail-high store below and the post-move-loop store persist — stays the raw eval.
+            let sp =
+                if
+                    usePruning
+                    && cfg.UseTtEvalAdjust
+                    && ttHit
+                    && abs ttScore < MATE_IN_MAX_PLY
+                    && (ttBound &&& (if ttScore > rawSp then BoundLower else BoundUpper)) <> 0
+                then
+                    ttScore
+                else
+                    rawSp
+
             best <- sp
 
             if sp >= beta then
@@ -878,14 +899,31 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                 && (let prev2 = w.Stack.[ssCur - 2].StaticEval in
                     prev2 = VALUE_NONE || staticEval > prev2)
 
+        // 3b. TT score as a better WORKING eval: a bound-consistent search score is tighter than the
+        //     heuristic static eval, so RFP/razoring/NMP below prune against it. Only this local —
+        //     Stack.StaticEval (already stored raw above), `improving`, the move-loop futility gate and
+        //     the TT store all keep the RAW eval (SF's `unadjustedStaticEval` contract).
+        let mutable workingEval = staticEval
+
+        if
+            not produced
+            && usePruning
+            && cfg.UseTtEvalAdjust
+            && not inCheck
+            && ttHit
+            && abs ttScore < MATE_IN_MAX_PLY
+            && (ttBound &&& (if ttScore > staticEval then BoundLower else BoundUpper)) <> 0
+        then
+            workingEval <- ttScore
+
         // 4. pruning block (gated, non-PV, not in check; disabled during a singular exclusion search)
         if not produced && usePruning && not isPv && not inCheck && excludedMove = MoveNone then
             if
                 depthIn <= 6
-                && staticEval - 120 * depthIn - (if ttPv then 20 else 0) >= beta
+                && workingEval - 120 * depthIn - (if ttPv then 20 else 0) >= beta
                 && abs beta < MATE_IN_MAX_PLY
             then
-                result <- staticEval
+                result <- workingEval
                 produced <- true
             // razoring: at shallow depth a static eval far below alpha is verified by qsearch;
             // if even captures can't lift alpha, fail low. Mutually exclusive with RFP/null-move.
@@ -893,7 +931,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                 cfg.UseRazoring
                 && depthIn <= 3
                 && abs alpha < MATE_IN_MAX_PLY
-                && staticEval + (240 + 200 * depthIn) <= alpha
+                && workingEval + (240 + 200 * depthIn) <= alpha
             then
                 let v = qsearch w pos alpha (alpha + 1) ply
 
@@ -904,10 +942,10 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                 depthIn >= 3
                 && ply >= w.NmpMinPly
                 && pos.PliesFromNull > 0
-                && staticEval >= beta
+                && workingEval >= beta
                 && hasNonPawnMaterial pos
             then
-                let r = 3 + depthIn / 4 + (if staticEval - beta > 200 then 1 else 0)
+                let r = 3 + depthIn / 4 + (if workingEval - beta > 200 then 1 else 0)
                 w.Stack.[ssCur].CurrentMove <- MoveNull
                 w.Stack.[ssCur].MovedPiece <- NoPiece
                 pos.MakeNull()
