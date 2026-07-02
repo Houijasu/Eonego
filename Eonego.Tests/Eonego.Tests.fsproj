@@ -30,6 +30,7 @@
     <Compile Include="SearchTests.fs" />
     <Compile Include="DrawDetectionTests.fs" />
     <Compile Include="LazySmpTests.fs" />
+    <Compile Include="VotingTests.fs" />
     <Compile Include="ProbCutTests.fs" />
     <Compile Include="PruningTests.fs" />
     <Compile Include="SingularTests.fs" />

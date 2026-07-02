@@ -72,6 +72,10 @@ let DoubleExtMargin = envInt "EONEGO_T_SING_DBL" 16 1 200
 // --- Aspiration: initial delta = Init + prev^2/SqDiv ---
 let AspInitDelta = envInt "EONEGO_T_ASP_INIT" 10 1 100
 let AspSqDiv = envInt "EONEGO_T_ASP_SQDIV" 15000 1000 100000
+// A3 diversity rider: odd-id helper workers ADD this to their initial aspiration delta (0 = off,
+// byte-identical legacy behaviour). Widens helper windows so LazySMP threads diverge by design
+// instead of only by TT-arrival races.
+let HelperAspOffset = envInt "EONEGO_T_HELPER_ASP" 0 0 100
 
 // --- Correction history: applied = entry/ApplyDiv; update bonus = clamp(err*depth/DepthDiv, ±Clamp) ---
 let CorrApplyDiv = envInt "EONEGO_T_CORR_DIV" 16 1 256

@@ -1600,6 +1600,11 @@ let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
                 else
                     16
 
+            // A3 diversity rider (EONEGO_T_HELPER_ASP > 0): odd-id helpers search a wider initial
+            // window, so LazySMP threads diverge by construction rather than only by TT races.
+            if Tunables.HelperAspOffset > 0 && not w.IsMain && w.Id % 2 = 1 then
+                delta <- delta + Tunables.HelperAspOffset
+
             let fullWindow = depth <= 4 || abs prev >= MATE_IN_MAX_PLY
             let mutable alpha = if fullWindow then -INF else max (-INF) (prev - delta)
             let mutable beta = if fullWindow then INF else min INF (prev + delta)
@@ -1871,6 +1876,71 @@ let computeTimes (moveOverhead: int) (l: SearchLimits) (stm: Color) : int64 * in
 // ---------------------------------------------------------------------------
 // LazySMP orchestration. Returns the chosen best move (and prints `bestmove`).
 // ---------------------------------------------------------------------------
+/// SF-style thread vote over the workers' published root results (classic LazySMP only). Returns the
+/// index of the worker whose (move, score, depth) the search should report. Voters are workers that
+/// completed at least one iteration; each contributes (score − minScore + 40) × depth to its move's
+/// tally. Deterministic: ties prefer the first-encountered move, then the deepest voter for the winning
+/// move, then the higher score, then the lowest worker index. Mate override: a voter holding a proven
+/// mate wins outright (deepest proof = highest score) — consensus must not outvote a proof.
+/// Pure over parallel arrays so tests can drive it without workers (cold path; runs once per `go`).
+let internal voteBest (moves: Move[]) (scores: int[]) (depths: int[]) (n: int) : int =
+    let inline isVoter i = depths.[i] > 0 && moves.[i] <> MoveNone
+
+    let mutable mate = -1
+
+    for i in 0 .. n - 1 do
+        if isVoter i && scores.[i] >= MATE_IN_MAX_PLY && (mate < 0 || scores.[i] > scores.[mate]) then
+            mate <- i
+
+    if mate >= 0 then
+        mate
+    else
+        let mutable minScore = System.Int32.MaxValue
+        let mutable nVoters = 0
+
+        for i in 0 .. n - 1 do
+            if isVoter i then
+                nVoters <- nVoters + 1
+                minScore <- min minScore scores.[i]
+
+        if nVoters = 0 then
+            0
+        else
+            let inline voteOf (m: Move) =
+                let mutable v = 0L
+
+                for j in 0 .. n - 1 do
+                    if isVoter j && moves.[j] = m then
+                        v <- v + int64 (scores.[j] - minScore + 40) * int64 depths.[j]
+
+                v
+
+            let mutable win = -1
+            let mutable winVote = System.Int64.MinValue
+
+            for i in 0 .. n - 1 do
+                if isVoter i then
+                    let v = voteOf moves.[i]
+
+                    if v > winVote then
+                        winVote <- v
+                        win <- i
+
+            // Among voters for the winning move: deepest, then highest score, then lowest index
+            // (ascending scan with strict > keeps the lowest index on full ties).
+            let wm = moves.[win]
+            let mutable chosen = win
+
+            for i in 0 .. n - 1 do
+                if isVoter i && moves.[i] = wm then
+                    if
+                        depths.[i] > depths.[chosen]
+                        || (depths.[i] = depths.[chosen] && scores.[i] > scores.[chosen])
+                    then
+                        chosen <- i
+
+            chosen
+
 let go (control: SearchControl) : Move =
     control.Reset()
     control.NewSearch()
@@ -2005,7 +2075,21 @@ let go (control: SearchControl) : Move =
 
         writeLine ("info string prof3 align " + workers.[0].Pos.ProfAlignReport())
 
-    let rb = workers.[0].RootBest
+    // Thread vote (classic LazySMP, single-PV only): helpers' completed-iteration results outvote the
+    // main worker when a deeper/better-scoring consensus exists. Root-par helpers never publish
+    // RootBest (vote would degenerate to worker 0), and MultiPV's bestmove must match the main
+    // worker's reported line 1 — both keep the legacy worker-0 selection. n = 1 bypass keeps the
+    // single-thread path structurally identical (LazySmpTests determinism).
+    let chosen =
+        if n = 1 || useRootPar || control.Config.MultiPv > 1 then
+            workers.[0]
+        else
+            let vMoves = Array.init n (fun i -> workers.[i].RootBest)
+            let vScores = Array.init n (fun i -> workers.[i].RootScore)
+            let vDepths = Array.init n (fun i -> workers.[i].CompletedDepth)
+            workers.[voteBest vMoves vScores vDepths n]
+
+    let rb = chosen.RootBest
 
     let best =
         if isLegalRoot workers.[0].Pos rb then
@@ -2014,10 +2098,10 @@ let go (control: SearchControl) : Move =
             firstLegalMove workers.[0].Pos
 
     control.LastBest <- best
-    control.LastScore <- workers.[0].RootScore
+    control.LastScore <- chosen.RootScore
 
-    if workers.[0].CompletedDepth > 0 then
-        reportInfo workers.[0] workers.[0].CompletedDepth workers.[0].RootScore
+    if chosen.CompletedDepth > 0 then
+        reportInfo chosen chosen.CompletedDepth chosen.RootScore
 
     writeLine ("bestmove " + toUci best)
     best
