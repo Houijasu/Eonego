@@ -10,6 +10,7 @@ param(
     [Parameter(Mandatory)][string]$Exe,
     [int[]]$Depths = @(13, 14, 15),
     [string]$EnvSpec = "",
+    [int]$Threads = 1, # >1: aggregate NodeSum across workers (nondeterministic — compare magnitudes)
     [switch]$Json
 )
 
@@ -42,6 +43,7 @@ foreach ($depth in $Depths) {
         foreach ($k in $envPairs.Keys) { $psi.Environment[$k] = [string]$envPairs[$k] }
         $p = [System.Diagnostics.Process]::Start($psi)
         $null = $p.StandardInput.WriteLine("uci")
+        if ($Threads -gt 1) { $null = $p.StandardInput.WriteLine("setoption name Threads value $Threads") }
         $null = $p.StandardInput.WriteLine("isready")
         while (($line = $p.StandardOutput.ReadLine()) -ne $null) { if ($line -eq "readyok") { break } }
         $p.StandardInput.WriteLine("position " + $f.pos)
