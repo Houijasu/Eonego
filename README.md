@@ -20,6 +20,9 @@ node-count sweeps and SPRT self-play matches.
 - Incremental **int16 accumulator** with lazy catch-up walks, finny (bucket-refresh) tables,
   a fused delta-apply kernel and sparse fc0 propagation
 - **AVX2 / AVX-VNNI** kernels with a bit-exact scalar fallback (`EONEGO_FORCE_SCALAR=1`)
+- **Rule-50 draw-proximity damping**: the static eval decays linearly with the halfmove
+  counter, so fortresses and shuffling positions drift toward 0.00 instead of holding a
+  full advantage until the 50-move draw hits the search horizon
 - The net is embedded into the executable at build time when present (see *Building*)
 
 ### Search
@@ -30,13 +33,16 @@ node-count sweeps and SPRT self-play matches.
 - Selectivity: null-move pruning (+ verification), reverse futility, razoring, ProbCut, IIR,
   LMR with history-driven tweaks, late-move (move-count) pruning, history / futility / SEE
   pruning, singular extensions with **multicut and negative extensions**, qsearch TT
-  cutoffs + stand-pat stores, bound-consistent TT-score-as-eval
+  cutoffs + stand-pat stores, bound-consistent TT-score-as-eval, optional quiet checking
+  moves at the first quiescence ply
 - **Correction history** (pawn-structure keyed; minor-piece rider) corrects the static eval
   wherever it feeds pruning
 - Move ordering: staged lazy picker (TT move, captures by MVV + capture history, killers,
   counter-move, quiets by butterfly + continuation history)
-- All ~40 search margins live in `Tunables.fs` as `EONEGO_T_*` environment overrides;
-  the defaults are **SPSA-tuned** (self-play, ~10k games per wave)
+- Mate scores report the **complete principal variation to the mate** (the reported line is
+  extended from the transposition table, legality-checked, capped at the mate distance)
+- All ~45 search and time-management margins live in `Tunables.fs` as `EONEGO_T_*`
+  environment overrides; the defaults are **SPSA-tuned** (self-play, ~10k games per wave)
 
 ## Building
 
@@ -60,7 +66,7 @@ For development, a JIT build works anywhere the SDK does:
 
 ```powershell
 dotnet build Eonego/Eonego.fsproj -c Release
-dotnet test  Eonego.Tests/Eonego.Tests.fsproj -c Release   # 320 tests
+dotnet test  Eonego.Tests/Eonego.Tests.fsproj -c Release   # 288 tests
 ```
 
 ## UCI options
@@ -109,7 +115,7 @@ adjudicate tree mechanics; SPRT matches adjudicate everything else.
 
 ## Testing
 
-320 xunit tests cover perft, make/unmake round-trips (full state + all three incremental
+288 xunit tests cover perft, make/unmake round-trips (full state + all three incremental
 keys), SEE, the staged move picker, TT torn-read behavior, NNUE bit-exactness against
 golden evals (AVX2 == scalar), draw detection, LazySMP determinism at 1 thread, thread
 voting, and oracle equivalence of the pruned search against plain full-window alpha-beta.
