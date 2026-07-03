@@ -68,6 +68,13 @@ type Tables() =
         Array.Clear(corr, 0, corr.Length)
         Array.Clear(corrMinor, 0, corrMinor.Length)
 
+    /// Worker pool, between MOVES of one game: drop the per-search hint moves (killers are ply-indexed
+    /// and ply meanings shift; counters conservatively too) but keep every gravity table — warm
+    /// butterfly/capture/cont/corr history is the point of pooling.
+    member _.NewSearch() : unit =
+        Array.Fill(counter, MoveNone)
+        Array.Fill(killers, MoveNone)
+
     // --- reads (AggressiveInlining ATTRIBUTE: they touch the private arrays yet inline in-assembly) ---
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member _.MainHistory (c: Color) (fromToKey: int) : int = int main.[(c <<< 12) ||| fromToKey]

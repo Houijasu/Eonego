@@ -51,7 +51,11 @@ type private UCIState =
       mutable RootFen: string
       mutable RootMoves: Move[]
       mutable Control: SearchControl option
-      mutable SearchThread: Thread option }
+      mutable SearchThread: Thread option
+      // Worker pool (EONEGO_POOL=1): reused across `go` calls — dropped on ucinewgame (fresh-history
+      // semantics) and recreated whenever the length stops matching Threads. Only touched on the UCI
+      // thread with no live search (go/ucinewgame stop+join first), and goCore holds its own reference.
+      mutable Pool: Worker[] }
 
 let private tryInt (s: string) : int =
     match Int32.TryParse s with
@@ -228,9 +232,23 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
             SearchControl(cfg, lim, st.Tt, st.RootFen, st.RootMoves, ?net = st.Net)
         st.Control <- Some control
 
+        // Worker pool (EONEGO_POOL=1, default OFF = legacy fresh-workers path, byte-identical).
+        // Ensure/recreate on the UCI thread (no live search here); goPooled rebinds each worker to
+        // the fresh control and keeps the gravity history tables warm across moves.
+        let usePool = Environment.GetEnvironmentVariable("EONEGO_POOL") = "1"
+
+        if usePool && st.Pool.Length <> cfg.Threads then
+            st.Pool <- Array.init cfg.Threads (fun i -> Worker(i, (i = 0), control))
+
+        let pool = st.Pool
+
         let t =
             Thread(
-                ThreadStart(fun () -> Search.go control |> ignore),
+                ThreadStart(fun () ->
+                    if usePool then
+                        Search.goPooled control pool |> ignore
+                    else
+                        Search.go control |> ignore),
                 16 * 1024 * 1024
             )
 
@@ -284,7 +302,8 @@ let run () =
           RootFen = StartPosFen
           RootMoves = [||]
           Control = None
-          SearchThread = None }
+          SearchThread = None
+          Pool = [||] }
 
     let mutable running = true
 
@@ -310,6 +329,7 @@ let run () =
                 | "ucinewgame" ->
                     stopAndJoin st
                     st.Tt.Clear()
+                    st.Pool <- [||] // new game = fresh history (pooled workers carry warm tables)
                     st.RootFen <- StartPosFen
                     st.RootMoves <- [||]
                 | "position" ->

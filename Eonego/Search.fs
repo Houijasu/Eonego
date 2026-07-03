@@ -483,6 +483,10 @@ type SearchControl
 // ---------------------------------------------------------------------------
 [<Sealed>]
 type Worker(id: int, isMain: bool, control: SearchControl) =
+    // Rebindable (worker pool): goPooled points a reused worker at the new search's control between
+    // searches (single-threaded there — the UCI driver stops+joins any running search first). Every
+    // reader goes through this one mutable field, so nothing can cache a stale control.
+    let mutable control = control
     let pos = Position()
     let tables = Tables()
     let stack: StackEntry[] = Array.zeroCreate (MaxSearchPly + StackOffset + 4)
@@ -584,8 +588,14 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
 
         found
 
-    /// Rebuild this worker's Position from the immutable root (FEN + replayed moves) and reset per-search state.
-    member _.SetupRoot() =
+    /// Worker pool: point this worker at a new search's control. Call strictly between searches
+    /// (no live search thread), then SetupRoot.
+    member _.Rebind(c: SearchControl) = control <- c
+
+    /// Rebuild this worker's Position from the immutable root (FEN + replayed moves) and reset per-search
+    /// state. keepHistory=true (worker pool): killers + counter-moves are cleared but the gravity history
+    /// tables (butterfly/capture/cont/corr) persist across searches — warm ordering from move 2 on.
+    member _.SetupRoot(?keepHistory: bool) =
         pos.LoadFen control.RootFen
 
         // Replay the game history BEFORE binding NNUE: with the net bound, every Make pushes an
@@ -607,7 +617,11 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
         pos.BindCheckpoint control.AccCheckpoint
         pos.SeedCheckpoint()
 
-        tables.Clear()
+        if defaultArg keepHistory false then
+            tables.NewSearch()
+        else
+            tables.Clear()
+
         nodes <- 0L
         selDepth <- 0
         rootBest <- MoveNone
@@ -2025,10 +2039,12 @@ let computeTimes (moveOverhead: int) (l: SearchLimits) (stm: Color) : int64 * in
             // Proven baseline budget + MoveOverhead: soft ~ (clock - overhead)/movestogo + 3/4*inc; hard caps
             // one move at 40% of the clock (or 4x soft). The optimum/maximum-scaling experiment over the
             // soft limit was reverted as an un-tuned regression (it spent only ~1/3 of the budget).
-            let mtg = if l.MovesToGo > 0 then l.MovesToGo else 30
+            // Constants live in Tunables (EONEGO_T_TM_*, defaults = the exact v1 values) so game-clock
+            // matches can tune them without a rebuild.
+            let mtg = if l.MovesToGo > 0 then l.MovesToGo else Tunables.TmMtg
             let avail = max 1L (int64 time - overhead)
-            let soft = avail / int64 mtg + int64 inc * 3L / 4L
-            let hard = min (int64 (float time * 0.4)) (soft * 4L)
+            let soft = avail / int64 mtg + int64 inc * int64 Tunables.TmIncFrac100 / 100L
+            let hard = min (int64 time * int64 Tunables.TmHardClockPct / 100L) (soft * int64 Tunables.TmHardSoftMult)
             (max 1L soft, max 1L hard)
 
 // ---------------------------------------------------------------------------
@@ -2099,17 +2115,10 @@ let internal voteBest (moves: Move[]) (scores: int[]) (depths: int[]) (n: int) :
 
             chosen
 
-let go (control: SearchControl) : Move =
-    control.Reset()
-    control.NewSearch()
-
-    if PosProf.Enabled then
-        PosProf.reset ()
-    let n = max 1 control.Config.Threads
-    let workers = Array.init n (fun i -> Worker(i, (i = 0), control))
-
-    for w in workers do
-        w.SetupRoot()
+/// Shared orchestration body: `workers` are already created (or pool-rebound) and SetupRoot-ed by the
+/// caller; everything from the clock start through the bestmove print lives here.
+let private goCore (control: SearchControl) (workers: Worker[]) : Move =
+    let n = workers.Length
     // Live nps/nodes report the AGGREGATE over all workers (relaxed cross-thread reads, reporting only).
     control.NodeSum <-
         (fun () ->
@@ -2263,6 +2272,39 @@ let go (control: SearchControl) : Move =
 
     writeLine ("bestmove " + toUci best)
     best
+
+let go (control: SearchControl) : Move =
+    control.Reset()
+    control.NewSearch()
+
+    if PosProf.Enabled then
+        PosProf.reset ()
+
+    let n = max 1 control.Config.Threads
+    let workers = Array.init n (fun i -> Worker(i, (i = 0), control))
+
+    for w in workers do
+        w.SetupRoot()
+
+    goCore control workers
+
+/// Worker pool entry (UCI EONEGO_POOL=1): reuse per-thread Workers across `go` calls. Skips the
+/// per-move worker allocation (~3.5MB × threads of zeroed LOH — measured 26ms median per go at 16T)
+/// and keeps the gravity history tables warm across moves (killers/counters are re-cleared per
+/// search by SetupRoot keepHistory). The caller owns the pool lifetime: recreate on Threads change,
+/// drop on ucinewgame. Workers must be rebound here — the control is new every search.
+let goPooled (control: SearchControl) (workers: Worker[]) : Move =
+    control.Reset()
+    control.NewSearch()
+
+    if PosProf.Enabled then
+        PosProf.reset ()
+
+    for w in workers do
+        w.Rebind control
+        w.SetupRoot(keepHistory = true)
+
+    goCore control workers
 
 // ---------------------------------------------------------------------------
 // Test entry: a single fixed-depth, FULL-WINDOW negamax (bypasses aspiration/ID). The correctness oracle.
