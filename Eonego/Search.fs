@@ -142,6 +142,11 @@ type SearchConfig =
       // 1/Cont4Div weight in the LMR history term only (NOT move ordering — the naive full-weight
       // ordering variant measured +25-42% suite nodes and was reverted 2026-07-02).
       UseCont4: bool
+      // Rule-50 shuffle damping (SF's evaluate() wrapper term): static eval decays linearly with the
+      // halfmove counter (eval -= eval*rule50/Rule50DampDiv), so fortresses/shuffling drift toward
+      // the draw score instead of holding full value until the search's rule-50 horizon. Identity at
+      // rule50=0; perturbs ALL search trees (deep nodes accumulate counter), hence config-gated.
+      UseR50Damp: bool
       // ABDADA (SMP only, needs DagHashMb > 0): claim nodes in the DAG table while searching them and
       // DEFER moves whose child a sibling thread already owns at sufficient depth — de-duplicates
       // concurrent subtree work. Claim-only: the old StatusDone cutoff is retired (measured harmful).
@@ -205,6 +210,7 @@ let defaultConfig =
       UseCaptFut = false
       UsePartialCommit = false
       UseCont4 = false
+      UseR50Damp = true
       UseAbdada = false
       MoveOverhead = 10
       AccCheckpointMb = 0
@@ -649,14 +655,21 @@ let private writeLine (s: string) = System.Console.Out.WriteLine(s)
 let evalPos (w: Worker) (pos: Position) : int =
     match w.Control.Net with
     | Some net ->
-        if PosProf.Enabled then
-            let profT0 = System.Diagnostics.Stopwatch.GetTimestamp()
-            let v = Nnue.evalCp net pos
-            PosProf.tEval <- PosProf.tEval + (System.Diagnostics.Stopwatch.GetTimestamp() - profT0)
-            PosProf.nEval <- PosProf.nEval + 1L
-            v
+        let v =
+            if PosProf.Enabled then
+                let profT0 = System.Diagnostics.Stopwatch.GetTimestamp()
+                let v = Nnue.evalCp net pos
+                PosProf.tEval <- PosProf.tEval + (System.Diagnostics.Stopwatch.GetTimestamp() - profT0)
+                PosProf.nEval <- PosProf.nEval + 1L
+                v
+            else
+                Nnue.evalCp net pos
+        // Rule-50 shuffle damping (see SearchConfig.UseR50Damp): identity at rule50 = 0, and damping
+        // only shrinks magnitude, so the EvalMax clamp inside evalCp still bounds the result.
+        if w.Control.Config.UseR50Damp then
+            v - v * pos.Rule50 / Tunables.Rule50DampDiv
         else
-            Nnue.evalCp net pos
+            v
     | None -> 0 // unreachable in play: UCI refuses to search with no net (see UCI.startSearch)
 
 let private updatePv (w: Worker) (ply: int) (m: Move) =
