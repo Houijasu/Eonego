@@ -209,6 +209,9 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
               UseCheckExt = (Environment.GetEnvironmentVariable("EONEGO_CHECKEXT") = "1")
               UseQsEvasionCap = (Environment.GetEnvironmentVariable("EONEGO_QSEVCAP") = "1")
               UseCorrHist = (Environment.GetEnvironmentVariable("EONEGO_CORRHIST") <> "0")
+              UseCorrMinor = (Environment.GetEnvironmentVariable("EONEGO_CORRMINOR") = "1")
+              UseCaptFut = (Environment.GetEnvironmentVariable("EONEGO_CAPFUT") = "1")
+              UsePartialCommit = (Environment.GetEnvironmentVariable("EONEGO_PARTIAL") = "1")
               MoveOverhead = st.MoveOverhead
               AccCheckpointMb = 0
               // ABDADA (EONEGO_ABDADA=1, SMP only): claim-only DAG table + move-loop deferral — threads

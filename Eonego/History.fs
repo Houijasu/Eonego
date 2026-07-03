@@ -50,6 +50,8 @@ type Tables() =
     // Correction history: [stm<<<14 | pawnKey&16383] -> persistent (bestValue - staticEval) error for this
     // side's pawn structure, gravity-updated. Read as a static-eval correction wherever eval feeds pruning.
     let corr: int16[] = Array.zeroCreate (2 * 16384)
+    // Minor-piece correction history: same contract, keyed by Position.MinorKey (knights+bishops+kings).
+    let corrMinor: int16[] = Array.zeroCreate (2 * 16384)
 
     /// Zero every table (new game / clear between searches).
     member _.Clear() : unit =
@@ -60,6 +62,7 @@ type Tables() =
         Array.Clear(cont1, 0, cont1.Length)
         Array.Clear(cont2, 0, cont2.Length)
         Array.Clear(corr, 0, corr.Length)
+        Array.Clear(corrMinor, 0, corrMinor.Length)
 
     // --- reads (AggressiveInlining ATTRIBUTE: they touch the private arrays yet inline in-assembly) ---
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
@@ -94,6 +97,11 @@ type Tables() =
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member _.CorrHist (c: Color) (pawnKey: uint64) : int =
         int corr.[(c <<< 14) ||| int (pawnKey &&& 16383UL)]
+
+    /// Raw minor-piece correction-history entry for (side to move, minor structure); same scaling contract.
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+    member _.CorrHistMinor (c: Color) (minorKey: uint64) : int =
+        int corrMinor.[(c <<< 14) ||| int (minorKey &&& 16383UL)]
 
     // --- writes -----------------------------------------------------------------------------------
     member _.SetCounter (prevPc: Piece) (prevTo: Square) (m: Move) : unit = counter.[prevPc * 64 + prevTo] <- m
@@ -134,6 +142,13 @@ type Tables() =
         let b = max -CorrHistD (min CorrHistD bonus)
         let v = int corr.[i]
         corr.[i] <- int16 (v + b - v * (abs b) / CorrHistD)
+
+    /// Gravity update of minor-piece correction history.
+    member _.UpdateCorrMinor (c: Color) (minorKey: uint64) (bonus: int) : unit =
+        let i = (c <<< 14) ||| int (minorKey &&& 16383UL)
+        let b = max -CorrHistD (min CorrHistD bonus)
+        let v = int corrMinor.[i]
+        corrMinor.[i] <- int16 (v + b - v * (abs b) / CorrHistD)
 
     /// Gravity update of 2-ply continuation history (no-op when prevPc < 0).
     member _.UpdateCont2 (prevPc: int) (prevTo: int) (pc: Piece) (dst: Square) (bonus: int) : unit =

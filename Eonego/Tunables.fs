@@ -57,6 +57,10 @@ let HistPruneSlope = envInt "EONEGO_T_HISTPRUNE_SLOPE" 800 0 1200
 let FutBase = envInt "EONEGO_T_FUT_BASE" 120 1 1000
 let FutSlope = envInt "EONEGO_T_FUT_SLOPE" 110 1 1000
 
+// --- Capture futility (EONEGO_CAPFUT=1): staticEval + Base + Slope*lmrDepth + capturedValue <= alpha ---
+let CaptFutBase = envInt "EONEGO_T_CAPTFUT_BASE" 300 1 1000
+let CaptFutSlope = envInt "EONEGO_T_CAPTFUT_SLOPE" 250 1 1000
+
 // --- SEE pruning: quiets -Mult*lmrDepth^2, captures -Mult*depth ---
 let SeeQuietMult = envInt "EONEGO_T_SEE_QUIET" 25 1 200
 let SeeCaptMult = envInt "EONEGO_T_SEE_CAPT" 90 1 500

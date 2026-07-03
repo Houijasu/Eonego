@@ -35,6 +35,7 @@ type Snap =
       Occ: uint64
       Key: uint64
       PawnKey: uint64
+      MinorKey: uint64
       Castle: int
       Ep: int
       Rule50: int
@@ -47,6 +48,7 @@ let snap (p: Position) : Snap =
       Occ = p.Occupied
       Key = p.Key
       PawnKey = p.PawnKey
+      MinorKey = p.MinorKey
       Castle = p.CastlingRights
       Ep = p.EpSquare
       Rule50 = p.Rule50
@@ -65,12 +67,13 @@ let tryLoadNet () : Network option =
         if System.IO.File.Exists p then (match Eonego.Nnue.load p with Loaded n -> Some n | _ -> None) else None
     | None -> None
 
-/// Make then Unmake must restore every byte; and after Make incremental key == from-scratch (full + pawn).
+/// Make then Unmake must restore every byte; and after Make incremental key == from-scratch (full + pawn + minor).
 let assertRoundTrips (p: Position) (m: Move) =
     let before = snap p
     p.Make m
     Assert.Equal(p.RecomputeKey(), p.Key)
     Assert.Equal(p.RecomputePawnKey(), p.PawnKey)
+    Assert.Equal(p.RecomputeMinorKey(), p.MinorKey)
     p.Unmake m
     Assert.True((before = snap p), "Make/Unmake did not restore full state for " + toUci m)
 

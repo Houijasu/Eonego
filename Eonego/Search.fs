@@ -127,6 +127,17 @@ type SearchConfig =
       // qsearch stand-pat). Every TT store keeps the RAW eval. Adjudicated by self-play match — node
       // counts cannot judge an eval-accuracy feature.
       UseCorrHist: bool
+      // Minor-piece correction history rider (needs UseCorrHist): a second correction table keyed by
+      // Position.MinorKey (knights+bishops+kings), summed with the pawn term before the /CorrApplyDiv
+      // scale and taught the same clamped error at the same update gate.
+      UseCorrMinor: bool
+      // Capture futility: at shallow reduced depth, skip a non-checking capture when even banking the
+      // captured piece's full value cannot lift the static eval to alpha (SF's capture analogue of the
+      // quiet futility gate; promotions excluded — their material swing isn't in capturedValue).
+      UseCaptFut: bool
+      // Partial-iteration commit (classic path, timed games): on a hard stop mid-iteration, adopt the
+      // interrupted iteration's best fully-searched root move instead of discarding all its progress.
+      UsePartialCommit: bool
       // ABDADA (SMP only, needs DagHashMb > 0): claim nodes in the DAG table while searching them and
       // DEFER moves whose child a sibling thread already owns at sufficient depth — de-duplicates
       // concurrent subtree work. Claim-only: the old StatusDone cutoff is retired (measured harmful).
@@ -186,6 +197,9 @@ let defaultConfig =
       UseCheckExt = false
       UseQsEvasionCap = false
       UseCorrHist = true
+      UseCorrMinor = false
+      UseCaptFut = false
+      UsePartialCommit = false
       UseAbdada = false
       MoveOverhead = 10
       AccCheckpointMb = 0
@@ -539,6 +553,13 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     /// MultiPV: 0-based index of the line currently being searched (reporting: currmovenumber offset).
     member val RootPvIdx = 0 with get, set
 
+    /// Partial-iteration commit (EONEGO_PARTIAL=1): the best root move that raised alpha during the
+    /// CURRENT (possibly interrupted) iteration, with its score. Reset to MoveNone at each iteration
+    /// start; a hard-stopped iteration's progress is otherwise discarded wholesale (up to hard≈3×soft
+    /// of clock). Written at ply 0 only, never during an exclusion re-search or a MultiPV side line.
+    member val IterBest = MoveNone with get, set
+    member val IterScore = 0 with get, set
+
     member _.ClearRootExclusions() = nRootExcluded <- 0
 
     member _.AddRootExclusion(m: Move) =
@@ -712,7 +733,14 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
             // for the TT stores below).
             let rawSp =
                 if usePruning && cfg.UseCorrHist then
-                    rawSp + w.Tables.CorrHist pos.SideToMove pos.PawnKey / Tunables.CorrApplyDiv
+                    let corrSum =
+                        w.Tables.CorrHist pos.SideToMove pos.PawnKey
+                        + (if cfg.UseCorrMinor then
+                               w.Tables.CorrHistMinor pos.SideToMove pos.MinorKey
+                           else
+                               0)
+
+                    rawSp + corrSum / Tunables.CorrApplyDiv
                 else
                     rawSp
 
@@ -945,7 +973,14 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
             staticEval <-
                 if rawStaticEval <> VALUE_NONE && usePruning && cfg.UseCorrHist then
-                    rawStaticEval + w.Tables.CorrHist pos.SideToMove pos.PawnKey / Tunables.CorrApplyDiv
+                    let corrSum =
+                        w.Tables.CorrHist pos.SideToMove pos.PawnKey
+                        + (if cfg.UseCorrMinor then
+                               w.Tables.CorrHistMinor pos.SideToMove pos.MinorKey
+                           else
+                               0)
+
+                    rawStaticEval + corrSum / Tunables.CorrApplyDiv
                 else
                     rawStaticEval
 
@@ -1268,6 +1303,25 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                                         not (pos.SeeGe m (-Tunables.SeeQuietMult * lmrDepth * lmrDepth)))
                             then
                                 doMove <- false
+                        // capture futility — even banking the captured piece's full value cannot lift the
+                        // static eval to alpha at shallow (reduced) depth. Promotions excluded (their
+                        // material swing is not in capturedValue). Runs before the SEE gate: a compare is
+                        // cheaper than an exchange walk.
+                        elif
+                            cfg.UseCaptFut
+                            && (not givesCheck)
+                            && not (isPromotion m)
+                            && lmrDepth <= 6
+                            && (let dst = pos.PieceOn(toSq m)
+
+                                let capturedValue =
+                                    if isEnPassant m then pieceValueOf Pawn
+                                    elif dst = NoPiece then 0
+                                    else pieceValueOf (pieceType dst)
+
+                                staticEval + Tunables.CaptFutBase + Tunables.CaptFutSlope * lmrDepth + capturedValue <= alpha)
+                        then
+                            doMove <- false
                         elif (not givesCheck) && depth <= 6 && not (pos.SeeGe m (-Tunables.SeeCaptMult * depth)) then
                             // SEE — a capture that loses material by static exchange at shallow depth
                             doMove <- false
@@ -1438,6 +1492,13 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                                     if isPv then
                                         updatePv w ply m
 
+                                    // Partial-iteration commit bookkeeping: remember the root's best
+                                    // fully-searched alpha-raiser so a hard-stopped iteration can still
+                                    // contribute its progress (adopted in iterativeDeepening on stop).
+                                    if ply = 0 && excludedMove = MoveNone && w.RootPvIdx = 0 then
+                                        w.IterBest <- m
+                                        w.IterScore <- v
+
                             if alpha >= beta then
                                 cutoff <- true
 
@@ -1527,6 +1588,9 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                     let bonus =
                         max -Tunables.CorrClamp (min Tunables.CorrClamp ((best - staticEval) * depth / Tunables.CorrDepthDiv))
                     w.Tables.UpdateCorr pos.SideToMove pos.PawnKey bonus
+
+                    if cfg.UseCorrMinor then
+                        w.Tables.UpdateCorrMinor pos.SideToMove pos.MinorKey bonus
 
                 result <- best
 
@@ -1639,6 +1703,9 @@ let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
 
     while depth <= maxDepth && not w.Control.Stopped do
         w.ClearRootExclusions()
+        // Partial-iteration commit: forget the previous iteration's root progress marker — only a
+        // move fully searched WITHIN the iteration a hard stop interrupts may be adopted below.
+        w.IterBest <- MoveNone
         let mutable pvIdx = 0
         let mutable iterationOk = true
 
@@ -1743,6 +1810,15 @@ let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
         // tried but over-conserved time without SPRT tuning — reverted; MoveOverhead is kept below.)
         if w.IsMain && w.Control.SoftTimeUp then
             w.Control.Stop()
+
+    // Partial-iteration commit: the classic path otherwise discards ALL root progress of a hard-stopped
+    // iteration (up to hard≈3×soft of clock burned for nothing). Adopt its best fully-searched root
+    // improvement — updatePv already wrote PV row 0 for it, so this also re-aligns the reported PV with
+    // RootBest. After a COMPLETED iteration IterBest equals lineMoves[0], making the adoption a no-op.
+    // Fixed-depth sweeps never hard-stop mid-iteration with progress, so node counts are untouched.
+    if cfg.UsePartialCommit && multiPv = 1 && w.IterBest <> MoveNone then
+        w.RootBest <- w.IterBest
+        w.RootScore <- w.IterScore
 
 // ---------------------------------------------------------------------------
 // Root-move parallelism (Phase 3): the main worker searches the first (best) root

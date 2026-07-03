@@ -67,6 +67,13 @@ let inline dBound (d: uint64) : int = (dGenBound d) &&& 3
 let inline dTtPv (d: uint64) : bool = ((dGenBound d) >>> 2) &&& 1 = 1
 let inline dGen (d: uint64) : int = (dGenBound d) >>> 3
 
+/// EONEGO_TT_REFRESH=1: a probe HIT re-stamps the entry's generation (SF behaviour), so cutoff-serving
+/// entries stop losing replacement priority (relAge*2 ≈ 2 effective depth per game move) and aging out
+/// while hot. Costs a write on the probe path, but only when the stored generation differs — at most
+/// once per entry per search. Default OFF pending its match under hash pressure.
+let private refreshOnProbe =
+    System.Environment.GetEnvironmentVariable "EONEGO_TT_REFRESH" = "1"
+
 /// Largest power-of-two cluster count that fits `mb` MiB (>= 1).
 let private clustersFor (mb: int) : int =
     let bytes = int64 (max 1 mb) * 1024L * 1024L
@@ -131,6 +138,17 @@ type TranspositionTable(mb: int) =
 
         cnt * 1000 / (sample * ClusterSize)
 
+    /// Re-stamp a hit entry's generation without touching move/score/eval/depth/bound/ttPv (the XOR key is
+    /// rewritten to stay consistent). A concurrent Store to the same slot can interleave with the two
+    /// writes — any torn pair fails a reader's XOR validation and is treated as a miss, the same benign
+    /// race class as Store itself.
+    member private _.RefreshGen(idx: int) (key: uint64) (d: uint64) : unit =
+        if refreshOnProbe && dGen d <> generation then
+            let gb = (generation <<< 3) ||| (dGenBound d &&& 0x7)
+            let d' = (d &&& 0x00FF_FFFF_FFFF_FFFFUL) ||| (uint64 (byte gb) <<< 56)
+            Volatile.Write(&entries.[idx].Data, d')
+            Volatile.Write(&entries.[idx].Key, key ^^^ d')
+
     /// XOR-validated probe. Returns struct(hit, move, score(raw — caller applies valueFromTt), eval, depth,
     /// bound, ttPv).
     member this.Probe(key: uint64) : struct (bool * Move * int * int * int * int * bool) =
@@ -140,6 +158,7 @@ type TranspositionTable(mb: int) =
         let gb0 = dGenBound d0
 
         if (k0 ^^^ d0) = key && (gb0 &&& 3) <> BoundNone then
+            this.RefreshGen b key d0
             struct (true, dMove d0, dScore d0, dEval d0, dDepth d0, gb0 &&& 3, ((gb0 >>> 2) &&& 1) = 1)
         else
             let k1 = Volatile.Read(&entries.[b + 1].Key)
@@ -147,6 +166,7 @@ type TranspositionTable(mb: int) =
             let gb1 = dGenBound d1
 
             if (k1 ^^^ d1) = key && (gb1 &&& 3) <> BoundNone then
+                this.RefreshGen (b + 1) key d1
                 struct (true, dMove d1, dScore d1, dEval d1, dDepth d1, gb1 &&& 3, ((gb1 >>> 2) &&& 1) = 1)
             else
                 let k2 = Volatile.Read(&entries.[b + 2].Key)
@@ -154,6 +174,7 @@ type TranspositionTable(mb: int) =
                 let gb2 = dGenBound d2
 
                 if (k2 ^^^ d2) = key && (gb2 &&& 3) <> BoundNone then
+                    this.RefreshGen (b + 2) key d2
                     struct (true, dMove d2, dScore d2, dEval d2, dDepth d2, gb2 &&& 3, ((gb2 >>> 2) &&& 1) = 1)
                 else
                     let k3 = Volatile.Read(&entries.[b + 3].Key)
@@ -161,6 +182,7 @@ type TranspositionTable(mb: int) =
                     let gb3 = dGenBound d3
 
                     if (k3 ^^^ d3) = key && (gb3 &&& 3) <> BoundNone then
+                        this.RefreshGen (b + 3) key d3
                         struct (true, dMove d3, dScore d3, dEval d3, dDepth d3, gb3 &&& 3, ((gb3 >>> 2) &&& 1) = 1)
                     else
                         struct (false, MoveNone, 0, 0, 0, BoundNone, false)
