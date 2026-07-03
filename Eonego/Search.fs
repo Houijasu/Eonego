@@ -1806,6 +1806,11 @@ let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
             linePvs.[i * MaxSearchPly + k] <- linePvs.[j * MaxSearchPly + k]
             linePvs.[j * MaxSearchPly + k] <- t
 
+    // SMP depth-skipping was tried here (odd-id helpers striding by 2) and MEASURED WORSE
+    // 2026-07-04: 16T/10s midgame depth d26 -> d23 — the striding helpers burn time on deep
+    // iterations they can't finish while their width contribution (which fed the main thread's
+    // TT) is lost. The reference engine's thread-to-depth conversion comes from tree efficiency,
+    // not scheduling. Do not re-add without a tree-efficiency step-change first.
     let mutable depth = 1
 
     while depth <= maxDepth && not w.Control.Stopped do
