@@ -113,6 +113,14 @@ let TmIncFrac100 = envInt "EONEGO_T_TM_INCFRAC" 75 0 150
 let TmHardClockPct = envInt "EONEGO_T_TM_HARDPCT" 40 10 90
 let TmHardSoftMult = envInt "EONEGO_T_TM_HARDMULT" 4 2 12
 
+// --- Root re-verification on stagnation (EONEGO_ROOTVERIFY=1): once the root score has moved less
+//     than VerifyBand centipawns over the last 6 completed iterations (>= VerifyDepth), each further
+//     iteration designates ONE rotating non-best root move for a full-window, unreduced, PV-quality
+//     search. PV nodes skip TT cutoffs, so this is the only way past stale "<= alpha" bounds that
+//     null-window scouts re-graft forever (the b3-b4 fixture deadlock). ---
+let RootVerifyDepth = envInt "EONEGO_T_ROOTVERIFY_DEPTH" 14 6 64
+let RootVerifyBand = envInt "EONEGO_T_ROOTVERIFY_BAND" 12 1 200
+
 // --- Root LMR cap (EONEGO_T_ROOT_LMR_CAP): clamp the LMR reduction of root moves to this many
 //     plies. 99 = no cap (byte-identical legacy). The reference engine reduces root moves less than
 //     interior moves; a buried root move (negative history + late order) otherwise never gets a deep

@@ -155,6 +155,11 @@ type SearchConfig =
       // win buried under its own failed-scout history (the b3-b4 fixture pathology). Classic
       // single-PV path only.
       UseRootEffort: bool
+      // Root re-verification on stagnation: when the root score is flat (see Tunables.RootVerify*),
+      // each iteration gives ONE rotating non-best root move a full-window unreduced PV search —
+      // the fresh look that pierces stale TT bounds a null-window scout can never re-open. Classic
+      // single-PV path only; free when the score is moving.
+      UseRootVerify: bool
       MoveOverhead: int
       // Phase 1: NNUE accumulator checkpoint cache. Set to 0 to disable; ~4 MiB is the recommended default
       // (1024 slots, ~4.1 KiB/slot). Cleared per search by `SearchControl.NewSearch` (alongside the TT gen
@@ -209,6 +214,7 @@ let defaultConfig =
       UseR50Damp = true
       UseQsChecks = false
       UseRootEffort = false
+      UseRootVerify = false
       MoveOverhead = 10
       AccCheckpointMb = 0
       MultiPv = 1 }
@@ -558,6 +564,10 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
         with get () = rootListActive
         and set v = rootListActive <- v
 
+    /// Root re-verification (UseRootVerify): the ONE root move this iteration searches full-window,
+    /// unreduced and PV-flagged even when late in the order. MoveNone = inactive.
+    member val RootVerifyMove = MoveNone with get, set
+
     member _.ClearRootExclusions() = nRootExcluded <- 0
 
     member _.AddRootExclusion(m: Move) =
@@ -584,7 +594,7 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     /// Rebuild this worker's Position from the immutable root (FEN + replayed moves) and reset per-search
     /// state. keepHistory=true (worker pool): killers + counter-moves are cleared but the gravity history
     /// tables (butterfly/capture/cont/corr) persist across searches — warm ordering from move 2 on.
-    member _.SetupRoot(?keepHistory: bool) =
+    member this.SetupRoot(?keepHistory: bool) =
         pos.LoadFen control.RootFen
 
         // Replay the game history BEFORE binding NNUE: with the net bound, every Make pushes an
@@ -620,6 +630,7 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
         nRootExcluded <- 0
         rootCnt <- 0
         rootListActive <- false
+        this.RootVerifyMove <- MoveNone
 
 let inline private pollStop (w: Worker) : bool =
     if w.StopSeen then
@@ -1445,7 +1456,13 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
                         let mutable v = 0
 
-                        if moveCount = 1 then
+                        // Root re-verification: the designated move gets the first-move treatment —
+                        // full window, no reduction, PV-flagged — so its subtree is searched WITHOUT
+                        // TT cutoffs on the PV spine (the fresh look stale bounds otherwise prevent).
+                        let rootVerify =
+                            ply = 0 && excludedMove = MoveNone && m = w.RootVerifyMove
+
+                        if moveCount = 1 || rootVerify then
                             v <- -(negamax w pos (-beta) (-alpha) newDepth (ply + 1) isPv (if isPv then false else not cutNode))
                         elif not usePruning then
                             v <- -(negamax w pos (-beta) (-alpha) newDepth (ply + 1) false (not cutNode))
@@ -1747,12 +1764,24 @@ let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
     // list from legal generation; negamax's ply-0 loop iterates it and accounts per-move subtree
     // nodes; the block at the end of each completed iteration re-sorts it (best first, then by effort).
     let useRootList = cfg.UseRootEffort && multiPv = 1
+    // Root re-verification (UseRootVerify) needs the same list (as a rotation pool) but NOT the
+    // list-driven iteration — the picker stays in charge unless UseRootEffort is also on.
+    let useRootVerify = cfg.UseRootVerify && multiPv = 1
 
-    if useRootList then
+    if useRootList || useRootVerify then
         w.RootCnt <- generateLegal w.Pos (Span<Move>(w.RootMv))
         Array.Clear(w.RootNodes, 0, w.RootNodes.Length)
 
     w.RootListActive <- useRootList
+
+    // Stagnation detector state: ring of the last 6 completed-iteration scores + rotation cursor.
+    // Each candidate is verified for 3 CONSECUTIVE iterations before rotating on: one fresh PV look
+    // only re-opens its spine, while consecutive looks compound (each stores fresh deep bounds the
+    // next look searches past) — needed to rebuild a subtree soaked in stale <=alpha bounds.
+    let verifyHist = Array.create 6 0
+    let mutable verifyHistN = 0
+    let mutable verifyIdx = 0
+    let mutable verifyStreak = 0
 
     // Per-line state: previous score (aspiration centre), and this iteration's score/move/PV per line.
     let prevScores = Array.create multiPv (evalPos w w.Pos)
@@ -1901,6 +1930,38 @@ let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
                     w.RootNodes.[j + 1] <- nd
 
                 Array.Clear(w.RootNodes, 0, w.RootCnt)
+
+            // Root re-verification: once the score has been flat across the last 6 completed
+            // iterations at sufficient depth, designate the next rotating non-best root move for a
+            // full-window PV look next iteration. Score moving again => detector re-arms, no cost.
+            if useRootVerify then
+                verifyHist.[verifyHistN % 6] <- lineScores.[0]
+                verifyHistN <- verifyHistN + 1
+                w.RootVerifyMove <- MoveNone
+
+                if verifyHistN >= 6 && depth >= Tunables.RootVerifyDepth && w.RootCnt > 1 then
+                    let mutable lo = System.Int32.MaxValue
+                    let mutable hi = System.Int32.MinValue
+
+                    for s in verifyHist do
+                        lo <- min lo s
+                        hi <- max hi s
+
+                    if hi - lo <= Tunables.RootVerifyBand && abs lineScores.[0] < MATE_IN_MAX_PLY then
+                        // Advance the rotation only every 3rd stagnant iteration; skip the current
+                        // best move (it already gets the PV treatment).
+                        if verifyStreak >= 3 then
+                            verifyIdx <- verifyIdx + 1
+                            verifyStreak <- 0
+
+                        let mutable tries = 0
+
+                        while tries < w.RootCnt && w.RootMv.[verifyIdx % w.RootCnt] = lineMoves.[0] do
+                            verifyIdx <- verifyIdx + 1
+                            tries <- tries + 1
+
+                        w.RootVerifyMove <- w.RootMv.[verifyIdx % w.RootCnt]
+                        verifyStreak <- verifyStreak + 1
 
             if w.IsMain then
                 for k in 0 .. multiPv - 1 do

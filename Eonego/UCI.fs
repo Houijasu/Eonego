@@ -230,6 +230,7 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
               UseR50Damp = (Environment.GetEnvironmentVariable("EONEGO_R50DAMP") <> "0")
               UseQsChecks = (Environment.GetEnvironmentVariable("EONEGO_QSCHECKS") = "1")
               UseRootEffort = (Environment.GetEnvironmentVariable("EONEGO_ROOTEFFORT") = "1")
+              UseRootVerify = (Environment.GetEnvironmentVariable("EONEGO_ROOTVERIFY") = "1")
               MoveOverhead = st.MoveOverhead
               AccCheckpointMb = 0
               MultiPv = st.MultiPv }
