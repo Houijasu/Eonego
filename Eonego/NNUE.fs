@@ -754,9 +754,19 @@ let evalInternal (net: Network) (pos: Position) (useAvx2: bool) (useVnni: bool) 
         buildAccProd net pos Black accB psqB
         evalFromAcc net pos accW accB psqW psqB useAvx2 useVnni useSparse
 
+/// EONEGO_R50DAMP=0 disables the rule-50 shuffle damping below (default ON — it is part of the
+/// reference engine's evaluate() wrapper that the original port skipped).
+let private dampRule50 =
+    System.Environment.GetEnvironmentVariable "EONEGO_R50DAMP" <> "0"
+
 /// Side-to-move-relative centipawns, clamped to +/-EvalMax.
 let evalCp (net: Network) (pos: Position) : int =
     let cp = int (int64 (evalInternal net pos UseAvx2 UseVnni UseSparse) * 100L / int64 NormalizeToPawnValue)
+    // SF's shuffle damping (evaluate() wrapper): eval decays linearly with the 50-move counter, so
+    // no-progress positions (fortresses, shuffling) drift toward the draw score instead of holding
+    // full value until the search actually reaches the rule-50 draw at its horizon. Identity when
+    // the counter is 0, so all rule50=0 golden/parity fixtures are untouched.
+    let cp = if dampRule50 then cp - cp * pos.Rule50 / Tunables.Rule50DampDiv else cp
     max -EvalMax (min EvalMax cp)
 
 /// Bind the net into the Position's incremental accumulator (root only). The threat enumerator is passed as

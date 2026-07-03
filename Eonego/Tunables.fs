@@ -94,6 +94,11 @@ let CorrDepthDiv = envInt "EONEGO_T_CORR_DDIV" 8 1 64
 //     history threshold (taught full bonus). Div=2 = the "weighted ss-4" shape. ---
 let Cont4Div = envInt "EONEGO_T_CONT4_DIV" 2 1 8
 
+// --- Rule-50 shuffle damping (SF's evaluate() wrapper term, missing from the original port):
+//     eval -= eval * rule50 / Div. Pulls stuck positions (fortresses, shuffling) toward the draw
+//     score gracefully instead of holding full value until the search proves the rule-50 draw. ---
+let Rule50DampDiv = envInt "EONEGO_T_R50_DAMP" 212 50 2048
+
 // --- Time management (game clocks only — fixed-depth/movetime paths never read these).
 //     soft = (clock-overhead)/Mtg + inc*IncFrac100/100; hard = min(clock*HardClockPct/100, soft*HardSoftMult).
 //     Defaults reproduce the v1 formula exactly (3/4 == 75/100, 0.4 == 40/100 at int precision). ---
