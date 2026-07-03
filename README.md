@@ -84,6 +84,7 @@ environment variables (default off unless noted) so A/B matches never need a reb
 | `EONEGO_CORRMINOR=1` | Minor-piece correction-history rider |
 | `EONEGO_TT_REFRESH=1` | Probe hits re-stamp TT entry age |
 | `EONEGO_PARTIAL=1` | Adopt a hard-stopped iteration's best root move |
+| `EONEGO_QSCHECKS=1` | Quiet checking moves at the first qsearch ply (SEE-losing checks skipped) |
 | `EONEGO_CORRHIST=0` | Disable correction history (default on) |
 | `EONEGO_QSTT=0` / `EONEGO_TTEVADJ=0` | Disable qsearch-TT / TT-eval-adjust (default on) |
 | `EONEGO_CHECKEXT=1` / `EONEGO_QSEVCAP=1` | Legacy check extension / qsearch evasion cap |

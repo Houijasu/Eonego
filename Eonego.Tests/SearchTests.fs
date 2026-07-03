@@ -65,7 +65,7 @@ let rec private refMinimax (w: Worker) (pos: Position) (depth: int) (ply: int) :
     if ply > 0 && isImmediateDraw pos then
         0
     elif depth = 0 then
-        qsearch w pos (-INF) INF ply
+        qsearch w pos (-INF) INF ply 0
     elif ply >= MaxSearchPly then
         (if pos.InCheck then 0 else evalPos w pos)
     else
@@ -194,7 +194,7 @@ let ``qsearch on a quiet position equals static eval`` () =
             UsePruning = false }
 
     let w = makeWorker "8/8/4k3/8/8/4K3/4P3/8 w - - 0 1" cfg
-    Assert.Equal(evalPos w w.Pos, qsearch w w.Pos (-INF) INF 0)
+    Assert.Equal(evalPos w w.Pos, qsearch w w.Pos (-INF) INF 0 0)
 
 [<Theory>]
 [<InlineData(0)>]

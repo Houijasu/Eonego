@@ -215,6 +215,7 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
               UsePartialCommit = (Environment.GetEnvironmentVariable("EONEGO_PARTIAL") = "1")
               UseCont4 = (Environment.GetEnvironmentVariable("EONEGO_CONT4") = "1")
               UseR50Damp = (Environment.GetEnvironmentVariable("EONEGO_R50DAMP") <> "0")
+              UseQsChecks = (Environment.GetEnvironmentVariable("EONEGO_QSCHECKS") = "1")
               MoveOverhead = st.MoveOverhead
               AccCheckpointMb = 0
               MultiPv = st.MultiPv }

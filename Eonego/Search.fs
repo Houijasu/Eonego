@@ -145,6 +145,10 @@ type SearchConfig =
       // the draw score instead of holding full value until the search's rule-50 horizon. Identity at
       // rule50=0; perturbs ALL search trees (deep nodes accumulate counter), hence config-gated.
       UseR50Damp: bool
+      // Quiet CHECKING moves at the FIRST qsearch ply (SF's DEPTH_QS_CHECKS): the captures-only
+      // horizon is blind to mating attacks that start with a quiet check. SEE-losing checks skipped;
+      // deeper qsearch plies stay captures-only.
+      UseQsChecks: bool
       MoveOverhead: int
       // Phase 1: NNUE accumulator checkpoint cache. Set to 0 to disable; ~4 MiB is the recommended default
       // (1024 slots, ~4.1 KiB/slot). Cleared per search by `SearchControl.NewSearch` (alongside the TT gen
@@ -194,6 +198,7 @@ let defaultConfig =
       UsePartialCommit = false
       UseCont4 = false
       UseR50Damp = true
+      UseQsChecks = false
       MoveOverhead = 10
       AccCheckpointMb = 0
       MultiPv = 1 }
@@ -642,9 +647,11 @@ let private updatePv (w: Worker) (ply: int) (m: Move) =
         pv.[basep + 1] <- MoveNone
 
 // ---------------------------------------------------------------------------
-// Quiescence (fail-soft leaves)
+// Quiescence (fail-soft leaves). `qsDepth` counts plies BELOW the qsearch entry (0 at the negamax
+// boundary, negative deeper) — it exists solely so UseQsChecks can restrict quiet checking moves to
+// the first layer; captures/evasions ignore it.
 // ---------------------------------------------------------------------------
-let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: int) : int =
+let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: int) (qsDepth: int) : int =
     w.Nodes <- w.Nodes + 1L
 
     let stopNow = pollStop w
@@ -800,7 +807,7 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
                     movesPlayed <- movesPlayed + 1
                     pos.Make m
                     w.Control.Tt.Prefetch pos.Key // child probes this exact key at entry
-                    let v = -(qsearch w pos (-beta) (-alpha) (ply + 1))
+                    let v = -(qsearch w pos (-beta) (-alpha) (ply + 1) (qsDepth - 1))
                     pos.Unmake m
 
                     if pollStop w then
@@ -817,6 +824,46 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
                             cutoff <- true
 
                 m <- if cutoff then MoveNone else nextMove &mp false
+
+            // Quiet CHECKING moves at the first qsearch ply only (UseQsChecks, SF's DEPTH_QS_CHECKS):
+            // after the capture picker drains, try quiet moves that give check and don't lose material
+            // by SEE (spite checks explode the tree for nothing). The child is an evasion node, so its
+            // replies are searched exhaustively — one extra move class at exactly one layer. The 1 KB
+            // stackalloc is bounded: at most one qsDepth=0 frame exists per call-stack branch.
+            if usePruning && cfg.UseQsChecks && not cutoff && not inCheck && qsDepth = 0 then
+                let qcPtr = NativePtr.stackalloc<Move> MaxMoves
+                let qcBuf = Span<Move>(NativePtr.toVoidPtr qcPtr, MaxMoves)
+                let nLegal = generateLegal pos qcBuf
+                let mutable i = 0
+
+                while i < nLegal && not cutoff do
+                    let qm = qcBuf.[i]
+
+                    let isQuiet =
+                        (pos.PieceOn(toSq qm) = NoPiece)
+                        && not (isEnPassant qm)
+                        && not (isPromotion qm)
+
+                    if isQuiet && pos.GivesCheck qm && pos.SeeGe qm 0 then
+                        pos.Make qm
+                        w.Control.Tt.Prefetch pos.Key
+                        let v = -(qsearch w pos (-beta) (-alpha) (ply + 1) (qsDepth - 1))
+                        pos.Unmake qm
+
+                        if pollStop w then
+                            cutoff <- true
+                        else
+                            if v > best then
+                                best <- v
+                                bestMove <- qm
+
+                                if v > alpha then
+                                    alpha <- v
+
+                            if alpha >= beta then
+                                cutoff <- true
+
+                    i <- i + 1
 
             if inCheck && movesPlayed = 0 then
                 -MATE + ply
@@ -855,7 +902,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
     elif ply >= MaxSearchPly || pos.Top >= Position.AccStackLimit then
         (if pos.InCheck then 0 else evalPos w pos)
     elif depthIn <= 0 then
-        qsearch w pos alphaIn betaIn ply
+        qsearch w pos alphaIn betaIn ply 0
     else
         let cfg = w.Control.Config
         let usePruning = cfg.UsePruning
@@ -981,7 +1028,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                 && abs alpha < MATE_IN_MAX_PLY
                 && workingEval + (Tunables.RazorBase + Tunables.RazorSlope * depthIn) <= alpha
             then
-                let v = qsearch w pos alpha (alpha + 1) ply
+                let v = qsearch w pos alpha (alpha + 1) ply 0
 
                 if v <= alpha && not (pollStop w) then
                     result <- v
@@ -1060,7 +1107,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                         w.Stack.[ssCur].MovedPiece <- pos.PieceOn(fromSq pcMove)
                         pos.Make pcMove
                         w.Control.Tt.Prefetch pos.Key // child probes this exact key at entry
-                        let mutable v = -(qsearch w pos (-probCutBeta) (-probCutBeta + 1) (ply + 1))
+                        let mutable v = -(qsearch w pos (-probCutBeta) (-probCutBeta + 1) (ply + 1) 0)
 
                         if v >= probCutBeta then
                             v <- -(negamax w pos (-probCutBeta) (-probCutBeta + 1) (depthIn - 4) (ply + 1) false (not cutNode))
