@@ -90,6 +90,10 @@ let CorrApplyDiv = envInt "EONEGO_T_CORR_DIV" 16 1 256
 let CorrClamp = envInt "EONEGO_T_CORR_CLAMP" 256 16 2047
 let CorrDepthDiv = envInt "EONEGO_T_CORR_DDIV" 8 1 64
 
+// --- cont4 (EONEGO_CONT4=1): the ss-4 continuation term is read at 1/Div weight in the LMR
+//     history threshold (taught full bonus). Div=2 = the "weighted ss-4" shape. ---
+let Cont4Div = envInt "EONEGO_T_CONT4_DIV" 2 1 8
+
 // --- History stat bonus: min(Mul*depth - 100, Cap) ---
 let StatBonusMul = envInt "EONEGO_T_STATB_MUL" 167 16 1000 // was 160
 let StatBonusCap = envInt "EONEGO_T_STATB_CAP" 1735 100 7000 // was 1700

@@ -138,6 +138,10 @@ type SearchConfig =
       // Partial-iteration commit (classic path, timed games): on a hard stop mid-iteration, adopt the
       // interrupted iteration's best fully-searched root move instead of discarding all its progress.
       UsePartialCommit: bool
+      // Weighted ss-4 continuation history: a cont4 table taught alongside cont1/cont2 and read at
+      // 1/Cont4Div weight in the LMR history term only (NOT move ordering — the naive full-weight
+      // ordering variant measured +25-42% suite nodes and was reverted 2026-07-02).
+      UseCont4: bool
       // ABDADA (SMP only, needs DagHashMb > 0): claim nodes in the DAG table while searching them and
       // DEFER moves whose child a sibling thread already owns at sufficient depth — de-duplicates
       // concurrent subtree work. Claim-only: the old StatusDone cutoff is retired (measured harmful).
@@ -200,6 +204,7 @@ let defaultConfig =
       UseCorrMinor = false
       UseCaptFut = false
       UsePartialCommit = false
+      UseCont4 = false
       UseAbdada = false
       MoveOverhead = 10
       AccCheckpointMb = 0
@@ -1172,6 +1177,20 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                 else
                     struct (-1, -1)
 
+            // ss-4 continuation key (cont4 rider): ssCur - 4 = ply + StackOffset - 4 >= 0 always
+            // (StackOffset = 4), and the zeroed below-root slots fail the MoveNone guard.
+            let struct (prev4Pc, prev4To) =
+                if contOn && cfg.UseCont4 then
+                    let prev4Move = w.Stack.[ssCur - 4].CurrentMove
+                    let prev4Piece = w.Stack.[ssCur - 4].MovedPiece
+
+                    if prev4Move <> MoveNone && prev4Move <> MoveNull && prev4Piece <> NoPiece then
+                        struct (prev4Piece, toSq prev4Move)
+                    else
+                        struct (-1, -1)
+                else
+                    struct (-1, -1)
+
             let us = pos.SideToMove
             let ksq = pos.KingSquare us
             let usBlockers = pos.BlockersForKing us // loop-invariant across Make/Unmake (see qsearch note)
@@ -1455,6 +1474,11 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                                             w.Tables.MainHistory us (fromTo m)
                                             + w.Tables.ContHistory1 prev1Pc prev1To pc (toSq m)
                                             + w.Tables.ContHistory2 prev2Pc prev2To pc (toSq m)
+                                            + (if cfg.UseCont4 then
+                                                   w.Tables.ContHistory4 prev4Pc prev4To pc (toSq m)
+                                                   / Tunables.Cont4Div
+                                               else
+                                                   0)
 
                                         if hist < Tunables.LmrHistThresh then
                                             rr <- rr + 1
@@ -1511,12 +1535,18 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                                         w.Tables.UpdateCont1 prev1Pc prev1To mPc (toSq m) bonus
                                         w.Tables.UpdateCont2 prev2Pc prev2To mPc (toSq m) bonus
 
+                                        if cfg.UseCont4 then
+                                            w.Tables.UpdateCont4 prev4Pc prev4To mPc (toSq m) bonus
+
                                         for qi in 0 .. nQuiets - 2 do
                                             let q = quietsBuf.[quietsBase + qi]
                                             let qPc = pos.PieceOn(fromSq q)
                                             w.Tables.UpdateMain us q (-bonus)
                                             w.Tables.UpdateCont1 prev1Pc prev1To qPc (toSq q) (-bonus)
                                             w.Tables.UpdateCont2 prev2Pc prev2To qPc (toSq q) (-bonus)
+
+                                            if cfg.UseCont4 then
+                                                w.Tables.UpdateCont4 prev4Pc prev4To qPc (toSq q) (-bonus)
 
                                         w.Tables.SetKiller ply m
 

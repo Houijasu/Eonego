@@ -47,6 +47,9 @@ type Tables() =
     // 1-ply-back move (ss-1), cont2 by the 2-ply-back move (ss-2). 768 = 12 pieces * 64 squares.
     let cont1: int16[] = Array.zeroCreate (768 * 768)
     let cont2: int16[] = Array.zeroCreate (768 * 768)
+    // cont4: keyed by the 4-ply-back move (ss-4, same side to move) — the "deepened" continuation
+    // table. Read WEIGHTED (Tunables.Cont4Div) in the LMR history term only; taught the full bonus.
+    let cont4: int16[] = Array.zeroCreate (768 * 768)
     // Correction history: [stm<<<14 | pawnKey&16383] -> persistent (bestValue - staticEval) error for this
     // side's pawn structure, gravity-updated. Read as a static-eval correction wherever eval feeds pruning.
     let corr: int16[] = Array.zeroCreate (2 * 16384)
@@ -61,6 +64,7 @@ type Tables() =
         Array.Fill(killers, MoveNone)
         Array.Clear(cont1, 0, cont1.Length)
         Array.Clear(cont2, 0, cont2.Length)
+        Array.Clear(cont4, 0, cont4.Length)
         Array.Clear(corr, 0, corr.Length)
         Array.Clear(corrMinor, 0, corrMinor.Length)
 
@@ -92,6 +96,13 @@ type Tables() =
             0
         else
             int cont2.[(prevPc * 64 + prevTo) * 768 + (pc * 64 + dst)]
+
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+    member _.ContHistory4 (prevPc: int) (prevTo: int) (pc: Piece) (dst: Square) : int =
+        if prevPc < 0 then
+            0
+        else
+            int cont4.[(prevPc * 64 + prevTo) * 768 + (pc * 64 + dst)]
 
     /// Raw correction-history entry for (side to move, pawn structure); callers scale (/16) into eval units.
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
@@ -157,3 +168,11 @@ type Tables() =
             let b = max -ContHistD (min ContHistD bonus)
             let v = int cont2.[i]
             cont2.[i] <- int16 (v + b - v * (abs b) / ContHistD)
+
+    /// Gravity update of 4-ply continuation history (no-op when prevPc < 0).
+    member _.UpdateCont4 (prevPc: int) (prevTo: int) (pc: Piece) (dst: Square) (bonus: int) : unit =
+        if prevPc >= 0 then
+            let i = (prevPc * 64 + prevTo) * 768 + (pc * 64 + dst)
+            let b = max -ContHistD (min ContHistD bonus)
+            let v = int cont4.[i]
+            cont4.[i] <- int16 (v + b - v * (abs b) / ContHistD)
