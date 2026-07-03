@@ -20,8 +20,7 @@ set DIR=C:\Users\Samaritan\Projects\Eonego\trainer
 
 "%PY%" "%MATCH%" --a=EONEGO_CONT4=1,EONEGO_T_CONT4_DIV=1 --b= "--exe=%EXE%" --movetime=100 --openings=400 --sprt --concurrency=8 > "%DIR%\sprt_cont4_ext.log" 2>&1
 
-rem 6) Aspiration fail-high depth-reduction OFF (the b3-b4 slow-win suppressor) -> sprt_fhred.log
-"%PY%" "%MATCH%" --a=EONEGO_T_ASP_FHRED=0 --b= "--exe=%EXE%" --movetime=100 --openings=200 --sprt --concurrency=8 > "%DIR%\sprt_fhred.log" 2>&1
+rem 6) FHRED=0: ADJUDICATED 2026-07-04, -24.4 +- 26.2 @400g -> default stays 1, stage removed.
 
 rem 7) Root effort ordering -> sprt_rooteffort.log
 "%PY%" "%MATCH%" --a=EONEGO_ROOTEFFORT=1 --b= "--exe=%EXE%" --movetime=100 --openings=200 --sprt --concurrency=8 > "%DIR%\sprt_rooteffort.log" 2>&1

@@ -77,11 +77,15 @@ let QsDeltaBase = envInt "EONEGO_T_QS_DELTA" 196 1 1000 // was 200
 let SingularMul16 = envInt "EONEGO_T_SING_MUL16" 35 4 128 // was 32
 let DoubleExtMargin = envInt "EONEGO_T_SING_DBL" 18 1 200 // was 16
 
-// --- Aspiration fail-high re-search depth reduction (1 = legacy ON): a root fail-high re-searches
-//     at up to depth-3. Asymmetric with fail-low (which re-runs at FULL depth) — a slow win that
-//     arrives as a root fail-high can evaporate at the reduced depth every iteration and stay
-//     suppressed forever (b3-b4 fixture: score pinned at +18 while the subtree is provably +380). ---
-let AspFailHighRed = envInt "EONEGO_T_ASP_FHRED" 1 0 1
+// --- Aspiration fail-high re-search depth reduction. 0 = never reduce (measured −24.4 ± 26.2 vs
+//     legacy — full-depth re-searches on every noisy fail-high are too expensive); 1 = legacy,
+//     always reduce up to depth−3 (asymmetric with fail-low, which re-runs at FULL depth — a slow
+//     win arriving as a root fail-high can evaporate at the reduced depth every iteration and stay
+//     suppressed forever: b3-b4 fixture pinned at +18 while the subtree is provably +380);
+//     2 = ARBITRATED: reduce as legacy, but when the fail-high then EVAPORATES (the re-search comes
+//     back below the pre-widen beta — the erasure signature), run ONE full-depth arbitration
+//     re-search per iteration. Keeps the efficiency where it pays, removes the suppression. ---
+let AspFailHighRed = envInt "EONEGO_T_ASP_FHRED" 1 0 2
 
 // --- Aspiration: initial delta = Init + prev^2/SqDiv ---
 let AspInitDelta = envInt "EONEGO_T_ASP_INIT" 8 1 100 // was 10

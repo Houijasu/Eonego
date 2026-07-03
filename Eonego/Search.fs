@@ -1839,6 +1839,10 @@ let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
             // Tweaked: drop the re-search depth by up to 3 plies on consecutive fail-highs (reported depth
             // stays `depth`). OFF (or no fail-high) => attemptDepth = depth, i.e. the legacy behaviour.
             let mutable attemptDepth = depth
+            // Fail-high arbitration (AspFailHighRed = 2): the pre-widen beta of the last fail-high, and
+            // whether this iteration already spent its one full-depth arbitration re-search.
+            let mutable lastFailHighBeta = System.Int32.MinValue
+            let mutable arbitrated = false
 
             while searching do
                 score <- negamax w w.Pos alpha beta (max 1 attemptDepth) 0 true false
@@ -1855,20 +1859,36 @@ let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
                     alpha <- max (-INF) (score - delta)
                     delta <- delta * 2
                     attemptDepth <- depth // a fail-low re-search runs at full depth again
+                    lastFailHighBeta <- System.Int32.MinValue
                 elif score >= beta then
                     if w.IsMain && w.Control.ElapsedMs > 3000L then
                         reportLine w depth (pvIdx + 1) score " lowerbound" w.Pv 0 w.RootBest
 
+                    lastFailHighBeta <- beta
                     beta <- min INF (score + delta)
                     delta <- delta * 2
 
                     if
                         cfg.UseAspTweaks
-                        && Tunables.AspFailHighRed = 1
+                        && Tunables.AspFailHighRed >= 1
                         && attemptDepth > depth - 3
                         && abs score < MATE_IN_MAX_PLY
                     then
                         attemptDepth <- attemptDepth - 1
+                elif
+                    // Fail-high CONFIRMATION (mode 2): this iteration failed high and was re-searched
+                    // at REDUCED depth; whatever in-window score that produced may have erased a deep
+                    // fail-high signal (the b3-b4 suppression: the reduced look lands just above the
+                    // old beta and the creep repeats forever). Confirm ONCE at full depth before
+                    // accepting the iteration's result.
+                    Tunables.AspFailHighRed = 2
+                    && not arbitrated
+                    && lastFailHighBeta <> System.Int32.MinValue
+                    && attemptDepth < depth
+                then
+                    arbitrated <- true
+                    attemptDepth <- depth
+                    lastFailHighBeta <- System.Int32.MinValue
                 else
                     searching <- false
 
