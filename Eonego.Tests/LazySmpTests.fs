@@ -54,35 +54,10 @@ let ``multi-thread pruning-off search returns a legal move and a sane score`` ()
         Assert.True(abs s < 2000, sprintf "threads=%d score %d outside the sane startpos-depth6 range" threads s)
 
 [<Fact>]
-let ``work-queue root parallelism plays the incumbent best root move`` () =
-    // Regression: iterativeDeepeningRootPar's phase 1 set `w.RootBest <- w.Pv.[0]`, but PV row 0 is never
-    // written on the root-par path (negamax runs at ply 1), so RootBest stayed MoveNone whenever the
-    // incumbent rootMoves.[0] remained best — and go() then fell back to the FIRST GENERATED legal move.
-    // Here d2d5 wins the hanging queen and is confirmed best every depth from 1 on, while the first
-    // generated rook move is d2d1: the bug plays d2d1, the fix plays d2d5. Eval-dependent (soft-skip
-    // without the net file); the forced win is thread-count-proof, so SMP nondeterminism can't flip it.
-    match tryLoadNet () with
-    | None -> ()
-    | Some net ->
-        let cfg =
-            { defaultConfig with
-                Threads = 4
-                UseWorkQueue = true }
-
-        let tt = TranspositionTable(16)
-
-        let control =
-            SearchControl(cfg, { defaultLimits with Depth = 6 }, tt, "7k/8/8/3q4/8/8/3R4/K7 w - - 0 1", [||], net)
-
-        let best = go control
-        Assert.Equal("d2d5", toUci best)
-
-[<Fact>]
 let ``Phase 3 Lazy-SMP scaling: 4T nps > 1T nps (sanity gate)`` () =
-    // Phase 3 gate: with the Phase 1 acc-checkpoint cache + Phase 2 DAG table shared across all workers,
-    // 4-thread Lazy-SMP must visit strictly MORE nodes than 1-thread in the SAME wall-clock budget. The
-    // existing Lazy-SMP plumbing spawns N workers each running iterative-deepening; they share the lock-free
-    // TT + acc-checkpoint + DagNodeTable, so one worker's findings propagate to the others' subsequent
+    // SMP gate: 4-thread Lazy-SMP must visit strictly MORE nodes than 1-thread in the SAME wall-clock
+    // budget. The Lazy-SMP plumbing spawns N workers each running iterative-deepening; they share the
+    // lock-free TT + acc-checkpoint cache, so one worker's findings propagate to the others' subsequent
     // iterations — even without fine-grained work-stealing. The bench-friendly `Threads`/`Nodes` time budget
     // asserts that downscaling-up IS observed. The aggressive 0.7× linear-to-8c threshold would require a
     // full task-parallel work-stealing rewrite (deferred per the pragmatic Phase 3 scope); this gate catches

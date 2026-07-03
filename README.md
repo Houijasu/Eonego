@@ -26,7 +26,7 @@ node-count sweeps and SPRT self-play matches.
 - Negamax / PVS with quiescence, **LazySMP** parallelism, and SF-style **thread voting**
   over the workers' root results
 - XOR-lockless (Hyatt) transposition table, 4-entry 64-byte clusters, 5-bit aging
-- Aspiration windows, iterative deepening; optional root-move work-queue mode
+- Aspiration windows, iterative deepening
 - Selectivity: null-move pruning (+ verification), reverse futility, razoring, ProbCut, IIR,
   LMR with history-driven tweaks, late-move (move-count) pruning, history / futility / SEE
   pruning, singular extensions with **multicut and negative extensions**, qsearch TT
@@ -71,7 +71,6 @@ dotnet test  Eonego.Tests/Eonego.Tests.fsproj -c Release   # 320 tests
 | `Hash` | 256 | Transposition table MB (1–65536) |
 | `MultiPV` | 1 | Extra reported lines (main worker only) |
 | `Move Overhead` | 10 | ms safety margin per move |
-| `Use Work Queue` | false | ABDADA subtree deferral on LazySMP (threads skip subtrees a sibling already searches; experimental, Threads > 1 only) |
 
 Everything else is deliberately hardwired; experimental features ship behind
 environment variables (default off unless noted) so A/B matches never need a rebuild:
@@ -85,7 +84,6 @@ environment variables (default off unless noted) so A/B matches never need a reb
 | `EONEGO_CORRMINOR=1` | Minor-piece correction-history rider |
 | `EONEGO_TT_REFRESH=1` | Probe hits re-stamp TT entry age |
 | `EONEGO_PARTIAL=1` | Adopt a hard-stopped iteration's best root move |
-| `EONEGO_ROOTPAR=1` | Legacy root-move work-queue parallelism (what `Use Work Queue` used to select) |
 | `EONEGO_CORRHIST=0` | Disable correction history (default on) |
 | `EONEGO_QSTT=0` / `EONEGO_TTEVADJ=0` | Disable qsearch-TT / TT-eval-adjust (default on) |
 | `EONEGO_CHECKEXT=1` / `EONEGO_QSEVCAP=1` | Legacy check extension / qsearch evasion cap |

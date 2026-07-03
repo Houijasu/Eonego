@@ -24,8 +24,6 @@
     <Compile Include="MovePickTests.fs" />
     <Compile Include="MovePickProbeTests.fs" />
     <Compile Include="TranspositionTests.fs" />
-    <Compile Include="DAGNodeTests.fs" />
-    <Compile Include="DAGQueueTests.fs" />
     <Compile Include="PliesFromNullTests.fs" />
     <Compile Include="SearchTests.fs" />
     <Compile Include="DrawDetectionTests.fs" />

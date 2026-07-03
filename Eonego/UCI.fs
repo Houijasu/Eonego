@@ -37,7 +37,7 @@ let private readEmbedded (name: string) : byte[] option =
         s.CopyTo ms
         Some(ms.ToArray())
 
-/// Tunable options: Threads, Hash, MultiPV, Move Overhead, Use Work Queue; every search toggle is
+/// Tunable options: Threads, Hash, MultiPV, Move Overhead; every search toggle is
 /// hardwired ON. The NNUE net is embedded in the binary (see Eonego.fsproj), so there is no EvalFile
 /// UCI option.
 type private UCIState =
@@ -45,7 +45,6 @@ type private UCIState =
       mutable HashMb: int
       mutable MultiPv: int
       mutable MoveOverhead: int
-      mutable UseWorkQueue: bool
       Net: Network option
       Tt: TranspositionTable
       mutable RootFen: string
@@ -189,17 +188,6 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
         writeLine ("bestmove " + toUci (Search.firstLegalMove p))
     | Some _ ->
         // All search toggles are hardwired ON; Threads/Hash/MultiPV/MoveOverhead come from state.
-        // "Use Work Queue" (the GUI checkbox) drives the ABDADA experiment: claim-only DAG table +
-        // move-loop deferral on classic LazySMP — threads skip subtrees a sibling already owns at
-        // sufficient depth. Wired for live GUI testing 2026-07-03 at user request; note the fixed-depth
-        // gate measured tree WIDENING (8T +14%, 16T +19% aggregate nodes), so it stays opt-in until
-        // play evidence says otherwise. EONEGO_ABDADA=1 still forces it without the GUI; the old
-        // root-move work-queue mode this option used to select moved to EONEGO_ROOTPAR=1.
-        let useAbdada =
-            st.UseWorkQueue || Environment.GetEnvironmentVariable("EONEGO_ABDADA") = "1"
-
-        let useRootPar = Environment.GetEnvironmentVariable("EONEGO_ROOTPAR") = "1"
-
         let cfg =
             { Threads = st.Threads
               HashMb = st.HashMb
@@ -229,18 +217,7 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
               UseR50Damp = (Environment.GetEnvironmentVariable("EONEGO_R50DAMP") <> "0")
               MoveOverhead = st.MoveOverhead
               AccCheckpointMb = 0
-              // ABDADA claims are transient (~threads × depth live entries), so 8 MB is generous; the
-              // legacy StatusDone-cutoff mode stays retired (measured −4-5% nps, +15% tree at 1T).
-              // SMP-only: at Threads=1 the table stays null and the deferral code is inert.
-              UseAbdada = useAbdada
-              DagHashMb = (if useAbdada && st.Threads > 1 then 8 else 0)
-              UseWorkQueue = useRootPar
               MultiPv = st.MultiPv }
-
-        // Visible confirmation for GUI testing: the checkbox path is otherwise only observable as an
-        // aggregate-node shift buried in SMP noise.
-        if cfg.UseAbdada && cfg.Threads > 1 then
-            writeLine "info string ABDADA deferral ON (claim-only DAG, 8 MB)"
 
         let control =
             SearchControl(cfg, lim, st.Tt, st.RootFen, st.RootMoves, ?net = st.Net)
@@ -293,11 +270,6 @@ let private handleSetOption (st: UCIState) (tokens: string[]) =
             st.MultiPv <- max 1 (min 256 v)
         elif String.Equals(name, "Move Overhead", StringComparison.OrdinalIgnoreCase) then
             st.MoveOverhead <- max 0 (min 5000 v)
-        elif String.Equals(name, "Use Work Queue", StringComparison.OrdinalIgnoreCase) then
-            // UCI check options arrive as the STRINGS "true"/"false" (tryInt parsed both as 0, so the
-            // checkbox could never turn anything on from a GUI — fixed alongside the ABDADA wiring).
-            st.UseWorkQueue <-
-                String.Equals(tokens.[vi + 1], "true", StringComparison.OrdinalIgnoreCase) || v <> 0
     // Any other (legacy/hardwired) option is silently ignored.
     | _ -> ()
 
@@ -313,7 +285,6 @@ let run () =
           HashMb = DefaultHashMb
           MultiPv = 1
           MoveOverhead = 10
-          UseWorkQueue = false
           Net = net
           Tt = TranspositionTable(DefaultHashMb)
           RootFen = StartPosFen
@@ -339,7 +310,6 @@ let run () =
                     writeLine "option name Hash type spin default 256 min 1 max 65536"
                     writeLine "option name MultiPV type spin default 1 min 1 max 256"
                     writeLine "option name Move Overhead type spin default 10 min 0 max 5000"
-                    writeLine "option name Use Work Queue type check default false"
                     writeLine "uciok"
                 | "isready" ->
                     writeLine "readyok"

@@ -24,8 +24,6 @@ open Eonego.History
 open Eonego.MovePick
 open Eonego.Transposition
 open Eonego.AccCheckpoint
-open Eonego.DagNode
-open Eonego.DagWorkQueue
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -147,27 +145,12 @@ type SearchConfig =
       // the draw score instead of holding full value until the search's rule-50 horizon. Identity at
       // rule50=0; perturbs ALL search trees (deep nodes accumulate counter), hence config-gated.
       UseR50Damp: bool
-      // ABDADA (SMP only, needs DagHashMb > 0): claim nodes in the DAG table while searching them and
-      // DEFER moves whose child a sibling thread already owns at sufficient depth — de-duplicates
-      // concurrent subtree work. Claim-only: the old StatusDone cutoff is retired (measured harmful).
-      UseAbdada: bool
       MoveOverhead: int
       // Phase 1: NNUE accumulator checkpoint cache. Set to 0 to disable; ~4 MiB is the recommended default
       // (1024 slots, ~4.1 KiB/slot). Cleared per search by `SearchControl.NewSearch` (alongside the TT gen
       // bump). Probes are best-effort lock-free (matching the TT); populates on each successful
       // `Position.EnsureBothComputed` materialization.
       AccCheckpointMb: int
-      // Phase 2: DAG node table. Set to 0 to disable; ~2 MiB is the default (the table carries in-flight
-      // partial-result + alpha/beta-window metadata the TT cannot encode). Worker search routes through the DAG
-      // claim/probe/complete lifecycle for nodes within the split-ply window; fallback to plain recursion
-      // outside that window or when the table is full.
-      DagHashMb: int
-      // Phase 3: root-move work distribution via the Vyukov MPMC work queue. OFF (default) = classic LazySMP
-      // (every worker independently searches the full tree, sharing only via TT/DAG). ON = root parallelism:
-      // the main worker searches the best root move (full PVS window) and pushes the rest to a shared
-      // DagWorkQueue; all workers pop root moves and search them with null windows. The TT carries the
-      // results back to the main worker's collection phase. Falls back to LazySMP when Threads <= 1.
-      UseWorkQueue: bool
       // Number of principal variations to report (UCI MultiPV). 1 = classic single-PV search. >1 makes the
       // main worker search each root line with the previous lines' best moves excluded at the root; helpers
       // always run single-PV. Forces the classic LazySMP path (no root-move work queue).
@@ -211,11 +194,8 @@ let defaultConfig =
       UsePartialCommit = false
       UseCont4 = false
       UseR50Damp = true
-      UseAbdada = false
       MoveOverhead = 10
       AccCheckpointMb = 0
-      DagHashMb = 0
-      UseWorkQueue = false
       MultiPv = 1 }
 
 let defaultLimits =
@@ -374,18 +354,6 @@ type SearchControl
     // `NewSearch` alongside `tt.newSearch`.
     let accCheckpoint: AccCheckpointTable =
         if config.AccCheckpointMb <= 0 then null else AccCheckpointTable(config.AccCheckpointMb)
-    // Phase 2: per-search DAG node table. `null` when disabled in config. Carries in-flight partial-result
-    // + alpha/beta-window metadata the TT cannot encode; the worker search's claim->expand->complete lifecycle
-    // routes through it (Phase 2+). Cleared per search alongside the TT and the accumulator cache.
-    let dagTable: DagNodeTable =
-        if config.DagHashMb <= 0 then null else DagNodeTable(config.DagHashMb)
-    // Phase 3: root-move work-distribution queue (Vyukov MPMC). `null` when UseWorkQueue is off or Threads <= 1.
-    // Recreated per search in `NewSearch` (drained + fresh). The main worker pushes unsearched root-move keys
-    // each iteration; all workers pop and search the corresponding subtree with a null PVS window.
-    let mutable workQueue: DagWorkQueue = null
-    // Shared alpha published by the main worker after its first-move PVS search, so helpers know the null-window
-    // bound. Volatile — read by helpers, written by main.
-    let mutable sharedRootAlpha = 0
     member _.Config = config
     member _.Limits = limits
     member _.Tt = tt
@@ -394,13 +362,6 @@ type SearchControl
     member _.Net: Network option = net
     /// Borrowed reference to the per-search accumulator checkpoint cache; `null` when disabled in config.
     member _.AccCheckpoint: AccCheckpointTable = accCheckpoint
-    /// Borrowed reference to the per-search DAG node table; `null` when disabled in config.
-    member _.DagTable: DagNodeTable = dagTable
-    /// Borrowed reference to the per-search work-distribution queue; `null` when UseWorkQueue is off.
-    member _.WorkQueue: DagWorkQueue = workQueue
-    /// Shared root alpha for the null-window helper searches (published by the main worker).
-    member _.SharedRootAlpha: int = Volatile.Read(&sharedRootAlpha)
-    member _.SetSharedRootAlpha(v: int) = Volatile.Write(&sharedRootAlpha, v)
     member val LastBest: Move = MoveNone with get, set // result of the most recent go()
     member val LastScore: int = 0 with get, set
     /// Aggregate live node count across all workers (relaxed reads — reporting only, set by go()).
@@ -415,14 +376,6 @@ type SearchControl
         match accCheckpoint with
         | null -> ()
         | cache -> cache.Clear()
-        match dagTable with
-        | null -> ()
-        | dag -> dag.NewSearch()
-        // Phase 3: recreate the work queue fresh for each search (guarantees empty + resets Vyukov seqs).
-        if config.UseWorkQueue && config.Threads > 1 then
-            workQueue <- DagWorkQueue(256)
-        else
-            workQueue <- null
     member _.ElapsedMs: int64 = elapsedMs ()
 
     member _.SoftTimeUp: bool =
@@ -507,9 +460,6 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     let exclMoveBuf: Move[] = Array.zeroCreate (MaxSearchPly * MaxMoves)
     let exclScoreBuf: int[] = Array.zeroCreate (MaxSearchPly * MaxMoves)
     let exclQuietsBuf: Move[] = Array.zeroCreate (MaxSearchPly * MaxMoves)
-    // ABDADA: per-ply buffer of moves deferred because a sibling thread owned the child position
-    // (exclusion searches never defer, so no Excl variant is needed).
-    let deferBuf: Move[] = Array.zeroCreate (MaxSearchPly * MaxMoves)
     let pv: Move[] = Array.zeroCreate (MaxSearchPly * MaxSearchPly)
     let mutable nodes = 0L
     let mutable selDepth = 0
@@ -534,7 +484,6 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     member _.ExclMoveBuf = exclMoveBuf
     member _.ExclScoreBuf = exclScoreBuf
     member _.ExclQuietsBuf = exclQuietsBuf
-    member _.DeferBuf = deferBuf
     member _.Pv = pv
 
     member _.Nodes
@@ -927,9 +876,6 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
         let mutable ttEval = VALUE_NONE
         let mutable ttDepth = 0
         let mutable ttBound = BoundNone
-        // ABDADA claim token: `TryClaim` marks this node StatusExpanding so sibling threads defer their
-        // entry into the same subtree; Cancel-on-exit (the function tail) is the sole release.
-        let mutable dagClaim = NoClaim
         // ttPv: this node is (or was) on a PV. Sticky — start from isPv, OR in a probed former-PV mark.
         let mutable ttPv = isPv
 
@@ -966,28 +912,6 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                     then
                         result <- ttScore
                         produced <- true
-
-        // 2b. ABDADA claim: publish "this node is being searched at depthIn" so sibling threads defer
-        // their entry into the same subtree (the move-loop probe below). Claim-ONLY — the original DAG
-        // design's StatusDone verbatim cutoff is retired for good (measured −4-5% nps AND +15% tree at
-        // 1T; its cutoff semantics are dominated by the TT's fail-soft bound logic). Best-effort: on
-        // race/cluster-full the search proceeds unclaimed, exactly like before. Gated off during
-        // exclusion searches (their key equals a normal search's) and at shallow depth (table churn).
-        if
-            not produced
-            && cfg.UseAbdada
-            && excludedMove = MoveNone
-            && depthIn >= Tunables.AbdadaClaimMinDepth
-        then
-            match w.Control.DagTable with
-            | null -> ()
-            | dag ->
-                // Probe-before-claim: skips TryClaim's cluster-reservation CAS when another worker
-                // already owns the key (the common contended case).
-                let struct (st, _, _, _, _, _) = dag.Probe pos.Key
-
-                if st = StatusEmpty then
-                    dagClaim <- dag.TryClaim pos.Key alpha beta depthIn
 
         // 3. static eval (+ "improving": static eval higher than 2 plies ago — hoisted up so ProbCut/pruning
         //    can read it; prunes less when our position is improving). `staticEval` is the CORRECTED value
@@ -1246,21 +1170,6 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
             // Multicut (set in the singular block): the node fails high on TWO moves at reduced depth, so
             // the whole move loop is abandoned and `best` returned WITHOUT a TT store.
             let mutable multicut = false
-            // ABDADA deferral: moves skipped because a sibling thread already owns the child at
-            // sufficient depth land in deferSpan and are re-tried in ONE pass after the picker drains.
-            // Disabled during exclusion searches (same-ply recursion shares this ply's buffer slice, and
-            // deferring inside a singular probe is semantically wrong anyway).
-            let abdadaDefer =
-                cfg.UseAbdada
-                && excludedMove = MoveNone
-                && (match w.Control.DagTable with
-                    | null -> false
-                    | _ -> true)
-
-            let deferSpan = w.DeferBuf.AsSpan(bufBase, MaxMoves)
-            let mutable nDeferred = 0
-            let mutable deferIdx = 0
-            let mutable deferredPass = false
             let mutable m = nextMove &mp skipQuiets
 
             while m <> MoveNone && not cutoff do
@@ -1418,7 +1327,6 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                                     ext <- ext - 2
 
                     let mutable newDepth = 0
-                    let mutable deferredNow = false
 
                     if doMove && not multicut then
                         // Cap so check + double extensions can't push newDepth past depthIn + 1.
@@ -1434,30 +1342,6 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                         pos.Make m
                         w.Control.Tt.Prefetch pos.Key // child probes this exact key at entry
 
-                        // ABDADA: if a sibling thread owns this exact child at >= our target depth, defer
-                        // the move instead of duplicating its subtree. Never the first move (the PV move
-                        // is searched here regardless), never on the deferred pass itself. On defer:
-                        // unmake and roll back moveCount — LMP/futility/LMR all key on it, and the quiets
-                        // append below runs only for moves actually searched.
-                        if
-                            abdadaDefer
-                            && not deferredPass
-                            && moveCount > 1
-                            && newDepth >= Tunables.AbdadaDeferMinDepth
-                        then
-                            match w.Control.DagTable with
-                            | null -> ()
-                            | dag ->
-                                let struct (childStatus, _, _, _, _, childDepth) = dag.Probe pos.Key
-
-                                if childStatus = StatusExpanding && childDepth >= newDepth then
-                                    deferredNow <- true
-                                    pos.Unmake m
-                                    moveCount <- moveCount - 1
-                                    deferSpan.[nDeferred] <- m
-                                    nDeferred <- nDeferred + 1
-
-                    if doMove && not multicut && not deferredNow then
                         if isQuiet && nQuiets < MaxMoves - 1 then
                             quietsBuf.[quietsBase + nQuiets] <- m
                             nQuiets <- nQuiets + 1
@@ -1593,24 +1477,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
                                         w.Tables.UpdateCapture (pos.PieceOn(fromSq m)) (toSq m) capPt bonus
 
-                m <-
-                    if cutoff then
-                        MoveNone
-                    else
-                        let nm = if deferredPass then MoveNone else nextMove &mp skipQuiets
-
-                        if nm <> MoveNone then
-                            nm
-                        elif deferIdx < nDeferred then
-                            // Picker drained: single pass over the deferred moves. deferredPass blocks
-                            // re-deferral; each move re-enters the full legality/pruning body at the
-                            // CURRENT alpha (a deferred move getting LMP'd now is a feature).
-                            deferredPass <- true
-                            let dm = deferSpan.[deferIdx]
-                            deferIdx <- deferIdx + 1
-                            dm
-                        else
-                            MoveNone
+                m <- if cutoff then MoveNone else nextMove &mp skipQuiets
 
             if moveCount = 0 then
                 // No legal move searched. During an exclusion search this means the excluded move was the
@@ -1650,13 +1517,6 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                         w.Tables.UpdateCorrMinor pos.SideToMove pos.MinorKey bonus
 
                 result <- best
-
-        // Sole claim release (ABDADA is claim-only; `Complete` is unused). The single-exit structure
-        // guarantees this runs on every path — early cutoffs, multicut, stop, no-legal-moves.
-        if dagClaim <> NoClaim then
-            match w.Control.DagTable with
-            | null -> ()
-            | dag -> dag.Cancel(dagClaim, pos.Key) |> ignore
 
         result
 
@@ -1916,159 +1776,6 @@ let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
         w.RootScore <- w.IterScore
 
 // ---------------------------------------------------------------------------
-// Root-move parallelism (Phase 3): the main worker searches the first (best) root
-// move with a full PVS window and pushes the rest to a shared DagWorkQueue. All
-// workers pop root-move keys and search the corresponding subtree with a null PVS
-// window. The TT carries results back to the main worker's collection phase, which
-// re-searches any fail-high moves with a full window. A Barrier synchronises the
-// three phases per depth: (1) main pushes, (2) all search, (3) main collects.
-// ---------------------------------------------------------------------------
-let iterativeDeepeningRootPar (w: Worker) (maxDepth: int) (barrier: Threading.Barrier)
-                              (rootMoves: Move[]) (rootKeys: uint64[]) =
-    let cfg = w.Control.Config
-    let queue = w.Control.WorkQueue
-    let mutable prev = evalPos w w.Pos
-    let mutable depth = 1
-
-    while depth <= maxDepth && not w.Control.Stopped do
-        let mutable bestMove = rootMoves.[0]
-        let mutable bestScore = -INF
-        let mutable alpha = -INF
-
-        if w.IsMain then
-            // Phase 1: search the first (best) root move with the aspiration window (same loop as ID).
-            let mutable delta =
-                if cfg.UseAspTweaks then
-                    Tunables.AspInitDelta + prev * prev / Tunables.AspSqDiv
-                else
-                    16
-            let fullWindow = depth <= 4 || abs prev >= MATE_IN_MAX_PLY
-            let mutable aspAlpha = if fullWindow then -INF else max (-INF) (prev - delta)
-            let mutable aspBeta = if fullWindow then INF else min INF (prev + delta)
-            let mutable score = 0
-            let mutable searching = true
-            let mutable attemptDepth = depth
-
-            while searching do
-                w.Pos.Make rootMoves.[0]
-                score <- -(negamax w w.Pos (-aspBeta) (-aspAlpha) (max 1 attemptDepth) 1 true false)
-                w.Pos.Unmake rootMoves.[0]
-
-                if w.Control.Stopped then
-                    searching <- false
-                elif score <= aspAlpha then
-                    aspBeta <- (aspAlpha + aspBeta) / 2
-                    aspAlpha <- max (-INF) (score - delta)
-                    delta <- delta * 2
-                    attemptDepth <- depth
-                elif score >= aspBeta then
-                    aspBeta <- min INF (score + delta)
-                    delta <- delta * 2
-                    if cfg.UseAspTweaks && attemptDepth > depth - 3 && abs score < MATE_IN_MAX_PLY then
-                        attemptDepth <- attemptDepth - 1
-                else
-                    searching <- false
-
-            if not w.Control.Stopped then
-                bestScore <- score
-                bestMove <- rootMoves.[0]
-                alpha <- score
-                prev <- score
-                w.RootScore <- score
-                // NOT w.Pv.[0]: root-par searches at ply 1, so PV row 0 is never written — reading it
-                // left RootBest = MoveNone whenever the incumbent stayed best, and go() then fell back
-                // to the first generated legal move (see the LazySmpTests regression test).
-                w.RootBest <- rootMoves.[0]
-                w.CompletedDepth <- depth
-                w.Control.SetSharedRootAlpha alpha
-
-                // Phase 2: push remaining root-move keys to the work queue for helpers (and self).
-                for i in 1 .. rootMoves.Length - 1 do
-                    queue.TryPush rootKeys.[i] |> ignore
-
-        // Barrier 1: main has pushed (or stopped); all workers proceed to pop+search.
-        barrier.SignalAndWait()
-
-        // Phase 3: all workers pop root-move keys and search with a null PVS window.
-        if not w.Control.Stopped then
-            let mutable searching = true
-
-            while searching && not w.Control.Stopped do
-                match queue.TryPop() with
-                | Some key ->
-                    let mutable idx = -1
-                    let mutable i = 1
-
-                    while idx < 0 && i < rootMoves.Length do
-                        if rootKeys.[i] = key then idx <- i
-                        i <- i + 1
-
-                    if idx > 0 then
-                        let nullAlpha = w.Control.SharedRootAlpha
-                        w.Pos.Make rootMoves.[idx]
-                        let _ = negamax w w.Pos (-nullAlpha - 1) (-nullAlpha) (max 1 (depth - 1)) 1 false true
-                        w.Pos.Unmake rootMoves.[idx]
-                | None ->
-                    searching <- false
-
-        // Barrier 2: all workers done searching; main proceeds to collect.
-        barrier.SignalAndWait()
-
-        if w.IsMain then
-            // Drain leftovers (a worker stopped mid-pop leaves items; safe to discard — TT has partial data).
-            while (queue.TryPop() |> Option.isSome) do ()
-
-            if not w.Control.Stopped then
-                // Phase 4: collect results from TT, re-search fail-highs with full window.
-                for i in 1 .. rootMoves.Length - 1 do
-                    let struct (hit, _, sc, _, dp, bd, _) = w.Control.Tt.Probe rootKeys.[i]
-
-                    if hit && dp >= depth - 1 then
-                        // The entry belongs to the position AFTER rootMoves.[i] (opponent to move): its
-                        // score is from the OPPONENT's perspective, so the root move is worth -score —
-                        // and the root move failing HIGH is the child failing LOW (BoundUpper).
-                        let score = -(valueFromTt sc 1)
-
-                        if (bd = BoundUpper || bd = BoundExact) && score > alpha then
-                            w.Pos.Make rootMoves.[i]
-                            let v = -(negamax w w.Pos (-INF) (-alpha) (max 1 (depth - 1)) 1 true false)
-                            w.Pos.Unmake rootMoves.[i]
-
-                            if not w.Control.Stopped && v > alpha then
-                                alpha <- v
-                                bestScore <- v
-                                bestMove <- rootMoves.[i]
-                                w.RootScore <- v
-                                w.RootBest <- rootMoves.[i]
-                                w.Control.SetSharedRootAlpha alpha
-
-                w.CompletedDepth <- depth
-                reportInfo w depth bestScore
-
-                if abs bestScore >= MATE_IN_MAX_PLY then
-                    w.Control.Stop()
-
-        // Barrier 3: ready for next depth (helpers wait while main collects + reorders).
-        barrier.SignalAndWait()
-
-        depth <- depth + 1
-
-        // Reorder: move the best root move to [0] so the next iteration's PVS first-move is the strongest.
-        if w.IsMain && bestMove <> rootMoves.[0] && bestMove <> MoveNone then
-            let idx = Array.IndexOf(rootMoves, bestMove)
-
-            if idx > 0 then
-                let tmpM = rootMoves.[0]
-                rootMoves.[0] <- rootMoves.[idx]
-                rootMoves.[idx] <- tmpM
-                let tmpK = rootKeys.[0]
-                rootKeys.[0] <- rootKeys.[idx]
-                rootKeys.[idx] <- tmpK
-
-        if w.IsMain && w.Control.SoftTimeUp then
-            w.Control.Stop()
-
-// ---------------------------------------------------------------------------
 // Time budget (v1): movetime, or wtime/winc(+movestogo); depth/nodes/mate/infinite => no time stop.
 // ---------------------------------------------------------------------------
 let computeTimes (moveOverhead: int) (l: SearchLimits) (stm: Color) : int64 * int64 =
@@ -2193,73 +1900,22 @@ let private goCore (control: SearchControl) (workers: Worker[]) : Move =
         else
             (MaxSearchPly - 1)
 
-    // Branch: root-move parallelism (Phase 3) vs classic LazySMP. MultiPV needs per-line root exclusion,
-    // which the root-par phases don't support — force the classic path.
-    let useRootPar =
-        control.Config.UseWorkQueue
-        && n > 1
-        && control.WorkQueue <> null
-        && control.Config.MultiPv <= 1
+    let threads =
+        [| for i in 1 .. n - 1 ->
+               let w = workers.[i]
 
-    if useRootPar then
-        // Generate root moves + their resulting position keys from the main worker's Position.
-        let p = NativePtr.stackalloc<Move> MaxMoves
-        let buf = Span<Move>(NativePtr.toVoidPtr p, MaxMoves)
-        let nMoves = generateLegal workers.[0].Pos buf
+               let t =
+                   Thread(ThreadStart(fun () -> iterativeDeepening w maxDepth), 16 * 1024 * 1024)
 
-        let rootMoves: Move[] =
-            if nMoves = 0 then
-                [| MoveNone |]
-            else
-                buf.Slice(0, nMoves).ToArray()
+               t.IsBackground <- true
+               t.Start()
+               t |]
 
-        let rootKeys: uint64[] = Array.zeroCreate rootMoves.Length
+    iterativeDeepening workers.[0] maxDepth
+    control.Stop()
 
-        for i in 0 .. rootMoves.Length - 1 do
-            workers.[0].Pos.Make rootMoves.[i]
-            rootKeys.[i] <- workers.[0].Pos.Key
-            workers.[0].Pos.Unmake rootMoves.[i]
-
-        let barrier = new Barrier(n)
-
-        let threads =
-            [| for i in 1 .. n - 1 ->
-                   let w = workers.[i]
-
-                   let t =
-                       Thread(
-                           ThreadStart(fun () -> iterativeDeepeningRootPar w maxDepth barrier rootMoves rootKeys),
-                           16 * 1024 * 1024
-                       )
-
-                   t.IsBackground <- true
-                   t.Start()
-                   t |]
-
-        iterativeDeepeningRootPar workers.[0] maxDepth barrier rootMoves rootKeys
-        control.Stop()
-
-        for t in threads do
-            t.Join()
-
-        barrier.Dispose()
-    else
-        let threads =
-            [| for i in 1 .. n - 1 ->
-                   let w = workers.[i]
-
-                   let t =
-                       Thread(ThreadStart(fun () -> iterativeDeepening w maxDepth), 16 * 1024 * 1024)
-
-                   t.IsBackground <- true
-                   t.Start()
-                   t |]
-
-        iterativeDeepening workers.[0] maxDepth
-        control.Stop()
-
-        for t in threads do
-            t.Join()
+    for t in threads do
+        t.Join()
 
     // EONEGO_PROF=1: one-line phase breakdown (Threads=1 semantics; see PosProf doc). String concat, not
     // sprintf — Printf formatters crash under NativeAOT (see fsharp-dotnet-aot-gotchas).
@@ -2293,13 +1949,12 @@ let private goCore (control: SearchControl) (workers: Worker[]) : Move =
 
         writeLine ("info string prof3 align " + workers.[0].Pos.ProfAlignReport())
 
-    // Thread vote (classic LazySMP, single-PV only): helpers' completed-iteration results outvote the
-    // main worker when a deeper/better-scoring consensus exists. Root-par helpers never publish
-    // RootBest (vote would degenerate to worker 0), and MultiPV's bestmove must match the main
-    // worker's reported line 1 — both keep the legacy worker-0 selection. n = 1 bypass keeps the
-    // single-thread path structurally identical (LazySmpTests determinism).
+    // Thread vote (single-PV only): helpers' completed-iteration results outvote the main worker when
+    // a deeper/better-scoring consensus exists. MultiPV's bestmove must match the main worker's
+    // reported line 1 — it keeps the legacy worker-0 selection. n = 1 bypass keeps the single-thread
+    // path structurally identical (LazySmpTests determinism).
     let chosen =
-        if n = 1 || useRootPar || control.Config.MultiPv > 1 then
+        if n = 1 || control.Config.MultiPv > 1 then
             workers.[0]
         else
             let vMoves = Array.init n (fun i -> workers.[i].RootBest)

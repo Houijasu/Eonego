@@ -38,8 +38,7 @@ let private cfgBase =
         // Rule-50 damping perturbs every eval whose subtree accumulated halfmove count — enough to
         // flip the tuned node-count fixture below (measured 2026-07-03: nOn 19576 -> 26124). Pin it
         // off like the other post-hoc heuristics so these fixtures keep measuring ProbCut alone.
-        UseR50Damp = false
-        UseAbdada = false }
+        UseR50Damp = false }
 
 let private cfgOn = cfgBase                                         // UseProbCut = true
 let private cfgOff = { cfgBase with UseProbCut = false }

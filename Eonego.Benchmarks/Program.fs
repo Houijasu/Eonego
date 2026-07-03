@@ -598,8 +598,7 @@ type AccCheckpointSearchBench() =
                 HashMb = 16
                 UseTt = true
                 UsePruning = true
-                AccCheckpointMb = 4
-                DagHashMb = 0 } // isolate Phase 1's contribution: DAG off in both branches
+                AccCheckpointMb = 4 }
 
         let cfgOff =
             { defaultConfig with
@@ -607,8 +606,7 @@ type AccCheckpointSearchBench() =
                 HashMb = 16
                 UseTt = true
                 UsePruning = true
-                AccCheckpointMb = 0
-                DagHashMb = 0 }
+                AccCheckpointMb = 0 }
 
         let ttOn = TranspositionTable(16)
         let controlOn = SearchControl(cfgOn, defaultLimits, ttOn, fen, [||], ?net = net)
@@ -630,64 +628,6 @@ type AccCheckpointSearchBench() =
 
     [<Benchmark>]
     member _.SearchDepth7CacheOn() =
-        negamax workerOn workerOn.Pos (-INF) INF 7 0 true false
-
-/// Phase 2 — DAG node table A/B (DAG-on vs DAG-off). The DAG adds a per-node probe+claim+complete overhead;
-/// the Phase 2 acceptance gate is "nps within 2% of baseline" for the no-transposition-rich Kiwipede depth-7
-/// search (Phase 2's value proposition is structural correctness — additional cutoffs land in Phase 3+ via
-/// work-stealing reuse). Both branches have the Phase 1 acc-checkpoint enabled so the perf delta isolates
-/// the DAG wiring.
-[<MemoryDiagnoser>]
-[<ShortRunJob>]
-type DagSearchBench() =
-
-    let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -" // Kiwipete (rich tree)
-    let mutable workerOn = Unchecked.defaultof<Worker>
-    let mutable workerOff = Unchecked.defaultof<Worker>
-    let mutable net: Network option = None
-
-    [<GlobalSetup>]
-    member _.Setup() =
-        net <- loadFullThreatsNet ()
-
-        let cfgOn =
-            { defaultConfig with
-                Threads = 1
-                HashMb = 16
-                UseTt = true
-                UsePruning = true
-                AccCheckpointMb = 4
-                DagHashMb = 2 }
-
-        let cfgOff =
-            { defaultConfig with
-                Threads = 1
-                HashMb = 16
-                UseTt = true
-                UsePruning = true
-                AccCheckpointMb = 4
-                DagHashMb = 0 }
-
-        let ttOn = TranspositionTable(16)
-        let controlOn = SearchControl(cfgOn, defaultLimits, ttOn, fen, [||], ?net = net)
-        workerOn <- Worker(0, true, controlOn)
-        workerOn.SetupRoot()
-        controlOn.Reset()
-        controlOn.StartClock 0L 0L
-
-        let ttOff = TranspositionTable(16)
-        let controlOff = SearchControl(cfgOff, defaultLimits, ttOff, fen, [||], ?net = net)
-        workerOff <- Worker(0, true, controlOff)
-        workerOff.SetupRoot()
-        controlOff.Reset()
-        controlOff.StartClock 0L 0L
-
-    [<Benchmark(Baseline = true)>]
-    member _.SearchDepth7DagOff() =
-        negamax workerOff workerOff.Pos (-INF) INF 7 0 true false
-
-    [<Benchmark>]
-    member _.SearchDepth7DagOn() =
         negamax workerOn workerOn.Pos (-INF) INF 7 0 true false
 
 /// Multi-threaded entry for benchmarking only: mirrors `Search.go`'s thread topology (N workers sharing one
@@ -738,54 +678,8 @@ let private searchNodesMultiThreaded (fen: string) (nodes: int64) (cfg: SearchCo
 
     total
 
-/// Phase 2 multi-threaded A/B (DAG-on vs DAG-off) at real LazySMP concurrency. `DagSearchBench` above is
-/// Threads=1-only and therefore cannot exercise contention on the shared per-cluster reservation flags
-/// (claim/complete/cancel races between unrelated, non-colliding clusters); this variant runs the SAME
-/// Kiwipete tree under genuine N-worker contention via a fixed NODE budget (so wall time scales down with N
-/// instead of the per-thread workload growing) and reports DAG on/off at each N.
-[<MemoryDiagnoser>]
-[<ShortRunJob>]
-type DagSearchMtBench() =
-
-    let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -" // Kiwipete (rich tree)
-    let nodeBudget = 200_000L
-    let mutable net: Network option = None
-
-    [<Params(1, 4, 8)>]
-    member val Threads = 1 with get, set
-
-    [<GlobalSetup>]
-    member _.Setup() =
-        net <- loadFullThreatsNet ()
-
-    [<Benchmark(Baseline = true)>]
-    member this.SearchNodesDagOff() =
-        let cfg =
-            { defaultConfig with
-                Threads = this.Threads
-                HashMb = 16
-                UseTt = true
-                UsePruning = true
-                AccCheckpointMb = 4
-                DagHashMb = 0 }
-
-        searchNodesMultiThreaded fen nodeBudget cfg net
-
-    [<Benchmark>]
-    member this.SearchNodesDagOn() =
-        let cfg =
-            { defaultConfig with
-                Threads = this.Threads
-                HashMb = 16
-                UseTt = true
-                UsePruning = true
-                AccCheckpointMb = 4
-                DagHashMb = 2 }
-
-        searchNodesMultiThreaded fen nodeBudget cfg net
-
-/// Phase 1 multi-threaded A/B (checkpoint-cache-on vs off), isolating the AccCheckpoint contribution (DAG off
-/// in both branches) at real concurrency instead of the Threads=1-only `AccCheckpointSearchBench` above.
+/// Phase 1 multi-threaded A/B (checkpoint-cache-on vs off), isolating the AccCheckpoint contribution
+/// at real concurrency instead of the Threads=1-only `AccCheckpointSearchBench` above.
 [<MemoryDiagnoser>]
 [<ShortRunJob>]
 type AccCheckpointSearchMtBench() =
@@ -809,8 +703,7 @@ type AccCheckpointSearchMtBench() =
                 HashMb = 16
                 UseTt = true
                 UsePruning = true
-                AccCheckpointMb = 0
-                DagHashMb = 0 }
+                AccCheckpointMb = 0 }
 
         searchNodesMultiThreaded fen nodeBudget cfg net
 
@@ -822,8 +715,7 @@ type AccCheckpointSearchMtBench() =
                 HashMb = 16
                 UseTt = true
                 UsePruning = true
-                AccCheckpointMb = 4
-                DagHashMb = 0 }
+                AccCheckpointMb = 4 }
 
         searchNodesMultiThreaded fen nodeBudget cfg net
 
@@ -842,9 +734,7 @@ let main argv =
                typeof<EvalBench>
                typeof<SearchBench>
                typeof<AccCheckpointSearchBench>
-               typeof<DagSearchBench>
-               typeof<AccCheckpointSearchMtBench>
-               typeof<DagSearchMtBench> |]
+               typeof<AccCheckpointSearchMtBench> |]
         )
         .Run(args)
     |> ignore

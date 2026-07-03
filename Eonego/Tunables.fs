@@ -111,11 +111,6 @@ let TmHardSoftMult = envInt "EONEGO_T_TM_HARDMULT" 4 2 12
 let StatBonusMul = envInt "EONEGO_T_STATB_MUL" 167 16 1000 // was 160
 let StatBonusCap = envInt "EONEGO_T_STATB_CAP" 1735 100 7000 // was 1700
 
-// --- ABDADA (EONEGO_ABDADA=1): claim nodes at >= ClaimMinDepth; defer a move when a sibling thread
-//     owns the child at >= DeferMinDepth (child depth). Shallow nodes churn the table for nothing. ---
-let AbdadaClaimMinDepth = envInt "EONEGO_T_ABDADA_CLAIM" 4 1 32
-let AbdadaDeferMinDepth = envInt "EONEGO_T_ABDADA_DEFER" 4 1 32
-
 // --- Gravity divisors (also the bonus clamp bounds). MUST stay < 32700: the gravity fixpoint keeps
 //     |entry| <= D, so the int16 stores in History.Tables can never overflow. ---
 let MainHistD = envInt "EONEGO_T_MAINHIST_D" 7183 1024 32000
