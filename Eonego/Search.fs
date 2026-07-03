@@ -1699,6 +1699,44 @@ let private reportLine (w: Worker) (depth: int) (pvNum: int) (score: int) (bound
             sb.Append(' ').Append(toUci mv) |> ignore
             i <- i + 1
 
+    // A mate PV can end well short of the announced distance: the search stops deepening once the
+    // mate is proven (clock-saving), qsearch keeps no PV rows, and mate-distance pruning returns at
+    // PV nodes before any move once the window is mate-bounded — while the TT still holds the whole
+    // proof. Extend the REPORTED line by replaying the array PV on the worker's root position and
+    // following legal TT moves from the tail, capped at the exact mate distance. Cold reporting path:
+    // main worker only, between searches, make/unmake balanced; every step legality-checked so a
+    // stale or replaced TT entry can never print an illegal line (the walk just stops short instead).
+    if i > 0 && abs score >= MATE_IN_MAX_PLY then
+        let matePlies = MATE - abs score
+        let pos = w.Pos
+        let made: Move[] = Array.zeroCreate MaxSearchPly
+        let mutable nMade = 0
+        let mutable ok = true
+
+        while ok && nMade < i do
+            let mv = pv.[pvBase + nMade]
+
+            if isLegalRoot pos mv then
+                pos.Make mv
+                made.[nMade] <- mv
+                nMade <- nMade + 1
+            else
+                ok <- false
+
+        while ok && nMade < matePlies && nMade < MaxSearchPly - 1 do
+            let struct (hit, m, _, _, _, _, _) = w.Control.Tt.Probe pos.Key
+
+            if hit && isLegalRoot pos m then
+                sb.Append(' ').Append(toUci m) |> ignore
+                pos.Make m
+                made.[nMade] <- m
+                nMade <- nMade + 1
+            else
+                ok <- false
+
+        for j in nMade - 1 .. -1 .. 0 do
+            pos.Unmake made.[j]
+
     if i = 0 && fallback <> MoveNone then
         sb.Append(' ').Append(toUci fallback) |> ignore
 
