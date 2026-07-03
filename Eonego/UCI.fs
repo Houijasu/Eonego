@@ -189,7 +189,16 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
         writeLine ("bestmove " + toUci (Search.firstLegalMove p))
     | Some _ ->
         // All search toggles are hardwired ON; Threads/Hash/MultiPV/MoveOverhead come from state.
-        let useAbdada = Environment.GetEnvironmentVariable("EONEGO_ABDADA") = "1"
+        // "Use Work Queue" (the GUI checkbox) drives the ABDADA experiment: claim-only DAG table +
+        // move-loop deferral on classic LazySMP — threads skip subtrees a sibling already owns at
+        // sufficient depth. Wired for live GUI testing 2026-07-03 at user request; note the fixed-depth
+        // gate measured tree WIDENING (8T +14%, 16T +19% aggregate nodes), so it stays opt-in until
+        // play evidence says otherwise. EONEGO_ABDADA=1 still forces it without the GUI; the old
+        // root-move work-queue mode this option used to select moved to EONEGO_ROOTPAR=1.
+        let useAbdada =
+            st.UseWorkQueue || Environment.GetEnvironmentVariable("EONEGO_ABDADA") = "1"
+
+        let useRootPar = Environment.GetEnvironmentVariable("EONEGO_ROOTPAR") = "1"
 
         let cfg =
             { Threads = st.Threads
@@ -220,14 +229,18 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
               UseR50Damp = (Environment.GetEnvironmentVariable("EONEGO_R50DAMP") <> "0")
               MoveOverhead = st.MoveOverhead
               AccCheckpointMb = 0
-              // ABDADA (EONEGO_ABDADA=1, SMP only): claim-only DAG table + move-loop deferral — threads
-              // skip subtrees a sibling already owns at sufficient depth. The legacy StatusDone-cutoff
-              // mode stays retired (measured −4-5% nps, +15% tree). Live claims are transient (~threads ×
-              // depth), so 8 MB is generous. Default OFF pending its SPRT vs the voting-lazy arm.
+              // ABDADA claims are transient (~threads × depth live entries), so 8 MB is generous; the
+              // legacy StatusDone-cutoff mode stays retired (measured −4-5% nps, +15% tree at 1T).
+              // SMP-only: at Threads=1 the table stays null and the deferral code is inert.
               UseAbdada = useAbdada
               DagHashMb = (if useAbdada && st.Threads > 1 then 8 else 0)
-              UseWorkQueue = st.UseWorkQueue
+              UseWorkQueue = useRootPar
               MultiPv = st.MultiPv }
+
+        // Visible confirmation for GUI testing: the checkbox path is otherwise only observable as an
+        // aggregate-node shift buried in SMP noise.
+        if cfg.UseAbdada && cfg.Threads > 1 then
+            writeLine "info string ABDADA deferral ON (claim-only DAG, 8 MB)"
 
         let control =
             SearchControl(cfg, lim, st.Tt, st.RootFen, st.RootMoves, ?net = st.Net)
@@ -281,7 +294,10 @@ let private handleSetOption (st: UCIState) (tokens: string[]) =
         elif String.Equals(name, "Move Overhead", StringComparison.OrdinalIgnoreCase) then
             st.MoveOverhead <- max 0 (min 5000 v)
         elif String.Equals(name, "Use Work Queue", StringComparison.OrdinalIgnoreCase) then
-            st.UseWorkQueue <- (v <> 0)
+            // UCI check options arrive as the STRINGS "true"/"false" (tryInt parsed both as 0, so the
+            // checkbox could never turn anything on from a GUI — fixed alongside the ABDADA wiring).
+            st.UseWorkQueue <-
+                String.Equals(tokens.[vi + 1], "true", StringComparison.OrdinalIgnoreCase) || v <> 0
     // Any other (legacy/hardwired) option is silently ignored.
     | _ -> ()
 

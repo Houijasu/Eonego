@@ -71,7 +71,7 @@ dotnet test  Eonego.Tests/Eonego.Tests.fsproj -c Release   # 320 tests
 | `Hash` | 256 | Transposition table MB (1–65536) |
 | `MultiPV` | 1 | Extra reported lines (main worker only) |
 | `Move Overhead` | 10 | ms safety margin per move |
-| `Use Work Queue` | false | Root-move parallelism instead of classic LazySMP |
+| `Use Work Queue` | false | ABDADA subtree deferral on LazySMP (threads skip subtrees a sibling already searches; experimental, Threads > 1 only) |
 
 Everything else is deliberately hardwired; experimental features ship behind
 environment variables (default off unless noted) so A/B matches never need a rebuild:
@@ -85,6 +85,7 @@ environment variables (default off unless noted) so A/B matches never need a reb
 | `EONEGO_CORRMINOR=1` | Minor-piece correction-history rider |
 | `EONEGO_TT_REFRESH=1` | Probe hits re-stamp TT entry age |
 | `EONEGO_PARTIAL=1` | Adopt a hard-stopped iteration's best root move |
+| `EONEGO_ROOTPAR=1` | Legacy root-move work-queue parallelism (what `Use Work Queue` used to select) |
 | `EONEGO_CORRHIST=0` | Disable correction history (default on) |
 | `EONEGO_QSTT=0` / `EONEGO_TTEVADJ=0` | Disable qsearch-TT / TT-eval-adjust (default on) |
 | `EONEGO_CHECKEXT=1` / `EONEGO_QSEVCAP=1` | Legacy check extension / qsearch evasion cap |
