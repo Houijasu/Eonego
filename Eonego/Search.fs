@@ -149,6 +149,12 @@ type SearchConfig =
       // horizon is blind to mating attacks that start with a quiet check. SEE-losing checks skipped;
       // deeper qsearch plies stay captures-only.
       UseQsChecks: bool
+      // Root effort ordering (SF-style): between iterations, root moves are re-sorted by the node
+      // count their subtrees consumed last iteration (best move stays first). A move producing
+      // expensive near-misses rises in the order and sheds reduction — the escape hatch for a slow
+      // win buried under its own failed-scout history (the b3-b4 fixture pathology). Classic
+      // single-PV path only.
+      UseRootEffort: bool
       MoveOverhead: int
       // Phase 1: NNUE accumulator checkpoint cache. Set to 0 to disable; ~4 MiB is the recommended default
       // (1024 slots, ~4.1 KiB/slot). Cleared per search by `SearchControl.NewSearch` (alongside the TT gen
@@ -171,7 +177,10 @@ type SearchLimits =
       Nodes: int64
       Infinite: bool
       Mate: int
-      Ponder: bool }
+      Ponder: bool
+      // UCI `go searchmoves ...`: restrict the root to these (already legality-stamped) moves.
+      // Empty = no restriction. Analysis feature — lets a GUI force full attention onto one candidate.
+      SearchMoves: Move[] }
 
 let defaultConfig =
     { Threads = 1
@@ -199,6 +208,7 @@ let defaultConfig =
       UseCont4 = false
       UseR50Damp = true
       UseQsChecks = false
+      UseRootEffort = false
       MoveOverhead = 10
       AccCheckpointMb = 0
       MultiPv = 1 }
@@ -214,7 +224,8 @@ let defaultLimits =
       Nodes = 0L
       Infinite = false
       Mate = 0
-      Ponder = false }
+      Ponder = false
+      SearchMoves = [||] }
 
 [<Struct>]
 type StackEntry =
@@ -477,6 +488,13 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     // next line finds the next-best move. Empty (count 0) in single-PV play — the ply-0 check is then free.
     let rootExcluded: Move[] = Array.zeroCreate 256
     let mutable nRootExcluded = 0
+    // Root effort ordering (UseRootEffort): persistent root move list + per-move subtree node counts,
+    // re-sorted by iterativeDeepening between iterations. Inactive (RootListActive=false) => the root
+    // iterates the normal staged picker, byte-identical to legacy.
+    let rootMv: Move[] = Array.zeroCreate MaxMoves
+    let rootNodes: int64[] = Array.zeroCreate MaxMoves
+    let mutable rootCnt = 0
+    let mutable rootListActive = false
     member _.Id = id
     member _.IsMain = isMain
     member _.Control = control
@@ -528,6 +546,17 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     /// of clock). Written at ply 0 only, never during an exclusion re-search or a MultiPV side line.
     member val IterBest = MoveNone with get, set
     member val IterScore = 0 with get, set
+
+    member _.RootMv = rootMv
+    member _.RootNodes = rootNodes
+
+    member _.RootCnt
+        with get () = rootCnt
+        and set v = rootCnt <- v
+
+    member _.RootListActive
+        with get () = rootListActive
+        and set v = rootListActive <- v
 
     member _.ClearRootExclusions() = nRootExcluded <- 0
 
@@ -589,6 +618,8 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
         completedDepth <- 0
         stopSeen <- false
         nRootExcluded <- 0
+        rootCnt <- 0
+        rootListActive <- false
 
 let inline private pollStop (w: Worker) : bool =
     if w.StopSeen then
@@ -1217,14 +1248,30 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
             // Multicut (set in the singular block): the node fails high on TWO moves at reduced depth, so
             // the whole move loop is abandoned and `best` returned WITHOUT a TT store.
             let mutable multicut = false
-            let mutable m = nextMove &mp skipQuiets
+            // Root effort ordering: when active, the root iterates the worker's persistent effort-sorted
+            // list instead of the staged picker (exclusion re-searches keep the picker — they must not
+            // touch the effort accounting). `go searchmoves` restriction is read once here too.
+            let useRootList = ply = 0 && w.RootListActive && excludedMove = MoveNone
+            let rootAllowed = if ply = 0 then w.Control.Limits.SearchMoves else [||]
+            let mutable rootIdx = 0
+
+            let mutable m =
+                if useRootList then
+                    (if w.RootCnt > 0 then w.RootMv.[0] else MoveNone)
+                else
+                    nextMove &mp skipQuiets
 
             while m <> MoveNone && not cutoff do
                 let needsCheck =
                     isEnPassant m || fromSq m = ksq || testBit usBlockers (fromSq m)
 
                 // MultiPV: at the root, skip the best moves of the lines already searched this iteration.
-                let rootSkip = ply = 0 && m <> MoveNone && w.IsRootExcluded m
+                // `go searchmoves`: skip root moves outside the requested set (empty = no restriction).
+                let rootSkip =
+                    ply = 0
+                    && m <> MoveNone
+                    && (w.IsRootExcluded m
+                        || (rootAllowed.Length > 0 && not (System.Array.IndexOf(rootAllowed, m) >= 0)))
 
                 if m <> excludedMove && not rootSkip && ((not needsCheck) || isLegal pos m) then
                     moveCount <- moveCount + 1
@@ -1386,6 +1433,9 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                         w.Stack.[ssCur].CurrentMove <- m
                         w.Stack.[ssCur].MovedPiece <- pos.PieceOn(fromSq m)
 
+                        // Root effort: nodes consumed by this root move's subtree (read back after Unmake).
+                        let effortStart = if useRootList then w.Nodes else 0L
+
                         pos.Make m
                         w.Control.Tt.Prefetch pos.Key // child probes this exact key at entry
 
@@ -1445,6 +1495,11 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                                 else
                                     0
 
+                            // Root LMR cap (99 = off): root moves shed reduction so a buried slow win
+                            // still gets a deep enough scout to surface (b3-b4 fixture pathology).
+                            if ply = 0 && r > Tunables.RootLmrCap then
+                                r <- Tunables.RootLmrCap
+
                             if r > newDepth - 1 then
                                 r <- newDepth - 1
 
@@ -1460,6 +1515,9 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                                 v <- -(negamax w pos (-beta) (-alpha) newDepth (ply + 1) isPv false)
 
                         pos.Unmake m
+
+                        if useRootList then
+                            w.RootNodes.[rootIdx] <- w.RootNodes.[rootIdx] + (w.Nodes - effortStart)
 
                         if pollStop w then
                             cutoff <- true
@@ -1524,7 +1582,14 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
                                         w.Tables.UpdateCapture (pos.PieceOn(fromSq m)) (toSq m) capPt bonus
 
-                m <- if cutoff then MoveNone else nextMove &mp skipQuiets
+                m <-
+                    if cutoff then
+                        MoveNone
+                    elif useRootList then
+                        rootIdx <- rootIdx + 1
+                        if rootIdx < w.RootCnt then w.RootMv.[rootIdx] else MoveNone
+                    else
+                        nextMove &mp skipQuiets
 
             if moveCount = 0 then
                 // No legal move searched. During an exclusion search this means the excluded move was the
@@ -1678,6 +1743,17 @@ let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
         else
             1
 
+    // Root effort ordering (UseRootEffort, classic single-PV only): seed the worker's persistent root
+    // list from legal generation; negamax's ply-0 loop iterates it and accounts per-move subtree
+    // nodes; the block at the end of each completed iteration re-sorts it (best first, then by effort).
+    let useRootList = cfg.UseRootEffort && multiPv = 1
+
+    if useRootList then
+        w.RootCnt <- generateLegal w.Pos (Span<Move>(w.RootMv))
+        Array.Clear(w.RootNodes, 0, w.RootNodes.Length)
+
+    w.RootListActive <- useRootList
+
     // Per-line state: previous score (aspiration centre), and this iteration's score/move/PV per line.
     let prevScores = Array.create multiPv (evalPos w w.Pos)
     let lineScores = Array.create multiPv 0
@@ -1757,7 +1833,12 @@ let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
                     beta <- min INF (score + delta)
                     delta <- delta * 2
 
-                    if cfg.UseAspTweaks && attemptDepth > depth - 3 && abs score < MATE_IN_MAX_PLY then
+                    if
+                        cfg.UseAspTweaks
+                        && Tunables.AspFailHighRed = 1
+                        && attemptDepth > depth - 3
+                        && abs score < MATE_IN_MAX_PLY
+                    then
                         attemptDepth <- attemptDepth - 1
                 else
                     searching <- false
@@ -1793,6 +1874,33 @@ let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
             w.RootScore <- lineScores.[0]
             w.RootBest <- lineMoves.[0]
             w.CompletedDepth <- depth
+
+            // Root effort ordering: best move to the front, the rest by the nodes their subtrees
+            // consumed this iteration (descending — expensive near-misses get searched earlier and
+            // less reduced next iteration). Effort then resets so each iteration's sort reflects
+            // fresh evidence at the new depth.
+            if useRootList && w.RootCnt > 1 then
+                let bi = System.Array.IndexOf(w.RootMv, w.RootBest, 0, w.RootCnt)
+
+                if bi > 0 then
+                    let tm = w.RootMv.[0] in w.RootMv.[0] <- w.RootMv.[bi]; w.RootMv.[bi] <- tm
+                    let tn = w.RootNodes.[0] in w.RootNodes.[0] <- w.RootNodes.[bi]; w.RootNodes.[bi] <- tn
+
+                // Insertion sort of [1..RootCnt-1] by effort desc (tiny N; stable).
+                for i in 2 .. w.RootCnt - 1 do
+                    let mv = w.RootMv.[i]
+                    let nd = w.RootNodes.[i]
+                    let mutable j = i - 1
+
+                    while j >= 1 && w.RootNodes.[j] < nd do
+                        w.RootMv.[j + 1] <- w.RootMv.[j]
+                        w.RootNodes.[j + 1] <- w.RootNodes.[j]
+                        j <- j - 1
+
+                    w.RootMv.[j + 1] <- mv
+                    w.RootNodes.[j + 1] <- nd
+
+                Array.Clear(w.RootNodes, 0, w.RootCnt)
 
             if w.IsMain then
                 for k in 0 .. multiPv - 1 do

@@ -77,6 +77,12 @@ let QsDeltaBase = envInt "EONEGO_T_QS_DELTA" 196 1 1000 // was 200
 let SingularMul16 = envInt "EONEGO_T_SING_MUL16" 35 4 128 // was 32
 let DoubleExtMargin = envInt "EONEGO_T_SING_DBL" 18 1 200 // was 16
 
+// --- Aspiration fail-high re-search depth reduction (1 = legacy ON): a root fail-high re-searches
+//     at up to depth-3. Asymmetric with fail-low (which re-runs at FULL depth) — a slow win that
+//     arrives as a root fail-high can evaporate at the reduced depth every iteration and stay
+//     suppressed forever (b3-b4 fixture: score pinned at +18 while the subtree is provably +380). ---
+let AspFailHighRed = envInt "EONEGO_T_ASP_FHRED" 1 0 1
+
 // --- Aspiration: initial delta = Init + prev^2/SqDiv ---
 let AspInitDelta = envInt "EONEGO_T_ASP_INIT" 8 1 100 // was 10
 let AspSqDiv = envInt "EONEGO_T_ASP_SQDIV" 16053 1000 100000 // was 15000
@@ -106,6 +112,12 @@ let TmMtg = envInt "EONEGO_T_TM_MTG" 30 8 80
 let TmIncFrac100 = envInt "EONEGO_T_TM_INCFRAC" 75 0 150
 let TmHardClockPct = envInt "EONEGO_T_TM_HARDPCT" 40 10 90
 let TmHardSoftMult = envInt "EONEGO_T_TM_HARDMULT" 4 2 12
+
+// --- Root LMR cap (EONEGO_T_ROOT_LMR_CAP): clamp the LMR reduction of root moves to this many
+//     plies. 99 = no cap (byte-identical legacy). The reference engine reduces root moves less than
+//     interior moves; a buried root move (negative history + late order) otherwise never gets a deep
+//     enough scout to surface a slow win (the b3-b4 fixture pathology). ---
+let RootLmrCap = envInt "EONEGO_T_ROOT_LMR_CAP" 99 0 99
 
 // --- History stat bonus: min(Mul*depth - 100, Cap) ---
 let StatBonusMul = envInt "EONEGO_T_STATB_MUL" 167 16 1000 // was 160

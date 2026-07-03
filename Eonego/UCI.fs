@@ -129,16 +129,29 @@ let private parsePosition (st: UCIState) (tokens: string[]) =
     st.RootFen <- fen
     st.RootMoves <- acc.ToArray()
 
-// go [depth d | nodes n | movetime t | wtime .. winc .. btime .. binc .. movestogo .. | infinite | mate n]
-let private parseGo (tokens: string[]) : SearchLimits =
+// go [depth d | nodes n | movetime t | wtime .. winc .. btime .. binc .. movestogo .. | infinite |
+//     mate n | searchmoves m1 m2 ...]. Returns the limits plus the RAW searchmoves tokens (the go
+// handler stamps them against the current position — parseGo has no board).
+let private goKeywords =
+    [| "depth"; "nodes"; "movetime"; "wtime"; "btime"; "winc"; "binc"; "movestogo"; "mate"
+       "infinite"; "ponder"; "searchmoves" |]
+
+let private parseGo (tokens: string[]) : SearchLimits * string[] =
     let mutable lim = defaultLimits
     let mutable i = 0
+    let searchMoves = System.Collections.Generic.List<string>()
 
     let arg () =
         if i + 1 < tokens.Length then tryInt tokens.[i + 1] else 0
 
     while i < tokens.Length do
         match tokens.[i] with
+        | "searchmoves" ->
+            i <- i + 1
+
+            while i < tokens.Length && not (Array.contains tokens.[i] goKeywords) do
+                searchMoves.Add tokens.[i]
+                i <- i + 1
         | "depth" ->
             lim <- { lim with Depth = arg () }
             i <- i + 2
@@ -174,7 +187,7 @@ let private parseGo (tokens: string[]) : SearchLimits =
             i <- i + 1
         | _ -> i <- i + 1
 
-    lim
+    (lim, searchMoves.ToArray())
 
 let private startSearch (st: UCIState) (lim: SearchLimits) =
     stopAndJoin st
@@ -216,6 +229,7 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
               UseCont4 = (Environment.GetEnvironmentVariable("EONEGO_CONT4") = "1")
               UseR50Damp = (Environment.GetEnvironmentVariable("EONEGO_R50DAMP") <> "0")
               UseQsChecks = (Environment.GetEnvironmentVariable("EONEGO_QSCHECKS") = "1")
+              UseRootEffort = (Environment.GetEnvironmentVariable("EONEGO_ROOTEFFORT") = "1")
               MoveOverhead = st.MoveOverhead
               AccCheckpointMb = 0
               MultiPv = st.MultiPv }
@@ -326,7 +340,27 @@ let run () =
                 | "position" ->
                     stopAndJoin st
                     parsePosition st tokens.[1..]
-                | "go" -> startSearch st (parseGo tokens.[1..])
+                | "go" ->
+                    let (lim, smUci) = parseGo tokens.[1..]
+
+                    // Stamp `searchmoves` tokens against the actual position (parseUci is castling/
+                    // en-passant flag-lossy, same reason parsePosition re-stamps). Unmatched tokens drop.
+                    let lim =
+                        if smUci.Length = 0 then
+                            lim
+                        else
+                            let p = Position()
+                            p.LoadFen st.RootFen
+
+                            for mv in st.RootMoves do
+                                p.Make mv
+
+                            let stamped =
+                                smUci |> Array.map (matchMove p) |> Array.filter (fun m -> m <> MoveNone)
+
+                            { lim with SearchMoves = stamped }
+
+                    startSearch st lim
                 | "stop" ->
                     (match st.Control with
                      | Some c -> c.Stop()

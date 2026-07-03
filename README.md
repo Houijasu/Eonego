@@ -78,6 +78,9 @@ dotnet test  Eonego.Tests/Eonego.Tests.fsproj -c Release   # 288 tests
 | `MultiPV` | 1 | Extra reported lines (main worker only) |
 | `Move Overhead` | 10 | ms safety margin per move |
 
+`go searchmoves <m1> <m2> ...` is supported — restrict the root to specific candidate moves
+(the way to force a deep verdict on one move a normal search keeps reducing away).
+
 Everything else is deliberately hardwired; experimental features ship behind
 environment variables (default off unless noted) so A/B matches never need a rebuild:
 
@@ -91,6 +94,8 @@ environment variables (default off unless noted) so A/B matches never need a reb
 | `EONEGO_TT_REFRESH=1` | Probe hits re-stamp TT entry age |
 | `EONEGO_PARTIAL=1` | Adopt a hard-stopped iteration's best root move |
 | `EONEGO_QSCHECKS=1` | Quiet checking moves at the first qsearch ply (SEE-losing checks skipped) |
+| `EONEGO_ROOTEFFORT=1` | Re-sort root moves between iterations by subtree node effort (SF-style) |
+| `EONEGO_T_ASP_FHRED=0` | Disable the aspiration fail-high re-search depth reduction (slow-win suppression fix) |
 | `EONEGO_CORRHIST=0` | Disable correction history (default on) |
 | `EONEGO_QSTT=0` / `EONEGO_TTEVADJ=0` | Disable qsearch-TT / TT-eval-adjust (default on) |
 | `EONEGO_CHECKEXT=1` / `EONEGO_QSEVCAP=1` | Legacy check extension / qsearch evasion cap |
