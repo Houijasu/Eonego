@@ -275,6 +275,9 @@ let private handleSetOption (st: UCIState) (tokens: string[]) =
     | _ -> ()
 
 let run () =
+    // Startup banner (conventional for UCI engines; GUIs log it and show it in their engine lists).
+    writeLine (Engine.Name + " " + Engine.Version + " by " + Engine.Author)
+
     // The NNUE net is embedded in the binary (see Eonego.fsproj <EmbeddedResource>); load it once at startup.
     let net =
         match readEmbedded "eval.nnue" with
@@ -305,8 +308,8 @@ let run () =
             if tokens.Length > 0 then
                 match tokens.[0] with
                 | "uci" ->
-                    writeLine "id name Eonego"
-                    writeLine "id author Houijasu"
+                    writeLine ("id name " + Engine.Name + " " + Engine.Version)
+                    writeLine ("id author " + Engine.Author)
                     writeLine "option name Threads type spin default 1 min 1 max 256"
                     writeLine "option name Hash type spin default 256 min 1 max 65536"
                     writeLine "option name MultiPV type spin default 1 min 1 max 256"
