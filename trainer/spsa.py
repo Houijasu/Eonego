@@ -24,11 +24,19 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import match  # noqa: E402
 
-STATE_FILE = os.path.join(HERE, "spsa_state.json")
+def state_file_for(wave):
+    """Per-wave checkpoint so a new wave never clobbers an older wave's resumable state."""
+    name = "spsa_state.json" if wave == 1 else f"spsa_state_w{wave}.json"
+    return os.path.join(HERE, name)
+
+
+STATE_FILE = state_file_for(1)  # rebound in run() from --wave
 
 # Wave-1 parameters: env name -> (default, min, max, c_end).
 # c_end = the +/- perturbation magnitude at the END of the run (~5-10% of the default).
-PARAMS = {
+# NOTE: wave-1 winners were inlined as the Tunables defaults (dc3b1f7); this table keeps the OLD
+# pre-tune values and exists for reproducibility of the wave-1 run only. New runs: --wave 2.
+PARAMS_WAVE1 = {
     "EONEGO_T_RFP_MARGIN":      (120, 40, 400, 10),
     "EONEGO_T_RFP_TTPV":        (20, 0, 100, 4),
     "EONEGO_T_RAZOR_BASE":      (240, 60, 800, 20),
@@ -53,6 +61,28 @@ PARAMS = {
     "EONEGO_T_STATB_CAP":       (1700, 500, 5000, 150),
 }
 
+# Wave-2 (2026-07-03): the cont4/capture-futility joint retune. Both arms run with the riders ON
+# (--shared "EONEGO_CONT4=1,EONEGO_CAPFUT=1"); defaults here = the post-wave-1 inlined values.
+# Tight 13-param set (vs 22) concentrates the per-iteration signal on the coupled history bands.
+PARAMS_WAVE2 = {
+    "EONEGO_T_CONT4_DIV":       (2, 1, 8, 1),
+    "EONEGO_T_LMR_HIST":        (-11499, -25000, -2000, 1000),
+    "EONEGO_T_LMP_BASE":        (9, 1, 20, 1),
+    "EONEGO_T_HISTPRUNE_BASE":  (521, 0, 2500, 60),
+    "EONEGO_T_HISTPRUNE_SLOPE": (747, 100, 1200, 80),
+    "EONEGO_T_FUT_BASE":        (124, 30, 500, 12),
+    "EONEGO_T_FUT_SLOPE":       (109, 30, 400, 10),
+    "EONEGO_T_CAPTFUT_BASE":    (300, 50, 800, 25),
+    "EONEGO_T_CAPTFUT_SLOPE":   (250, 50, 800, 20),
+    "EONEGO_T_SEE_QUIET":       (26, 8, 100, 3),
+    "EONEGO_T_SEE_CAPT":        (99, 30, 300, 8),
+    "EONEGO_T_STATB_MUL":       (167, 60, 500, 16),
+    "EONEGO_T_STATB_CAP":       (1735, 500, 5000, 150),
+}
+
+WAVES = {1: PARAMS_WAVE1, 2: PARAMS_WAVE2}
+PARAMS = PARAMS_WAVE1  # rebound in run() from --wave; module-level default keeps wave-1 semantics
+
 
 def env_string(theta):
     return ",".join(f"{k}={int(round(v))}" for k, v in theta.items())
@@ -76,6 +106,8 @@ def match_args(env_a, env_b, ns):
         "--seed", str(ns.match_seed),
         "--concurrency", str(ns.concurrency),
     ]
+    if getattr(ns, "shared", ""):
+        argv += ["--shared", ns.shared]
     return match.build_parser().parse_args(argv)
 
 
@@ -89,6 +121,10 @@ def fake_score(theta):
 
 
 def run(ns):
+    global PARAMS, STATE_FILE
+    PARAMS = WAVES[ns.wave]
+    STATE_FILE = state_file_for(ns.wave)
+
     rng = random.Random(ns.seed)
     start_iter = 1
     theta = {k: float(PARAMS[k][0]) for k in PARAMS}
@@ -173,7 +209,16 @@ def main():
     ap.add_argument("--log-every", type=int, default=10)
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--fake-objective", action="store_true", help="synthetic convergence self-test (no engines)")
+    ap.add_argument("--wave", type=int, default=1, choices=sorted(WAVES),
+                    help="parameter table: 1 = original margins, 2 = cont4/captfut joint retune")
+    ap.add_argument("--shared", default="",
+                    help="env overrides for BOTH arms, e.g. 'EONEGO_CONT4=1,EONEGO_CAPFUT=1' (wave 2)")
     ns = ap.parse_args()
+    # Wave 2 tunes rider params (CONT4_DIV, CAPTFUT_*) that are inert unless the rider flags are on —
+    # a forgotten --shared would silently burn the whole run on dead parameters. Default it in.
+    if ns.wave == 2 and not ns.shared:
+        ns.shared = "EONEGO_CONT4=1,EONEGO_CAPFUT=1"
+        print(f"wave 2: defaulting --shared '{ns.shared}'", flush=True)
     ns.match_seed = ns.seed
     run(ns)
     return 0

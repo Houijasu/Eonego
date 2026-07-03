@@ -132,14 +132,33 @@ def gen_openings(root_fen, n, plies, seed):
     return out
 
 
-def play_game(root_fen, eng_white, eng_black, opening, go_cmd, max_plies=600):
+def play_game(root_fen, eng_white, eng_black, opening, go_cmd, max_plies=600, tc=None):
+    """tc = (base_ms, inc_ms) enables real game clocks: each move goes out as
+    `go wtime W btime B winc I binc I`, wall time is deducted from the mover's clock, and an
+    overdraft is a time-forfeit loss. tc=None keeps the fixed go_cmd (movetime/nodes) behavior."""
+    import time
     board = chess.Board(root_fen)
     for u in opening:
         board.push_uci(u)
     moves = list(opening)
+    clocks = [tc[0], tc[0]] if tc else None  # [white_ms, black_ms]
     while not board.is_game_over(claim_draw=True) and len(moves) < max_plies:
-        eng = eng_white if board.turn == chess.WHITE else eng_black
-        u = eng.bestmove(root_fen, moves, go_cmd)
+        white_to_move = board.turn == chess.WHITE
+        eng = eng_white if white_to_move else eng_black
+        if tc:
+            inc = tc[1]
+            cmd = (f"go wtime {max(1, int(clocks[0]))} btime {max(1, int(clocks[1]))} "
+                   f"winc {int(inc)} binc {int(inc)}")
+            t0 = time.perf_counter()
+            u = eng.bestmove(root_fen, moves, cmd)
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            side = 0 if white_to_move else 1
+            clocks[side] -= elapsed_ms
+            if clocks[side] < 0:
+                return "0-1" if white_to_move else "1-0"  # flag fall = loss
+            clocks[side] += inc
+        else:
+            u = eng.bestmove(root_fen, moves, go_cmd)
         try:
             mv = chess.Move.from_uci(u)
         except ValueError:
@@ -201,6 +220,12 @@ def run_match(args, quiet=False):
 
     go_cmd = f"go nodes {args.nodes}" if args.nodes > 0 else f"go movetime {args.movetime}"
 
+    # Real game clocks: --tc "base+inc" in seconds (e.g. "10+0.1") overrides movetime/nodes.
+    tc = None
+    if getattr(args, "tc", ""):
+        base_s, _, inc_s = args.tc.partition("+")
+        tc = (float(base_s) * 1000.0, float(inc_s or 0) * 1000.0)
+
     shared_env = parse_env(args.shared)
     env_a = {**shared_env, **parse_env(args.a)}
     env_b = {**shared_env, **parse_env(args.b)}
@@ -256,7 +281,7 @@ def run_match(args, quiet=False):
                     engA.newgame()
                     engB.newgame()
                     ew, eb = (engA, engB) if a_is_white else (engB, engA)
-                    res = play_game(args.root, ew, eb, op, go_cmd, max_plies=args.max_plies)
+                    res = play_game(args.root, ew, eb, op, go_cmd, max_plies=args.max_plies, tc=tc)
                     if record(res, a_is_white):
                         stop.set()
         except Exception as ex:  # engine crash etc. — stop the match, surface the error
@@ -298,6 +323,8 @@ def build_parser():
     ap.add_argument("--root", default=START_FEN, help="opening root FEN (default: startpos)")
     ap.add_argument("--movetime", type=int, default=200, help="ms per move")
     ap.add_argument("--nodes", type=int, default=0, help="alt budget: go nodes N")
+    ap.add_argument("--tc", default="", help="game clock 'base+inc' in seconds (e.g. '10+0.1'); "
+                                             "overrides movetime/nodes, flag fall = loss")
     ap.add_argument("--openings", type=int, default=80)
     ap.add_argument("--opening-plies", type=int, default=6)
     ap.add_argument("--seed", type=int, default=12345)
@@ -319,9 +346,11 @@ def build_parser():
 def main():
     args = build_parser().parse_args()
     r = run_match(args)
+    budget = (f"tc {args.tc}" if getattr(args, "tc", "")
+              else f"go nodes {args.nodes}" if args.nodes > 0
+              else f"go movetime {args.movetime}")
     print(f"\nFINAL  A=[{args.a}|{args.options_a}]  B=[{args.b}|{args.options_b}]  "
-          f"budget={'go nodes ' + str(args.nodes) if args.nodes > 0 else 'go movetime ' + str(args.movetime)}"
-          f"  concurrency={args.concurrency}")
+          f"budget={budget}  concurrency={args.concurrency}")
     print(f"  games {r['games']}  W{r['W']} D{r['D']} L{r['L']}  score {(r['W'] + 0.5 * r['D']) / max(1, r['games']):.3f}")
     print(f"  Elo(A-B) {r['elo']:+.1f} +- {r['err']:.1f}   LLR {r['llr']:+.2f}  -> {r['verdict']}")
     for e in r["errors"]:
