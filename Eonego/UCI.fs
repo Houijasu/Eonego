@@ -255,10 +255,14 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
         Search.arm control
         st.Control <- Some control
 
-        // Worker pool (EONEGO_POOL=1, default OFF = legacy fresh-workers path, byte-identical).
-        // Ensure/recreate on the UCI thread (no live search here); goPooled rebinds each worker to
-        // the fresh control and keeps the gravity history tables warm across moves.
-        let usePool = Environment.GetEnvironmentVariable("EONEGO_POOL") = "1"
+        // Worker pool: DEFAULT ON since 2026-07-05 (EONEGO_POOL=0 restores the legacy fresh-workers
+        // path). Warm per-worker gravity history is the only LazySMP divergence source besides the
+        // shared TT — measured +19.7±29.8 and +20.9±29.1 vs fresh workers over two independent
+        // 300-game 8T movetime-100 books (pooled ~+20±21), plus the 26ms/move allocation saving at
+        // 16T. First search from a cold pool is byte-identical to the legacy path (proven; pool
+        // tests pin the warm divergence). Ensure/recreate on the UCI thread (no live search here);
+        // goPooled rebinds each worker to the fresh control.
+        let usePool = Environment.GetEnvironmentVariable("EONEGO_POOL") <> "0"
 
         if usePool && st.Pool.Length <> cfg.Threads then
             st.Pool <- Array.init cfg.Threads (fun i -> Worker(i, (i = 0), control))
