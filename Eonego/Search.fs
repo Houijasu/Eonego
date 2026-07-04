@@ -476,6 +476,8 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     let mutable control = control
     let pos = Position()
     let tables = Tables()
+    // A brand-new Tables() is already in the fully-cleared state; SetupRoot skips the first Clear().
+    let mutable tablesVirgin = true
     let stack: StackEntry[] = Array.zeroCreate (MaxSearchPly + StackOffset + 4)
     let moveBuf: Move[] = Array.zeroCreate (MaxSearchPly * MaxMoves)
     let scoreBuf: int[] = Array.zeroCreate (MaxSearchPly * MaxMoves)
@@ -622,11 +624,16 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
         pos.BindCheckpoint control.AccCheckpoint
         pos.SeedCheckpoint()
 
+        tables.EnsureAux control.Config.UseCont4 control.Config.UseCorrMinor
+
         if defaultArg keepHistory false then
             tables.NewSearch()
-        else
+        elif not tablesVirgin then
             tables.Clear()
+        // else: a fresh Tables() is already fully cleared (zeroed arrays, MoveNone-filled hint
+        // moves) — skip the ~3.5 MiB re-zero on the default fresh-workers-per-go path.
 
+        tablesVirgin <- false
         nodes <- 0L
         selDepth <- 0
         rootBest <- MoveNone

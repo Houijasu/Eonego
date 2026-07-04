@@ -49,12 +49,25 @@ type Tables() =
     let cont2: int16[] = Array.zeroCreate (768 * 768)
     // cont4: keyed by the 4-ply-back move (ss-4, same side to move) — the "deepened" continuation
     // table. Read WEIGHTED (Tunables.Cont4Div) in the LMR history term only; taught the full bonus.
-    let cont4: int16[] = Array.zeroCreate (768 * 768)
+    // Lazily allocated (EnsureAux): UseCont4 defaults OFF and this is 1.125 MiB per worker that the
+    // default config never touches. Readers/writers stay unguarded — they are cfg-gated in Search,
+    // and Worker.SetupRoot ensures allocation before any search that can reach them.
+    let mutable cont4: int16[] = Array.empty
     // Correction history: [stm<<<14 | pawnKey&16383] -> persistent (bestValue - staticEval) error for this
     // side's pawn structure, gravity-updated. Read as a static-eval correction wherever eval feeds pruning.
     let corr: int16[] = Array.zeroCreate (2 * 16384)
     // Minor-piece correction history: same contract, keyed by Position.MinorKey (knights+bishops+kings).
-    let corrMinor: int16[] = Array.zeroCreate (2 * 16384)
+    // Lazily allocated like cont4 (UseCorrMinor defaults OFF; 64 KiB per worker).
+    let mutable corrMinor: int16[] = Array.empty
+
+    /// Allocate the config-gated tables this search will actually use (idempotent; called by
+    /// Worker.SetupRoot with the active config flags before the search starts).
+    member _.EnsureAux (useCont4: bool) (useCorrMinor: bool) : unit =
+        if useCont4 && cont4.Length = 0 then
+            cont4 <- Array.zeroCreate (768 * 768)
+
+        if useCorrMinor && corrMinor.Length = 0 then
+            corrMinor <- Array.zeroCreate (2 * 16384)
 
     /// Zero every table (new game / clear between searches).
     member _.Clear() : unit =

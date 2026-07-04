@@ -39,6 +39,7 @@
     <Compile Include="PruningTests.fs" />
     <Compile Include="SingularTests.fs" />
     <Compile Include="RetrogradeTests.fs" />
+    <Compile Include="PoolTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
