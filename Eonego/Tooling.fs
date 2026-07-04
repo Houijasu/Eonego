@@ -26,6 +26,7 @@ let private errLine (s: string) = Console.Error.WriteLine(s)
 let private usage () =
     writeLine "Eonego tooling subcommands:"
     writeLine "  gen --start <fen> --games N --out <file> --net <path> [--depth D | --nodes K] [--temp T] [--seed S] [--random-plies P] [--max-plies M]"
+    writeLine "  dumpft --net <path> --in <fens> --out <bin>   (trainer FT dump: 1034-byte records bucket/stm/psqt/eval/ft[1024])"
 
 /// Hand-rolled `--key value` parser; returns a map of flag -> optional value.
 let private parseFlags (args: string[]) : Map<string, string option> =
@@ -336,3 +337,41 @@ let runGen (args: string[]) : int =
         | None ->
             errLine "gen requires --net <path> (NNUE file)"
             1
+
+/// Trainer FT dump: for each input FEN (bare fen, or `fen;...` records), write one binary record
+/// [bucket u8][stm u8][psqtInternal i32][evalInternal i32][ft u8 x L1] (little-endian, 1034 bytes).
+/// Record order matches input line order so the trainer can join labels by index.
+let runDumpFt (args: string[]) : int =
+    let m = parseFlags args
+
+    match flag m "net", flag m "in", flag m "out" with
+    | Some netPath, Some inPath, Some outPath ->
+        match Nnue.load netPath with
+        | Nnue.Failed r ->
+            errLine ("failed to load net: " + r)
+            1
+        | Nnue.Loaded net ->
+            use writer = new BinaryWriter(File.Create outPath)
+            let ft = Array.zeroCreate<byte> Nnue.L1
+            let mutable count = 0
+
+            for line in File.ReadLines inPath do
+                let t = line.Trim()
+
+                if t.Length > 0 && not (t.StartsWith "#") then
+                    let fen = t.Split(';').[0].Trim()
+                    let pos = Position.OfFen fen
+                    let struct (bucket, psqtInternal, evalInt) = Nnue.dumpFeatures net pos ft
+                    writer.Write(byte bucket)
+                    writer.Write(if pos.SideToMove = White then 0uy else 1uy)
+                    writer.Write(psqtInternal)
+                    writer.Write(evalInt)
+                    writer.Write(ft)
+                    count <- count + 1
+
+            writer.Flush()
+            writeLine ("dumped " + string count + " records to " + outPath)
+            0
+    | _ ->
+        errLine "dumpft requires --net <path> --in <fens> --out <bin>"
+        1

@@ -761,6 +761,39 @@ let evalCp (net: Network) (pos: Position) : int =
     let cp = int (int64 (evalInternal net pos UseAvx2 UseVnni UseSparse) * 100L / int64 NormalizeToPawnValue)
     max -EvalMax (min EvalMax cp)
 
+/// Tooling tap (trainer): from-scratch forward capture — fills `ftOut` (L1 bytes) with the fc_0 input
+/// (the u8 FT pairwise-product buffer, STM perspective first, exactly what evalFromAcc feeds fc_0) and
+/// returns struct (bucket, psqtInternal, evalInternal). The FT is frozen during stack fine-tuning, so
+/// this buffer + the psqt term is everything the Python trainer needs per position.
+[<System.Runtime.CompilerServices.SkipLocalsInit>]
+let dumpFeatures (net: Network) (pos: Position) (ftOut: byte[]) : struct (int * int * int) =
+    let accWP = NativePtr.stackalloc<int16> L1
+    let accW = Span<int16>(NativePtr.toVoidPtr accWP, L1)
+    let accBP = NativePtr.stackalloc<int16> L1
+    let accB = Span<int16>(NativePtr.toVoidPtr accBP, L1)
+    let psqWP = NativePtr.stackalloc<int> PsqtBuckets
+    let psqW = Span<int>(NativePtr.toVoidPtr psqWP, PsqtBuckets)
+    let psqBP = NativePtr.stackalloc<int> PsqtBuckets
+    let psqB = Span<int>(NativePtr.toVoidPtr psqBP, PsqtBuckets)
+
+    buildAccProd net pos White accW psqW
+    buildAccProd net pos Black accB psqB
+
+    let stm = pos.SideToMove
+    let accUs = if stm = White then accW else accB
+    let accThem = if stm = White then accB else accW
+    let psqtUs = if stm = White then psqW else psqB
+    let psqtThem = if stm = White then psqB else psqW
+    let bucket = (popCount pos.Occupied - 1) / 4
+
+    let nnzPtr = NativePtr.stackalloc<byte> (L1 / 32)
+    let nnz = Span<byte>(NativePtr.toVoidPtr nnzPtr, L1 / 32)
+    ftProductInto accUs accThem (ftOut.AsSpan()) nnz UseAvx2
+
+    let psqtInternal = (psqtUs.[bucket] - psqtThem.[bucket]) / 2
+    let evalInt = evalFromAcc net pos accW accB psqW psqB UseAvx2 UseVnni UseSparse
+    struct (bucket, psqtInternal, evalInt)
+
 /// Bind the net into the Position's incremental accumulator (root only). The threat enumerator is passed as
 /// a delegate so Position needn't depend on Threats. After binding, `evalInternal` reads the maintained
 /// accumulator; unbound, it falls back to the from-scratch oracle (used by tests).

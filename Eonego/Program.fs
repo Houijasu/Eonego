@@ -24,6 +24,7 @@ let main argv =
     if argv.Length > 0 then
         match argv.[0] with
         | "gen" -> Eonego.Tooling.runGen argv.[1..]
+        | "dumpft" -> Eonego.Tooling.runDumpFt argv.[1..]
         | _ ->
             Eonego.UCI.run ()
             0
