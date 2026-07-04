@@ -59,6 +59,7 @@
     <Compile Include="Threats.fs" />
     <Compile Include="NNUE.fs" />
     <Compile Include="MoveGeneration.fs" />
+    <Compile Include="Retrograde.fs" />
     <Compile Include="History.fs" />
     <Compile Include="MovePick.fs" />
     <Compile Include="Transposition.fs" />
