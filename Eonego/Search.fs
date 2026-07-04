@@ -24,6 +24,7 @@ open Eonego.History
 open Eonego.MovePick
 open Eonego.Transposition
 open Eonego.AccCheckpoint
+open Eonego.Retrograde
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -57,6 +58,13 @@ let inline valueFromTt (v: int) (ply: int) : int =
     elif v >= MATE_IN_MAX_PLY then v - ply
     elif v <= -MATE_IN_MAX_PLY then v + ply
     else v
+
+/// Retrograde probe value (stm-relative; dtm in plies-from-THIS-node) -> root-relative search score at `ply`.
+/// draw -> 0; win -> mate in (ply + dtm); loss -> mated in (ply + dtm). dtm max ~56, so |score| >= MATE_IN_MAX_PLY.
+let inline retroToScore (v: sbyte) (ply: int) : int =
+    if v = 0y then 0
+    elif v > 0y then MATE - ply - Retrograde.retroDtm v
+    else -MATE + ply + Retrograde.retroDtm v
 
 /// LMR reduction table r[depth][moveCount], built once at init (read-only ⇒ LazySMP-safe, like the eval
 /// tables). r grows with both depth and move number: late moves at high depth are searched much shallower.
@@ -99,6 +107,7 @@ type SearchConfig =
       UseNmpVerify: bool
       UseLmrTweaks: bool
       UseAspTweaks: bool
+      UseRetrograde: bool
       // Qsearch TT protocol: non-PV bound cutoffs at qsearch entry + a BoundLower store on stand-pat
       // fail-highs. The store is tree-neutral (a revisit reaches the identical stand-pat value) and only
       // skips repeated NNUE evals; the cutoff changes tree shape (suite-total nodes -3..-9% at d13-d15,
@@ -202,6 +211,7 @@ let defaultConfig =
       UseNmpVerify = true
       UseLmrTweaks = true
       UseAspTweaks = true
+      UseRetrograde = true
       UseQsTt = true
       UseTtEvalAdjust = true
       UseCheckExt = false
@@ -752,6 +762,15 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
             best <- ttScore
             cutoff <- true
 
+        // Retrograde EGTB: exact value for a solved 3-man signature overrides stand-pat and the capture search.
+        // Applies in and out of check; `if cutoff then best` (below) returns it with no TT store.
+        if cfg.UseRetrograde && not cutoff then
+            match Retrograde.probe pos with
+            | ValueSome v ->
+                best <- retroToScore v ply
+                cutoff <- true
+            | ValueNone -> ()
+
         if not inCheck && not cutoff then
             // Stand-pat: reuse the TT-stored static eval when present (it is the same deterministic
             // evalPos value qsearch would recompute and store), mirroring negamax. Bit-exact, skips the
@@ -967,6 +986,15 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
         let mutable ttBound = BoundNone
         // ttPv: this node is (or was) on a PV. Sticky — start from isPv, OR in a probed former-PV mark.
         let mutable ttPv = isPv
+
+        // 0. retrograde EGTB: exact proven WDL/DTM for a solved 3-man signature short-circuits the node.
+        //    Never at the root (ply 0 must still produce a bestmove).
+        if ply > 0 && cfg.UseRetrograde then
+            match Retrograde.probe pos with
+            | ValueSome v ->
+                result <- retroToScore v ply
+                produced <- true
+            | ValueNone -> ()
 
         // 1. mate-distance pruning (gated -> oracle stays strictly full-window)
         if usePruning then

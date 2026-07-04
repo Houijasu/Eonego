@@ -15,6 +15,7 @@ open Eonego.MoveGeneration
 open Eonego.Transposition
 open Eonego.Nnue
 open Eonego.Search
+open Eonego.Retrograde
 
 let private writeLine (s: string) = Console.Out.WriteLine(s)
 
@@ -129,6 +130,9 @@ let private parsePosition (st: UCIState) (tokens: string[]) =
     st.RootFen <- fen
     st.RootMoves <- acc.ToArray()
 
+    if Environment.GetEnvironmentVariable("EONEGO_RETRO") <> "0" then
+        Retrograde.requestSolveFor scratch
+
 // go [depth d | nodes n | movetime t | wtime .. winc .. btime .. binc .. movestogo .. | infinite |
 //     mate n | searchmoves m1 m2 ...]. Returns the limits plus the RAW searchmoves tokens (the go
 // handler stamps them against the current position — parseGo has no board).
@@ -216,6 +220,7 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
               UseNmpVerify = true
               UseLmrTweaks = true
               UseAspTweaks = true
+              UseRetrograde = (Environment.GetEnvironmentVariable("EONEGO_RETRO") <> "0")
               // A/B env knobs for match.py per-player overrides (campaign step B4): defaults preserve
               // release behaviour; each flag flips for one player without a rebuild.
               UseQsTt = (Environment.GetEnvironmentVariable("EONEGO_QSTT") <> "0")
