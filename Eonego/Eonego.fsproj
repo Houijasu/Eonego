@@ -29,7 +29,6 @@
 
     <!-- Runtime / JIT tuning -->
     <TieredCompilation>false</TieredCompilation>
-    <ReadyToRun>true</ReadyToRun>
     <UseWindowsThreadPool>true</UseWindowsThreadPool>
 
     <!-- Native AOT publishing -->
