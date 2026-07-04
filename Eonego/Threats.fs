@@ -3,7 +3,7 @@
 /// piece, every OCCUPIED square it attacks (own pieces = defences, enemy = attacks) plus pawn-blocked-by-pawn
 /// contacts, indexed by (attacker, from, to, attacked, king-bucket, perspective). 60720 dims, <=128 active.
 ///
-/// IMPORTANT: this module works entirely in STOCKFISH's piece encoding (PieceType PAWN=1..KING=6; Piece
+/// IMPORTANT: this module works entirely in the NNUE reference piece encoding (PieceType PAWN=1..KING=6; Piece
 /// W_PAWN=1..W_KING=6, B_PAWN=9..B_KING=14, make_piece=(c<<3)+pt) because the index LUTs are generated in it.
 /// Eonego pieces (color*6+type, 0..11) are converted at the enumeration boundary. Squares are LERF in both.
 module Eonego.Threats

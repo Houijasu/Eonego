@@ -106,8 +106,8 @@ type SearchConfig =
       UseQsTt: bool
       // A bound-consistent TT score replaces the raw static eval as the WORKING eval that RFP/razoring/
       // NMP (and the qsearch stand-pat) prune on — a real search result is tighter than a heuristic eval.
-      // Stack.StaticEval, `improving`, move-loop futility and every TT store keep the RAW eval (SF's
-      // `unadjustedStaticEval` contract; correction history depends on it staying raw).
+      // Stack.StaticEval, `improving`, move-loop futility and every TT store keep the RAW eval
+      // (the unadjusted static-eval contract; correction history depends on it staying raw).
       UseTtEvalAdjust: bool
       // Extend every SEE>=0 checking move by one ply (legacy behaviour). The reference engine dropped its
       // generic check extension years ago — the singular machinery and LMR cover the useful cases, and the
@@ -130,7 +130,7 @@ type SearchConfig =
       // scale and taught the same clamped error at the same update gate.
       UseCorrMinor: bool
       // Capture futility: at shallow reduced depth, skip a non-checking capture when even banking the
-      // captured piece's full value cannot lift the static eval to alpha (SF's capture analogue of the
+      // captured piece's full value cannot lift the static eval to alpha (capture analogue of the
       // quiet futility gate; promotions excluded — their material swing isn't in capturedValue).
       UseCaptFut: bool
       // Partial-iteration commit (classic path, timed games): on a hard stop mid-iteration, adopt the
@@ -140,16 +140,16 @@ type SearchConfig =
       // 1/Cont4Div weight in the LMR history term only (NOT move ordering — the naive full-weight
       // ordering variant measured +25-42% suite nodes and was reverted 2026-07-02).
       UseCont4: bool
-      // Rule-50 shuffle damping (SF's evaluate() wrapper term): static eval decays linearly with the
+      // Rule-50 shuffle damping (evaluate() wrapper term): static eval decays linearly with the
       // halfmove counter (eval -= eval*rule50/Rule50DampDiv), so fortresses/shuffling drift toward
       // the draw score instead of holding full value until the search's rule-50 horizon. Identity at
       // rule50=0; perturbs ALL search trees (deep nodes accumulate counter), hence config-gated.
       UseR50Damp: bool
-      // Quiet CHECKING moves at the FIRST qsearch ply (SF's DEPTH_QS_CHECKS): the captures-only
+      // Quiet CHECKING moves at the FIRST qsearch ply (DEPTH_QS_CHECKS): the captures-only
       // horizon is blind to mating attacks that start with a quiet check. SEE-losing checks skipped;
       // deeper qsearch plies stay captures-only.
       UseQsChecks: bool
-      // Root effort ordering (SF-style): between iterations, root moves are re-sorted by the node
+      // Root effort ordering: between iterations, root moves are re-sorted by the node
       // count their subtrees consumed last iteration (best move stays first). A move producing
       // expensive near-misses rises in the order and sheds reduction — the escape hatch for a slow
       // win buried under its own failed-scout history (the b3-b4 fixture pathology). Classic
@@ -867,7 +867,7 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
 
                 m <- if cutoff then MoveNone else nextMove &mp false
 
-            // Quiet CHECKING moves at the first qsearch ply only (UseQsChecks, SF's DEPTH_QS_CHECKS):
+            // Quiet CHECKING moves at the first qsearch ply only (UseQsChecks, DEPTH_QS_CHECKS):
             // after the capture picker drains, try quiet moves that give check and don't lose material
             // by SEE (spite checks explode the tree for nothing). The child is an evasion node, so its
             // replies are searched exhaustively — one extra move class at exactly one layer. The 1 KB
@@ -1039,7 +1039,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
         // 3b. TT score as a better WORKING eval: a bound-consistent search score is tighter than the
         //     heuristic static eval, so RFP/razoring/NMP below prune against it. Only this local —
         //     Stack.StaticEval (already stored raw above), `improving`, the move-loop futility gate and
-        //     the TT store all keep the RAW eval (SF's `unadjustedStaticEval` contract).
+        //     the TT store all keep the RAW eval (the unadjusted static-eval contract).
         let mutable workingEval = staticEval
 
         if
@@ -1396,7 +1396,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                         // Singular / double extension: the TT move, at depth >= 8 with a depth-sufficient
                         // lower-bound TT score, is "singular" if every OTHER move fails low against a
                         // reduced exclusion window. Extend it (twice if it fails low by a clear margin).
-                        // A fail-HIGH exclusion search is informative too (SF-master else-branches):
+                        // A fail-HIGH exclusion search is informative too (reference else-branches):
                         // multicut — some OTHER move also beats beta at reduced depth, so with the TT move's
                         // own lower bound this node is a proven cut-node: return sv without searching a
                         // single move (and without a TT store — the bound is only reduced-depth);
@@ -1623,7 +1623,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
                 // Correction history: teach the table this pawn structure's persistent eval error. Only
                 // when the result is eval-like (not in check, best move not a capture) and the bound
-                // direction doesn't contradict the sign (SF gates): a fail-high below staticEval or a
+                // direction doesn't contradict the sign (standard gates): a fail-high below staticEval or a
                 // fail-low above it carries no usable signal.
                 if
                     usePruning
@@ -2049,7 +2049,7 @@ let computeTimes (moveOverhead: int) (l: SearchLimits) (stm: Color) : int64 * in
 // ---------------------------------------------------------------------------
 // LazySMP orchestration. Returns the chosen best move (and prints `bestmove`).
 // ---------------------------------------------------------------------------
-/// SF-style thread vote over the workers' published root results (classic LazySMP only). Returns the
+/// Thread vote over the workers' published root results (classic LazySMP only). Returns the
 /// index of the worker whose (move, score, depth) the search should report. Voters are workers that
 /// completed at least one iteration; each contributes (score − minScore + 40) × depth to its move's
 /// tally. Deterministic: ties prefer the first-encountered move, then the deepest voter for the winning

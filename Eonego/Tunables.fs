@@ -104,7 +104,7 @@ let CorrDepthDiv = envInt "EONEGO_T_CORR_DDIV" 8 1 64
 //     history threshold (taught full bonus). Div=2 = the "weighted ss-4" shape. ---
 let Cont4Div = envInt "EONEGO_T_CONT4_DIV" 2 1 8
 
-// --- Rule-50 shuffle damping (SF's evaluate() wrapper term, missing from the original port):
+// --- Rule-50 shuffle damping (evaluate() wrapper term, missing from the original port):
 //     eval -= eval * rule50 / Div. Pulls stuck positions (fortresses, shuffling) toward the draw
 //     score gracefully instead of holding full value until the search proves the rule-50 draw. ---
 let Rule50DampDiv = envInt "EONEGO_T_R50_DAMP" 212 50 2048

@@ -5,8 +5,8 @@
 #
 #   pwsh ./publish.ps1
 #
-# Output: Eonego/bin/Release/net10.0/win-x64/publish/Eonego.exe  (self-contained, ~42 MB; embeds the SF net
-# if nets/sf16.nnue is present). Requires the "Desktop development with C++" VS workload (link.exe + libs).
+# Output: Eonego/bin/Release/net10.0/win-x64/publish/Eonego.exe  (self-contained, ~42 MB; embeds the NNUE net
+# if nets/main.nnue is present). Requires the "Desktop development with C++" VS workload (link.exe + libs).
 
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot

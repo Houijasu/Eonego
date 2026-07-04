@@ -1,13 +1,13 @@
-"""Stockfish-distillation reinforcement loop (KGA-anchored, architecture unchanged).
+"""Teacher-distillation reinforcement loop (KGA-anchored, architecture unchanged).
 
 Per generation k:
   1. gen   : engine self-play from KGA with the best net (parallel workers) -> position FENs
-  2. label : Stockfish-label those positions (sflabel.py)                    -> sf_gen{k}.txt
-  3. window: the broad seed pool (sf_pool0) + the last W generations' SF labels
-  4. train : fine-tune warm-started from the best net's .pt on the window    -> net_sfk
-  5. match : net_sfk vs best from KGA; promote on score >= threshold
+  2. label : teacher-label those positions (sflabel.py)                       -> labeled_gen{k}.txt
+  3. window: the broad seed pool (teacher_pool0) + the last W generations' teacher labels
+  4. train : fine-tune warm-started from the best net's .pt on the window    -> net_gen{k}
+  5. match : net_gen{k} vs best from KGA; promote on score >= threshold
 This is distribution-matched (positions come from the best net's own play) + strong-teacher
-(Stockfish labels) + warm-start (keeps the good-playing net). Known to cap at the net's
+(teacher labels) + warm-start (keeps the good-playing net). Known to cap at the net's
 capacity (mid-2000s for the 64-wide region net) — the curve shows where.
 
     python sfloop.py --generations 8 --resume
@@ -25,8 +25,8 @@ EXE = os.path.join(REPO, "Eonego", "bin", "Release", "net10.0", "Eonego.exe")
 KGA = "rnbqkbnr/pppp1ppp/8/8/4Pp2/8/PPPP2PP/RNBQKBNR w KQkq - 0 3"
 DATA = os.path.join(HERE, "data")
 NETS = os.path.join(HERE, "nets")
-STATE = os.path.join(HERE, "sfloop_state.json")
-SEED_POOL = os.path.join(DATA, "sf_pool0.txt")  # broad material-distribution SF labels
+STATE = os.path.join(HERE, "trainloop_state.json")
+SEED_POOL = os.path.join(DATA, "teacher_pool0.txt")  # broad material-distribution teacher labels
 PY = sys.executable
 
 
@@ -39,7 +39,7 @@ def gen_positions(k, best_net, games, workers, depth, seed_base, random_plies):
     procs, parts = [], []
     per = max(1, games // workers)
     for w in range(workers):
-        out = os.path.join(DATA, f"sfgen{k}_{w}.txt")
+        out = os.path.join(DATA, f"playgen{k}_{w}.txt")
         parts.append(out)
         cmd = [EXE, "gen", "--start", KGA, "--games", str(per), "--depth", str(depth),
                "--random-plies", str(random_plies), "--max-plies", "200",
@@ -47,7 +47,7 @@ def gen_positions(k, best_net, games, workers, depth, seed_base, random_plies):
         procs.append(subprocess.Popen(cmd))
     for p in procs:
         p.wait()
-    fens = os.path.join(DATA, f"sfgen{k}_fens.txt")
+    fens = os.path.join(DATA, f"playgen{k}_fens.txt")
     seen = set()
     with open(fens, "w", encoding="utf-8") as out:
         for part in parts:
@@ -64,21 +64,21 @@ def gen_positions(k, best_net, games, workers, depth, seed_base, random_plies):
     return fens
 
 
-def sf_label(fens, k, depth, workers):
-    out = os.path.join(DATA, f"sf_gen{k}.txt")
+def label_generation(fens, k, depth, workers):
+    out = os.path.join(DATA, f"labeled_gen{k}.txt")
     run([PY, os.path.join(HERE, "sflabel.py"), "--in", fens, "--out", out,
          "--depth", str(depth), "--workers", str(workers)])
     return out
 
 
 def make_window(k, window):
-    win = os.path.join(DATA, f"sfwindow{k}.txt")
+    win = os.path.join(DATA, f"train_window{k}.txt")
     lo = max(1, k - window + 1)
     srcs = ([SEED_POOL] if os.path.exists(SEED_POOL) else []) + \
-           [os.path.join(DATA, f"sf_gen{g}.txt") for g in range(lo, k + 1)]
+           [os.path.join(DATA, f"labeled_gen{g}.txt") for g in range(lo, k + 1)]
     seen = set()
     with open(win, "w", encoding="utf-8") as out:
-        out.write(f"# sf window: seed + gens {lo}..{k}\n")
+        out.write(f"# train window: seed + gens {lo}..{k}\n")
         for s in srcs:
             if not os.path.exists(s):
                 continue
@@ -93,8 +93,8 @@ def make_window(k, window):
 
 
 def train_gen(k, data, init_pt, lr, epochs):
-    net_out = os.path.join(NETS, f"net_sf{k}.eongnnue")
-    pt_out = os.path.join(NETS, f"net_sf{k}.pt")
+    net_out = os.path.join(NETS, f"net_gen{k}.eongnnue")
+    pt_out = os.path.join(NETS, f"net_gen{k}.pt")
     if os.path.exists(data + ".npz"):
         os.remove(data + ".npz")
     run([PY, os.path.join(HERE, "train.py"), "--data", data, "--out", net_out,
@@ -135,8 +135,8 @@ def main():
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--depth", type=int, default=9)
     ap.add_argument("--random-plies", type=int, default=10)
-    ap.add_argument("--sf-depth", type=int, default=16)
-    ap.add_argument("--sf-workers", type=int, default=20)
+    ap.add_argument("--label-depth", type=int, default=16)
+    ap.add_argument("--label-workers", type=int, default=20)
     ap.add_argument("--window", type=int, default=3)
     ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--epochs", type=int, default=200)
@@ -150,34 +150,34 @@ def main():
     if args.resume and os.path.exists(STATE):
         st = json.load(open(STATE))
     else:
-        # seed from net_sf1 (already shown to beat net2)
+        # seed from net_gen1 (already shown to beat net2)
         st = {"gen": 1,
-              "best": os.path.join(NETS, "net_sf1.eongnnue"),
-              "best_pt": os.path.join(NETS, "net_sf1.pt"),
-              "history": [{"gen": 1, "net": "net_sf1", "match_score": 0.570, "promoted": True}]}
+              "best": os.path.join(NETS, "net_gen1.eongnnue"),
+              "best_pt": os.path.join(NETS, "net_gen1.pt"),
+              "history": [{"gen": 1, "net": "net_gen1", "match_score": 0.570, "promoted": True}]}
         json.dump(st, open(STATE, "w"), indent=2)
 
     for k in range(st["gen"] + 1, args.generations + 1):
         best, best_pt = st["best"], st["best_pt"]
-        print(f"\n===== SF-GEN {k} (best={os.path.basename(best)}) =====", flush=True)
+        print(f"\n===== GEN {k} (best={os.path.basename(best)}) =====", flush=True)
         fens = gen_positions(k, best, args.games, args.workers, args.depth,
                              seed_base=700000 + 10000 * k, random_plies=args.random_plies)
-        sf_label(fens, k, args.sf_depth, args.sf_workers)
+        label_generation(fens, k, args.label_depth, args.label_workers)
         window = make_window(k, args.window)
         net_k, pt_k = train_gen(k, window, best_pt, args.lr, args.epochs)
 
         score = match_score(net_k, best, args.match_nodes, args.match_openings, seed=k)
         promoted = score >= args.promote
-        print(f"sfgen{k}: net_sf{k} vs best -> {score:.3f} -> {'PROMOTE' if promoted else 'keep'}", flush=True)
+        print(f"gen{k}: net_gen{k} vs best -> {score:.3f} -> {'PROMOTE' if promoted else 'keep'}", flush=True)
         if promoted:
             st["best"], st["best_pt"] = net_k, pt_k
         tac = tactics(st["best"], args.suite, 50000)
         st["gen"] = k
-        st["history"].append({"gen": k, "net": f"net_sf{k}", "match_score": score,
+        st["history"].append({"gen": k, "net": f"net_gen{k}", "match_score": score,
                               "promoted": promoted, "tactics": tac})
         json.dump(st, open(STATE, "w"), indent=2)
 
-    print("\nsfloop done. best =", st["best"])
+    print("\ntrainloop done. best =", st["best"])
     print(json.dumps(st["history"], indent=2))
 
 

@@ -205,7 +205,7 @@ type StateInfo =
       // Pawn-only Zobrist key (both colors' pawns, piece-square terms only — no castle/ep/side). Feeds the
       // correction-history index; maintained by the same mutation choke points as Key.
       mutable PawnKey: uint64
-      // Minor-piece Zobrist key (both colors' knights, bishops AND kings — SF's minor corrhist keying;
+      // Minor-piece Zobrist key (both colors' knights, bishops AND kings — minor corrhist keying;
       // the king term makes king-safety structures distinguishable). Same contract as PawnKey.
       mutable MinorKey: uint64
       mutable CastlingRights: int

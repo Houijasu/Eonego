@@ -110,9 +110,9 @@ venv/
 *.pt
 trainer/*_state*.json
 
-# External NNUE nets (large, downloaded — Stockfish CC0; not committed)
+# External NNUE nets (large, downloaded — not committed)
 nets/
 *.nnue
 
-# Downloaded Stockfish binary used only as a local parity oracle (GPL — never commit)
-tmp_sf/
+# Downloaded UCI teacher binary used only as a local parity oracle (never commit)
+tmp_teacher/

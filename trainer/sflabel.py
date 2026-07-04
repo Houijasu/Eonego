@@ -1,11 +1,11 @@
-"""Label FENs with deep Stockfish eval (WHITE-RELATIVE centipawns), parallelized.
+"""Label FENs with deep teacher-engine eval (WHITE-RELATIVE centipawns), parallelized.
 
-Distillation teacher: Stockfish 18. Each worker runs its own Stockfish (1 thread) and
+Distillation teacher: external UCI engine. Each worker runs its own engine (1 thread) and
 analyses to a fixed depth (or nodes). Mate scores map to a large cp with ply falloff.
 Output line format matches the trainer: `<fen>;<cp_white>;<result_white>` (result is a
 placeholder 0.5 here — pure-eval distillation uses lambda=1.0; WDL can be added later).
 
-    python sflabel.py --in data/pool_fens.txt --out data/sf_gen0.txt --depth 16 --workers 20
+    python sflabel.py --in data/pool_fens.txt --out data/labeled_gen0.txt --depth 16 --workers 20
 """
 
 import argparse
@@ -16,9 +16,9 @@ from concurrent.futures import ProcessPoolExecutor
 import chess
 import chess.engine
 
-SF = os.environ.get(
-    "STOCKFISH",
-    r"C:\Program Files (x86)\Common Files\ChessBase\Engines.uci\Stockfish\stockfish-windows-x86-64-avx2.exe",
+TEACHER_ENGINE = os.environ.get(
+    "TEACHER_ENGINE",
+    os.path.join(os.environ.get("USERPROFILE", ""), "bin", "uci-engine.exe"),
 )
 MATE_CP = 30000  # mate maps to +-(MATE_CP - |mate_in|*100), clamped by the trainer anyway
 
@@ -32,9 +32,9 @@ def _cp_white(score):
 
 
 def label_chunk(args):
-    fens, depth, nodes, hash_mb, sf_threads = args
-    eng = chess.engine.SimpleEngine.popen_uci(SF)
-    eng.configure({"Threads": sf_threads, "Hash": hash_mb})
+    fens, depth, nodes, hash_mb, teacher_threads = args
+    eng = chess.engine.SimpleEngine.popen_uci(TEACHER_ENGINE)
+    eng.configure({"Threads": teacher_threads, "Hash": hash_mb})
     limit = chess.engine.Limit(nodes=nodes) if nodes else chess.engine.Limit(depth=depth)
     out = []
     try:
@@ -73,18 +73,18 @@ def main():
     ap.add_argument("--depth", type=int, default=16)
     ap.add_argument("--nodes", type=int, default=0, help="if >0, use fixed nodes instead of depth")
     ap.add_argument("--workers", type=int, default=24)
-    ap.add_argument("--sf-threads", type=int, default=1, help="threads per Stockfish process (workers * sf-threads should be <= cores)")
+    ap.add_argument("--teacher-threads", type=int, default=1, help="threads per teacher process (workers * teacher-threads should be <= cores)")
     ap.add_argument("--hash", type=int, default=16)
     args = ap.parse_args()
 
     fens = read_fens(args.inp)
     w = max(1, args.workers)
     chunks = [fens[i::w] for i in range(w)]  # round-robin -> even load
-    payloads = [(c, args.depth, args.nodes, args.hash, args.sf_threads) for c in chunks if c]
+    payloads = [(c, args.depth, args.nodes, args.hash, args.teacher_threads) for c in chunks if c]
 
-    print(f"labeling {len(fens)} unique FENs with Stockfish "
+    print(f"labeling {len(fens)} unique FENs with teacher engine "
           f"({'nodes ' + str(args.nodes) if args.nodes else 'depth ' + str(args.depth)}), "
-          f"{w} workers x {args.sf_threads} threads, hash {args.hash}MB", flush=True)
+          f"{w} workers x {args.teacher_threads} threads, hash {args.hash}MB", flush=True)
 
     results = []
     done = 0
@@ -96,7 +96,7 @@ def main():
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as f:
-        f.write(f"# stockfish-labeled  teacher=SF18  "
+        f.write(f"# teacher-labeled  "
                 f"{'nodes=' + str(args.nodes) if args.nodes else 'depth=' + str(args.depth)}  "
                 f"n={len(results)}\n")
         for fen, cp in results:

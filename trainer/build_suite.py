@@ -1,7 +1,7 @@
-"""Build a Stockfish-verified KGA tactical suite.
+"""Build a teacher-verified KGA tactical suite.
 
 Samples KGA-reachable positions (from gen data or random KGA play), analyses each with
-Stockfish at depth D with multipv=2, and keeps the ones where the best move is decisively
+a UCI teacher engine at depth D with multipv=2, and keeps the ones where the best move is decisively
 better than the second best (a forced mate, or a >=GAP cp swing) -- i.e. a real tactic with
 an unambiguous solution. Writes `<fen>\t<bm_uci>\t<tag>` to the suite file.
 
@@ -16,7 +16,10 @@ import chess
 import chess.engine
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SF = os.environ.get("STOCKFISH", r"C:\Users\Samaritan\bin\stockfish.exe")
+TEACHER_ENGINE = os.environ.get(
+    "TEACHER_ENGINE",
+    os.path.join(os.environ.get("USERPROFILE", ""), "bin", "uci-engine.exe"),
+)
 KGA_FEN = "rnbqkbnr/pppp1ppp/8/8/4Pp2/8/PPPP2PP/RNBQKBNR w KQkq - 0 3"
 
 
@@ -70,7 +73,7 @@ def main():
     rng.shuffle(cands)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-    eng = chess.engine.SimpleEngine.popen_uci(SF)
+    eng = chess.engine.SimpleEngine.popen_uci(TEACHER_ENGINE)
     eng.configure({"Threads": 2, "Hash": 256})
 
     kept = []
@@ -108,7 +111,7 @@ def main():
         eng.quit()
 
     with open(args.out, "w", encoding="utf-8") as f:
-        f.write("# fen\tbm_uci\ttag  (Stockfish-verified KGA tactics)\n")
+        f.write("# fen\tbm_uci\ttag  (teacher-verified KGA tactics)\n")
         for fen, bm, tag in kept:
             f.write(f"{fen}\t{bm}\t{tag}\n")
     print(f"wrote {len(kept)} tactical positions to {args.out}")

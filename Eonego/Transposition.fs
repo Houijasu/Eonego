@@ -67,7 +67,7 @@ let inline dBound (d: uint64) : int = (dGenBound d) &&& 3
 let inline dTtPv (d: uint64) : bool = ((dGenBound d) >>> 2) &&& 1 = 1
 let inline dGen (d: uint64) : int = (dGenBound d) >>> 3
 
-/// EONEGO_TT_REFRESH=1: a probe HIT re-stamps the entry's generation (SF behaviour), so cutoff-serving
+/// EONEGO_TT_REFRESH=1: a probe HIT re-stamps the entry's generation (reference behaviour), so cutoff-serving
 /// entries stop losing replacement priority (relAge*2 ≈ 2 effective depth per game move) and aging out
 /// while hot. Costs a write on the probe path, but only when the stored generation differs — at most
 /// once per entry per search. Default OFF pending its match under hash pressure.

@@ -26,7 +26,7 @@ node-count sweeps and SPRT self-play matches.
 - The net is embedded into the executable at build time when present (see *Building*)
 
 ### Search
-- Negamax / PVS with quiescence, **LazySMP** parallelism, and SF-style **thread voting**
+- Negamax / PVS with quiescence, **LazySMP** parallelism, and **thread voting**
   over the workers' root results
 - XOR-lockless (Hyatt) transposition table, 4-entry 64-byte clusters, 5-bit aging
 - Aspiration windows, iterative deepening
@@ -95,7 +95,7 @@ environment variables (default off unless noted) so A/B matches never need a reb
 | `EONEGO_TT_REFRESH=1` | Probe hits re-stamp TT entry age |
 | `EONEGO_PARTIAL=1` | Adopt a hard-stopped iteration's best root move |
 | `EONEGO_QSCHECKS=1` | Quiet checking moves at the first qsearch ply (SEE-losing checks skipped) |
-| `EONEGO_ROOTEFFORT=1` | Re-sort root moves between iterations by subtree node effort (SF-style) |
+| `EONEGO_ROOTEFFORT=1` | Re-sort root moves between iterations by subtree node effort |
 | `EONEGO_T_ASP_FHRED=0` | Disable the aspiration fail-high re-search depth reduction (slow-win suppression fix) |
 | `EONEGO_CORRHIST=0` | Disable correction history (default on) |
 | `EONEGO_QSTT=0` / `EONEGO_TTEVADJ=0` | Disable qsearch-TT / TT-eval-adjust (default on) |

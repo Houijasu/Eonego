@@ -12,7 +12,7 @@ module Eonego.Engine
 let Name = "Eonego"
 
 [<Literal>]
-let Version = "0.0.3"
+let Version = "0.0.4"
 
 [<Literal>]
 let Author = "Houijasu"

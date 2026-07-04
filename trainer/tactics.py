@@ -1,4 +1,4 @@
-"""Score an Eonego configuration on the Stockfish-verified KGA tactical suite.
+"""Score an Eonego configuration on the teacher-verified KGA tactical suite.
 
 The headline metric: fraction of suite positions where the engine, at a fixed budget,
 plays the verified best move. Reported overall and split by tag (mate / win).
