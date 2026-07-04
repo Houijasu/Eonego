@@ -216,3 +216,50 @@ let ``white queen signature passes the full self-consistency proof`` () =
 [<Trait("Category", "Slow")>]
 let ``black queen signature passes the full self-consistency proof`` () =
     Assert.Equal(None, verifySignature (makePiece Black Queen) (bqSolved.Force()) Array.empty)
+
+// ---------------------------------------------------------------------------
+// Rook / bishop / knight signatures — same generic solver, piece-specific retraction sets
+// ---------------------------------------------------------------------------
+
+let private wrSolved = lazy (solveSignature (makePiece White Rook) Array.empty)
+let private brSolved = lazy (solveSignature (makePiece Black Rook) Array.empty)
+let private wbSolved = lazy (solveSignature (makePiece White Bishop) Array.empty)
+let private wnSolved = lazy (solveSignature (makePiece White Knight) Array.empty)
+
+[<Fact>]
+let ``solved rook table finds the existing mate-in-one fixture`` () =
+    // k7/8/1K6/8/8/8/8/7R w — the search suite's mate-in-1 (Rh8#): wKb6, bKa8, Rh1.
+    let values = wrSolved.Force()
+    Assert.Equal(2y, values.[idxOf White B6 A8 H1])
+
+[<Fact>]
+let ``rook signature stats match the literature and the black twin mirrors them`` () =
+    // KRK: longest win is mate in 16 moves = 31 plies.
+    let struct (lW, wW, sW, mwW, mlW) = statsOf (wrSolved.Force())
+    Assert.Equal(31, mwW)
+    Assert.True(wW > 0 && sW > 0 && lW > wW + sW)
+    let struct (lB, wB, sB, mwB, mlB) = statsOf (brSolved.Force())
+    Assert.Equal((lW, wW, sW, mwW, mlW), (lB, wB, sB, mwB, mlB))
+
+[<Fact>]
+let ``bishop and knight signatures are proven all-draw`` () =
+    // The retrograde proof of insufficient material — no shortcut, the fixpoint must show it.
+    let struct (_, wB, sB, mwB, mlB) = statsOf (wbSolved.Force())
+    Assert.Equal((0, 0, 0, 0), (wB, sB, mwB, mlB))
+    let struct (_, wN, sN, mwN, mlN) = statsOf (wnSolved.Force())
+    Assert.Equal((0, 0, 0, 0), (wN, sN, mwN, mlN))
+
+[<Fact>]
+[<Trait("Category", "Slow")>]
+let ``rook signature passes the full self-consistency proof`` () =
+    Assert.Equal(None, verifySignature (makePiece White Rook) (wrSolved.Force()) Array.empty)
+
+[<Fact>]
+[<Trait("Category", "Slow")>]
+let ``bishop signature passes the full self-consistency proof`` () =
+    Assert.Equal(None, verifySignature (makePiece White Bishop) (wbSolved.Force()) Array.empty)
+
+[<Fact>]
+[<Trait("Category", "Slow")>]
+let ``knight signature passes the full self-consistency proof`` () =
+    Assert.Equal(None, verifySignature (makePiece White Knight) (wnSolved.Force()) Array.empty)
