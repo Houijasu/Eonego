@@ -61,6 +61,11 @@ let private tryInt (s: string) : int =
     | true, v -> v
     | _ -> 0
 
+let private tryInt64 (s: string) : int64 =
+    match Int64.TryParse s with
+    | true, v -> v
+    | _ -> 0L
+
 /// UCI moves are castling/en-passant flag-lossy via parseUci, so re-stamp each against legal generation.
 let private matchMove (pos: Position) (uci: string) : Move =
     let t = parseUci uci
@@ -156,7 +161,12 @@ let private parseGo (tokens: string[]) : SearchLimits * string[] =
             lim <- { lim with Depth = arg () }
             i <- i + 2
         | "nodes" ->
-            lim <- { lim with Nodes = int64 (arg ()) }
+            // Parse as int64 directly: `int64 (arg ())` went through the 32-bit parser first, so a
+            // budget above 2^31-1 parsed to 0 = "no node limit" = an unbounded search.
+            lim <-
+                { lim with
+                    Nodes = (if i + 1 < tokens.Length then tryInt64 tokens.[i + 1] else 0L) }
+
             i <- i + 2
         | "movetime" ->
             lim <- { lim with MoveTime = arg () }
