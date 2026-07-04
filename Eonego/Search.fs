@@ -2220,10 +2220,17 @@ let private goCore (control: SearchControl) (workers: Worker[]) : Move =
     writeLine ("bestmove " + toUci best)
     best
 
-let go (control: SearchControl) : Move =
+/// Arm a control for one search: clear the stop flag/counters and bump the TT age. The UCI driver
+/// calls this on ITS OWN thread before spawning the search thread — go/goPooled running Reset on the
+/// spawned thread let a `stop`/`quit` that raced in between `Thread.Start` and `Reset` be silently
+/// ERASED (the search then ran unbounded) or, on the other side of the race, abort depth 1 into a
+/// first-legal bestmove. Direct callers (tests, goArmed-less paths) use go/goPooled which arm inline.
+let arm (control: SearchControl) : unit =
     control.Reset()
     control.NewSearch()
 
+/// Search body: the control must already be armed (see `arm`).
+let goArmed (control: SearchControl) : Move =
     if PosProf.Enabled then
         PosProf.reset ()
 
@@ -2235,15 +2242,17 @@ let go (control: SearchControl) : Move =
 
     goCore control workers
 
+let go (control: SearchControl) : Move =
+    arm control
+    goArmed control
+
 /// Worker pool entry (UCI EONEGO_POOL=1): reuse per-thread Workers across `go` calls. Skips the
 /// per-move worker allocation (~3.5MB × threads of zeroed LOH — measured 26ms median per go at 16T)
 /// and keeps the gravity history tables warm across moves (killers/counters are re-cleared per
 /// search by SetupRoot keepHistory). The caller owns the pool lifetime: recreate on Threads change,
 /// drop on ucinewgame. Workers must be rebound here — the control is new every search.
-let goPooled (control: SearchControl) (workers: Worker[]) : Move =
-    control.Reset()
-    control.NewSearch()
-
+/// The control must already be armed (see `arm`).
+let goPooledArmed (control: SearchControl) (workers: Worker[]) : Move =
     if PosProf.Enabled then
         PosProf.reset ()
 
@@ -2252,6 +2261,10 @@ let goPooled (control: SearchControl) (workers: Worker[]) : Move =
         w.SetupRoot(keepHistory = true)
 
     goCore control workers
+
+let goPooled (control: SearchControl) (workers: Worker[]) : Move =
+    arm control
+    goPooledArmed control workers
 
 // ---------------------------------------------------------------------------
 // Test entry: a single fixed-depth, FULL-WINDOW negamax (bypasses aspiration/ID). The correctness oracle.

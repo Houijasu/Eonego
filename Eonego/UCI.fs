@@ -237,6 +237,11 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
 
         let control =
             SearchControl(cfg, lim, st.Tt, st.RootFen, st.RootMoves, ?net = st.Net)
+
+        // Arm on the UCI thread BEFORE the search thread exists: a `stop`/`quit` arriving right
+        // after t.Start() must find the stop flag armed-and-clear, not race the thread's own Reset
+        // (which either erased the stop — unbounded search — or aborted depth 1 into first-legal).
+        Search.arm control
         st.Control <- Some control
 
         // Worker pool (EONEGO_POOL=1, default OFF = legacy fresh-workers path, byte-identical).
@@ -253,9 +258,9 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
             Thread(
                 ThreadStart(fun () ->
                     if usePool then
-                        Search.goPooled control pool |> ignore
+                        Search.goPooledArmed control pool |> ignore
                     else
-                        Search.go control |> ignore),
+                        Search.goArmed control |> ignore),
                 16 * 1024 * 1024
             )
 

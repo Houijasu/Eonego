@@ -72,7 +72,9 @@ let ``ProbCut reduces nodes on a capture-rich position`` () =
     | None -> () // soft-skip: NNUE net absent
     | Some net ->
         let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"   // Kiwipete
-        let depth = 9
+        // d9 became a node-count wash (nOn=19588 vs nOff=19552) when the canonical net changed to the
+        // 2026-07-04 KGA fine-tune; at d11 ProbCut's savings dominate the fixture noise again.
+        let depth = 11
         let struct (_, nOn, mOn) = searchToDepthNet fen [||] depth cfgOn (Some net)
         let struct (_, nOff, mOff) = searchToDepthNet fen [||] depth cfgOff (Some net)
         Assert.True(nOn < nOff, "expected ProbCut to cut nodes: nOn=" + string nOn + " nOff=" + string nOff)

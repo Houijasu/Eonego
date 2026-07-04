@@ -54,19 +54,20 @@ let private fens =
       "8/8/8/3k4/8/3K4/4P3/8 w - -" // KPK (3) bucket 0
       "1nbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQk - 0 1" ] // white up the a1 rook
 
-// Captured from the int32 AVX2 build on 2026-06-29 (branch nnue-fullthreats-perf, pre-optimization baseline).
+// Captured 2026-07-04 for the KGA-specialist main.nnue (stack fine-tune of the FullThreats master;
+// values change whenever the canonical net is retrained — recapture via the protocol above).
 // Empty => capture mode (writes eonego-golden-eval.txt, skips assert). Order matches `fens`.
 let private golden: int list =
-    [ 16 // startpos
-      -312 // kiwipete white
-      785 // kiwipete black
-      -47 // Ruy Lopez black
-      676 // closed middlegame
-      -1 // rook endgame
-      113 // sparse endgame
-      -6 // KP vs KP
-      41 // KPK
-      1837 ] // up a rook
+    [ -12 // startpos
+      -317 // kiwipete white
+      962 // kiwipete black
+      -66 // Ruy Lopez black
+      750 // closed middlegame
+      17 // rook endgame
+      155 // sparse endgame
+      -5 // KP vs KP
+      321 // KPK
+      1785 ] // up a rook
 
 [<Fact>]
 let ``golden evalInternal is stable across perf phases`` () =
