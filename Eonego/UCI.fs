@@ -363,6 +363,24 @@ let run () =
                 | "position" ->
                     stopAndJoin st
                     parsePosition st tokens.[1..]
+
+                    // Retrograde root trigger: on a low-material root, start solving the reachable
+                    // signatures in the background NOW — during the opponent's think time — so the
+                    // search's probes are usually live before the ending matters. Same kill-switch
+                    // as the probe's config rider. The replay Position is net-free (no acc frames);
+                    // the cap keeps a pathological >900-ply history away from the state-stack limit
+                    // (skipping only delays solving — the search stays correct without it).
+                    if
+                        Environment.GetEnvironmentVariable "EONEGO_RETRO" <> "0"
+                        && st.RootMoves.Length <= 900
+                    then
+                        let p = Position()
+                        p.LoadFen st.RootFen
+
+                        for mv in st.RootMoves do
+                            p.Make mv
+
+                        Eonego.Retrograde.requestSolveFor p
                 | "go" ->
                     let (lim, smUci) = parseGo tokens.[1..]
 

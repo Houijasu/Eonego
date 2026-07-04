@@ -27,6 +27,7 @@ let private usage () =
     writeLine "Eonego tooling subcommands:"
     writeLine "  gen --start <fen> --games N --out <file> --net <path> [--depth D | --nodes K] [--temp T] [--seed S] [--random-plies P] [--max-plies M]"
     writeLine "  dumpft --net <path> --in <fens> --out <bin>   (trainer FT dump: 1034-byte records bucket/stm/psqt/eval/ft[1024])"
+    writeLine "  retro <fen> [--verify]   (solve the position's retrograde signatures, print stats + its value; --verify runs the full self-consistency proof)"
 
 /// Hand-rolled `--key value` parser; returns a map of flag -> optional value.
 let private parseFlags (args: string[]) : Map<string, string option> =
@@ -375,3 +376,90 @@ let runDumpFt (args: string[]) : int =
     | _ ->
         errLine "dumpft requires --net <path> --in <fens> --out <bin>"
         1
+
+/// `retro <fen> [--verify]` — synchronously solve the position's retrograde signature closure,
+/// print per-signature stats and the position's own value + root score mapping. `--verify` runs
+/// the full self-consistency proof on each solved signature (exit 1 on the first mismatch).
+let runRetro (args: string[]) : int =
+    let verify =
+        args
+        |> Array.exists (fun a -> a.Equals("--verify", StringComparison.OrdinalIgnoreCase))
+
+    let fenToks = args |> Array.filter (fun a -> not (a.StartsWith "--"))
+
+    if fenToks.Length = 0 then
+        usage ()
+        1
+    else
+        let pos = Position.OfFen(String.Join(" ", fenToks))
+        let sigs = Eonego.Retrograde.signatureClosure pos
+
+        if List.isEmpty sigs then
+            errLine "retro: no solvable signature (need a 3- or 4-man position)"
+            1
+        else
+            let sigName (pce: Piece) =
+                "K"
+                + string ("PNBRQK".[pieceType pce])
+                + "K "
+                + (if pieceColor pce = White then "(white)" else "(black)")
+
+            let promoTablesOf (pce: Piece) : sbyte[][] =
+                if pieceType pce = Pawn then
+                    let owner = pieceColor pce
+                    let t: sbyte[][] = Array.zeroCreate 6
+                    t.[Knight] <- Eonego.Retrograde.solvedTable (makePiece owner Knight)
+                    t.[Bishop] <- Eonego.Retrograde.solvedTable (makePiece owner Bishop)
+                    t.[Rook] <- Eonego.Retrograde.solvedTable (makePiece owner Rook)
+                    t.[Queen] <- Eonego.Retrograde.solvedTable (makePiece owner Queen)
+                    t
+                else
+                    Array.empty
+
+            let mutable exitCode = 0
+
+            for pce in sigs do
+                let sw = System.Diagnostics.Stopwatch.StartNew()
+                Eonego.Retrograde.ensureSolved pce
+                sw.Stop()
+                let tbl = Eonego.Retrograde.solvedTable pce
+
+                let struct (legal, wins, losses, maxWin, maxLoss) = Eonego.Retrograde.statsOf tbl
+
+                writeLine (
+                    "signature "
+                    + sigName pce
+                    + ": legal "
+                    + string legal
+                    + " win "
+                    + string wins
+                    + " loss "
+                    + string losses
+                    + " draw "
+                    + string (legal - wins - losses)
+                    + " maxWinDtm "
+                    + string maxWin
+                    + " maxLossDtm "
+                    + string maxLoss
+                    + " solveMs "
+                    + string sw.ElapsedMilliseconds
+                )
+
+                if verify then
+                    match Eonego.Retrograde.verifySignature pce tbl (promoTablesOf pce) with
+                    | None -> writeLine ("verify " + sigName pce + ": OK")
+                    | Some err ->
+                        errLine ("verify " + sigName pce + ": FAILED - " + err)
+                        exitCode <- 1
+
+            match Eonego.Retrograde.probe pos with
+            | ValueSome v ->
+                let desc =
+                    if v = 0y then "draw"
+                    elif v > 0y then "win in " + string (Eonego.Retrograde.retroDtm v) + " plies"
+                    else "loss in " + string (Eonego.Retrograde.retroDtm v) + " plies"
+
+                writeLine ("value: " + desc + " | root score " + string (retroScoreAt pos 0))
+            | ValueNone -> writeLine "value: not covered (4-man input pre-solved only, or probe guards declined)"
+
+            exitCode

@@ -25,6 +25,7 @@ let main argv =
         match argv.[0] with
         | "gen" -> Eonego.Tooling.runGen argv.[1..]
         | "dumpft" -> Eonego.Tooling.runDumpFt argv.[1..]
+        | "retro" -> Eonego.Tooling.runRetro argv.[1..]
         | _ ->
             Eonego.UCI.run ()
             0
