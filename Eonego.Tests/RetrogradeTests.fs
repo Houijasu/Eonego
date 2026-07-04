@@ -263,3 +263,75 @@ let ``bishop signature passes the full self-consistency proof`` () =
 [<Trait("Category", "Slow")>]
 let ``knight signature passes the full self-consistency proof`` () =
     Assert.Equal(None, verifySignature (makePiece White Knight) (wnSolved.Force()) Array.empty)
+
+// ---------------------------------------------------------------------------
+// Pawn signatures — un-pushes (single + double) and the promotion dependency
+// ---------------------------------------------------------------------------
+
+let private bbSolved = lazy (solveSignature (makePiece Black Bishop) Array.empty)
+let private bnSolved = lazy (solveSignature (makePiece Black Knight) Array.empty)
+
+let private promoTablesWhite =
+    lazy
+        (let t: sbyte[][] = Array.zeroCreate 6
+         t.[Knight] <- wnSolved.Force()
+         t.[Bishop] <- wbSolved.Force()
+         t.[Rook] <- wrSolved.Force()
+         t.[Queen] <- wqSolved.Force()
+         t)
+
+let private promoTablesBlack =
+    lazy
+        (let t: sbyte[][] = Array.zeroCreate 6
+         t.[Knight] <- bnSolved.Force()
+         t.[Bishop] <- bbSolved.Force()
+         t.[Rook] <- brSolved.Force()
+         t.[Queen] <- bqSolved.Force()
+         t)
+
+let private wpSolved = lazy (solveSignature (makePiece White Pawn) (promoTablesWhite.Force()))
+let private bpSolved = lazy (solveSignature (makePiece Black Pawn) (promoTablesBlack.Force()))
+
+let private E2 = 12
+let private E3 = 20
+let private E6 = 44
+let private E7 = 52
+let private G8 = 62
+
+[<Fact>]
+let ``solved pawn table proves promotion mate in one`` () =
+    // wKg6, Pe7, bKg8, White to move: e8=Q# (rank-8 check; g7/f7/h7 covered by wKg6).
+    let values = wpSolved.Force()
+    Assert.Equal(2y, values.[idxOf White G6 G8 E7])
+
+[<Fact>]
+let ``king ahead on the sixth wins even with the defender to move`` () =
+    // Textbook: Ke6 ahead of Pe5 vs Ke8 is winning regardless of the move; Black to move loses.
+    let values = wpSolved.Force()
+    let v = values.[idxOf Black E6 E8 E5]
+    Assert.True(v < 0y, "expected a loss, got " + string (int v))
+
+[<Fact>]
+let ``defender blockading the pawn with the attacker king behind is drawn`` () =
+    // Textbook: bKe3 directly in front of Pe2 with wKe1 stuck behind — dead draw.
+    let values = wpSolved.Force()
+    Assert.Equal(0y, values.[idxOf White E1 E3 E2])
+
+[<Fact>]
+let ``pawn signature stats match the literature and the black twin mirrors them`` () =
+    // KPK: longest win is mate in 28 moves = 55 plies (through promotion).
+    let struct (lW, wW, sW, mwW, mlW) = statsOf (wpSolved.Force())
+    Assert.Equal(55, mwW)
+    Assert.True(wW > 0 && sW > 0 && lW > wW + sW)
+    let struct (lB, wB, sB, mwB, mlB) = statsOf (bpSolved.Force())
+    Assert.Equal((lW, wW, sW, mwW, mlW), (lB, wB, sB, mwB, mlB))
+
+[<Fact>]
+[<Trait("Category", "Slow")>]
+let ``white pawn signature passes the full self-consistency proof`` () =
+    Assert.Equal(None, verifySignature (makePiece White Pawn) (wpSolved.Force()) (promoTablesWhite.Force()))
+
+[<Fact>]
+[<Trait("Category", "Slow")>]
+let ``black pawn signature passes the full self-consistency proof`` () =
+    Assert.Equal(None, verifySignature (makePiece Black Pawn) (bpSolved.Force()) (promoTablesBlack.Force()))
