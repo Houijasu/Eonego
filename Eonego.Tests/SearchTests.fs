@@ -14,6 +14,11 @@ let private oracleCfg =
     { defaultConfig with
         UseTt = false
         UsePruning = false
+        // Retro is exactness, not pruning, so it is NOT under the usePruning gate — but refMinimax
+        // has no probe (only the shared qsearch leaf would see it), and the oracle theories include
+        // 3-man FENs: pin it off or the equality goes order-dependent once a parallel test class
+        // publishes a solved signature.
+        UseRetro = false
         Threads = 1 }
 
 let private makeWorker (fen: string) (cfg: SearchConfig) : Worker =
@@ -104,6 +109,7 @@ let private oracleAllFlagsCfg =
     { defaultConfig with
         UseTt = false
         UsePruning = false
+        UseRetro = false // same rationale as oracleCfg
         Threads = 1
         UseContHist = true
         UseSingular = true

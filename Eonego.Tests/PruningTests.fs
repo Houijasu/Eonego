@@ -15,14 +15,18 @@ open Eonego.Tests.TestFixtures
 
 // cfgOn: all four new heuristics on (defaults). cfgOff: the four off, but the legacy pruning suite
 // (RFP/null-move/LMP/futility/SEE/LMR/ProbCut) stays on — so node deltas isolate the new heuristics.
-let private cfgOn = defaultConfig
+// UseRetro pinned OFF in both arms: retrograde values publish process-wide once any parallel test
+// class solves a signature, and the queen-grab fixture reaches 3-man subtrees at depth 8 — its
+// measured-then-pinned best-move tie-break must not depend on WHEN that publication happens.
+let private cfgOn = { defaultConfig with UseRetro = false }
 
 let private cfgOff =
     { defaultConfig with
         UseIir = false
         UseRazoring = false
         UseHistoryPruning = false
-        UseDeltaPruning = false }
+        UseDeltaPruning = false
+        UseRetro = false }
 
 // ---------------------------------------------------------------------------
 // (a) Tactics not hidden — with the full pruning suite on, known wins/mates are still found.

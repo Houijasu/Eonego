@@ -231,6 +231,7 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
               UseQsChecks = (Environment.GetEnvironmentVariable("EONEGO_QSCHECKS") = "1")
               UseRootEffort = (Environment.GetEnvironmentVariable("EONEGO_ROOTEFFORT") = "1")
               UseRootVerify = (Environment.GetEnvironmentVariable("EONEGO_ROOTVERIFY") = "1")
+              UseRetro = (Environment.GetEnvironmentVariable("EONEGO_RETRO") <> "0")
               MoveOverhead = st.MoveOverhead
               AccCheckpointMb = 0
               MultiPv = st.MultiPv }

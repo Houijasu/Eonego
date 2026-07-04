@@ -6,8 +6,10 @@ module Eonego.Tests.RetrogradeTests
 open System.Text
 open Xunit
 open Eonego.Bitboard
+open Eonego.Move
 open Eonego.Position
 open Eonego.Retrograde
+open Eonego.Search
 open Eonego.Tests.TestFixtures
 
 // LERF square shorthands used across the fixtures (a1 = 0 .. h8 = 63).
@@ -397,3 +399,69 @@ let ``root trigger solves the signature in the background`` () =
         System.Threading.Thread.Sleep 25
 
     Assert.True(isSolved (makePiece White Rook))
+
+// ---------------------------------------------------------------------------
+// Search integration — the negamax/qsearch probe arms return exact DTM scores
+// ---------------------------------------------------------------------------
+
+[<Fact>]
+let ``search returns the exact retro mate score at depth 2`` () =
+    ensureSolved (makePiece White Rook)
+    let struct (score, _, m) = searchToDepth "k7/8/1K6/8/8/8/8/7R w - - 0 1" [||] 2 defaultConfig
+    Assert.Equal(MATE - 1, score)
+    Assert.Equal("h1h8", toUci m)
+
+[<Fact>]
+let ``search backs up the table's exact DTM from probed children`` () =
+    // The root itself is never probed (ply 0) — its children return exact values, so even depth 2
+    // must reproduce the table's DTM to the ply.
+    ensureSolved (makePiece White Queen)
+    let v = (solvedTable (makePiece White Queen)).[idxOf White E1 E8 B3]
+    Assert.True(v > 0y)
+    let struct (score, _, m) = searchToDepth "4k3/8/8/8/8/1Q6/8/4K3 w - - 0 1" [||] 2 defaultConfig
+    Assert.Equal(MATE - retroDtm v, score)
+    Assert.NotEqual(MoveNone, m)
+
+[<Fact>]
+let ``search scores the blockade draw exactly zero`` () =
+    ensureSolved (makePiece White Pawn)
+    let struct (score, _, _) = searchToDepth "8/8/8/8/8/4k3/4P3/4K3 w - - 0 1" [||] 2 defaultConfig
+    Assert.Equal(0, score)
+
+[<Fact>]
+let ``rule-50 budget guard declines unreachable wins but keeps draws`` () =
+    ensureSolved (makePiece White Queen)
+    let v = (solvedTable (makePiece White Queen)).[idxOf White E1 E8 B3]
+    Assert.True(retroDtm v > 4) // the decline below relies on the win being longer than the budget
+    // Winning KQK with dtm beyond the remaining rule-50 budget: declined, search falls through.
+    Assert.Equal(VALUE_NONE, retroScoreAt (Position.OfFen "4k3/8/8/8/8/1Q6/8/4K3 w - - 96 1") 1)
+    Assert.True(retroScoreAt (Position.OfFen "4k3/8/8/8/8/1Q6/8/4K3 w - - 0 1") 1 >= MATE_IN_MAX_PLY)
+    // Draws are unconditionally safe (the Qb3 stalemate fixture at a high counter).
+    Assert.Equal(0, retroScoreAt (Position.OfFen "7k/8/6K1/8/8/1Q6/8/8 b - - 96 1") 1)
+
+[<Fact>]
+let ``depth-1 search agrees with the solved table on a stride sample`` () =
+    ensureSolved (makePiece White Queen)
+    let values = solvedTable (makePiece White Queen)
+    let pce = makePiece White Queen
+    let cfg = { defaultConfig with HashMb = 1 } // fresh TT per sample; keep it tiny
+    let sb = StringBuilder(80)
+    let mutable idx = 0
+
+    while idx < RetroSize do
+        if values.[idx] <> RetroIllegal then
+            let fen = fenOf sb pce (idxStm idx) (idxWk idx) (idxBk idx) (idxPc idx)
+            let struct (score, _, _) = searchToDepth fen [||] 1 cfg
+            let v = values.[idx]
+
+            let expected =
+                if v = 0y then 0
+                elif v > 0y then MATE - retroDtm v
+                else -MATE + retroDtm v
+
+            Assert.True(
+                (expected = score),
+                "table/search disagree at " + fen + ": table " + string expected + " search " + string score
+            )
+
+        idx <- idx + 4093 // odd stride, ~128 samples across both stm halves

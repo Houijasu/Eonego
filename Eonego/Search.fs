@@ -160,6 +160,11 @@ type SearchConfig =
       // the fresh look that pierces stale TT bounds a null-window scout can never re-open. Classic
       // single-PV path only; free when the score is moving.
       UseRootVerify: bool
+      // Retrograde search: probe on-demand-solved 3-man endings at negamax/qsearch entry for exact
+      // DTM scores (Retrograde.fs; signatures solve in the background once a low-material root
+      // appears). Exactness, not pruning — deliberately independent of UsePruning; the pruning-off
+      // oracle configs must pin this false themselves.
+      UseRetro: bool
       MoveOverhead: int
       // Phase 1: NNUE accumulator checkpoint cache. Set to 0 to disable; ~4 MiB is the recommended default
       // (1024 slots, ~4.1 KiB/slot). Cleared per search by `SearchControl.NewSearch` (alongside the TT gen
@@ -215,6 +220,7 @@ let defaultConfig =
       UseQsChecks = false
       UseRootEffort = false
       UseRootVerify = false
+      UseRetro = true
       MoveOverhead = 10
       AccCheckpointMb = 0
       MultiPv = 1 }
@@ -689,6 +695,29 @@ let private updatePv (w: Worker) (ply: int) (m: Move) =
         pv.[basep + 1] <- MoveNone
 
 // ---------------------------------------------------------------------------
+// Retrograde probe -> search score. VALUE_NONE = no usable hit (signature unsolved, guard failed).
+// A win/loss is trusted only when the mate fits the rule-50 budget (Q/R optimal lines never reset
+// the counter; conservative for pawn signatures — they fall through and the search copes) AND stays
+// inside the mate band: ply + dtm <= MaxSearchPly keeps every returned score >= MATE_IN_MAX_PLY,
+// preserving valueToTt/valueFromTt ply adjustment, `mate N` reporting, and the singular ttScore
+// gate. Draws are unconditionally safe. Exact-score contract: stm winning with dtm d at ply p means
+// the mate position scores -MATE + (p+d) with the loser to move — backed up here as MATE - (p+d),
+// bit-compatible with what a deep search would return.
+// ---------------------------------------------------------------------------
+let retroScoreAt (pos: Position) (ply: int) : int =
+    match Eonego.Retrograde.probe pos with
+    | ValueNone -> VALUE_NONE
+    | ValueSome v ->
+        if v = 0y then
+            0
+        else
+            let dtm = abs (int v) - 1
+
+            if dtm > 100 - pos.Rule50 || ply + dtm > MaxSearchPly then VALUE_NONE
+            elif v > 0y then MATE - (ply + dtm)
+            else -MATE + (ply + dtm)
+
+// ---------------------------------------------------------------------------
 // Quiescence (fail-soft leaves). `qsDepth` counts plies BELOW the qsearch entry (0 at the negamax
 // boundary, negative deeper) — it exists solely so UseQsChecks can restrict quiet checking moves to
 // the first layer; captures/evasions ignore it.
@@ -701,10 +730,26 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
     if ply > w.SelDepth then
         w.SelDepth <- ply
 
+    // Retrograde search: exact DTM score once the background solver has published this signature.
+    // ply > 0 (the root needs a move, and one test drives qsearch at ply 0); path draws (repetition/
+    // rule-50, the arm above) outrank the retro value. qsearch has no excluded-move state to guard.
+    let retroScore =
+        if
+            w.Control.Config.UseRetro
+            && ply > 0
+            && popCount pos.Occupied <= 3
+            && pos.CastlingRights = 0
+        then
+            retroScoreAt pos ply
+        else
+            VALUE_NONE
+
     if ply > 0 && stopNow then
         0
     elif ply > 0 && isImmediateDraw pos then
         0
+    elif retroScore <> VALUE_NONE then
+        retroScore
     // Acc-frame guard on pos.Top (search frames since the root rebase), NOT StPly: StPly includes the
     // GAME history, so after ~255 game plies the old guard bailed to a raw eval at every node.
     elif ply >= MaxSearchPly || pos.Top >= Position.AccStackLimit then
@@ -935,10 +980,30 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
     if isPv && ply < MaxSearchPly then
         w.Pv.[ply * MaxSearchPly] <- MoveNone
 
+    // Retrograde search: exact DTM score once the background solver has published this signature.
+    // Guards: ply > 0 (the root needs a move — children return exact scores, so depth-1 iterative
+    // deepening already plays DTM-optimally); no live castling rights (a 3-man position with O-O
+    // available is real and un-modeled); no excluded move (a singular-verification node must be
+    // searched WITHOUT the excluded move — a retro value assumes all moves available and would
+    // corrupt the singularity test). Path draws (repetition/rule-50) outrank the retro value.
+    let retroScore =
+        if
+            w.Control.Config.UseRetro
+            && ply > 0
+            && popCount pos.Occupied <= 3
+            && pos.CastlingRights = 0
+            && w.Stack.[ply + StackOffset].ExcludedMove = MoveNone
+        then
+            retroScoreAt pos ply
+        else
+            VALUE_NONE
+
     if ply > 0 && stopNow then
         0
     elif ply > 0 && isImmediateDraw pos then
         0
+    elif retroScore <> VALUE_NONE then
+        retroScore
     // Acc-frame guard on pos.Top (search frames since the root rebase), NOT StPly: StPly includes the
     // GAME history, so after ~255 game plies the old guard bailed to a raw eval at every node.
     elif ply >= MaxSearchPly || pos.Top >= Position.AccStackLimit then
