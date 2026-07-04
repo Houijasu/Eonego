@@ -15,6 +15,7 @@ let private A1 = 0
 let private D1 = 3
 let private E1 = 4
 let private H1 = 7
+let private H2 = 15
 let private B3 = 17
 let private E4 = 28
 let private D5 = 35
@@ -162,3 +163,56 @@ let ``init counter equals the legal move count`` () =
     Assert.Equal(RetroUnknown, values.[idx]) // non-terminal, untouched by init
     let pos = Position.OfFen "4k3/8/8/8/8/1Q6/8/4K3 w - - 0 1"
     Assert.Equal((collectLegal pos).Length, int counter.[idx])
+
+// ---------------------------------------------------------------------------
+// Queen-signature solve: BFS retraction + the full self-consistency proof
+// ---------------------------------------------------------------------------
+
+let private wqSolved = lazy (solveSignature (makePiece White Queen) Array.empty)
+let private bqSolved = lazy (solveSignature (makePiece Black Queen) Array.empty)
+
+[<Fact>]
+let ``solved queen table finds mate in one`` () =
+    // wKg6, Qb3, bKh8, White to move: Qb8# (b-file to b8, mate along rank 8; g7/h7 covered by wKg6).
+    let values = wqSolved.Force()
+    Assert.Equal(2y, values.[idxOf White G6 H8 B3]) // WinIn 1 ply
+
+[<Fact>]
+let ``solved queen table keeps terminals and proves losses and quiet stalemates`` () =
+    let values = wqSolved.Force()
+    Assert.Equal(-1y, values.[idxOf Black G6 H8 G7]) // checkmate stays LossIn 0
+    Assert.Equal(0y, values.[idxOf Black B6 A8 C7]) // stalemate stays draw
+    // wKg6/Qb3 vs bKh8 with BLACK to move is stalemate (Qb3 covers g8 diagonally; g7/h7 are next
+    // to the White king) — the solver must prove the 0, not a loss.
+    Assert.Equal(0y, values.[idxOf Black G6 H8 B3])
+    // wKg6/Qh2+ vs bKh8: Black in check, Kg8 forced, cornered against the KQ mating net — a loss.
+    let v = values.[idxOf Black G6 H8 H2]
+    Assert.True(v < 0y, "expected a loss, got " + string (int v))
+
+[<Fact>]
+let ``queen signature stats match the literature`` () =
+    // KQK: longest win is mate in 10 moves = 19 plies.
+    let struct (legal, wins, losses, maxWin, maxLoss) = statsOf (wqSolved.Force())
+    Assert.Equal(19, maxWin)
+    Assert.True(wins > 0 && losses > 0 && legal > wins + losses) // wins, losses, and real draws exist
+    Assert.True(maxLoss = maxWin + 1 || maxLoss = maxWin - 1) // loss parity brackets the win depth
+
+[<Fact>]
+let ``black-owner queen signature mirrors the white twin exactly`` () =
+    let struct (lW, wW, sW, mwW, mlW) = statsOf (wqSolved.Force())
+    let struct (lB, wB, sB, mwB, mlB) = statsOf (bqSolved.Force())
+    Assert.Equal(lW, lB)
+    Assert.Equal(wW, wB)
+    Assert.Equal(sW, sB)
+    Assert.Equal(mwW, mwB)
+    Assert.Equal(mlW, mlB)
+
+[<Fact>]
+[<Trait("Category", "Slow")>]
+let ``white queen signature passes the full self-consistency proof`` () =
+    Assert.Equal(None, verifySignature (makePiece White Queen) (wqSolved.Force()) Array.empty)
+
+[<Fact>]
+[<Trait("Category", "Slow")>]
+let ``black queen signature passes the full self-consistency proof`` () =
+    Assert.Equal(None, verifySignature (makePiece Black Queen) (bqSolved.Force()) Array.empty)

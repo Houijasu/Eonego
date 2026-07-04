@@ -3,6 +3,12 @@
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <IsPackable>false</IsPackable>
+    <!-- Match the engine project (and the AOT-published exe, which has no tiering at all): the
+         tiered JIT's mid-loop OSR transition mis-executed the retrograde solver's 524k-iteration
+         scans in the test host (intermittent NREs inside movegen, occasional test-host crash;
+         deterministic-green with tiering off, 2026-07-04). Full-opt-from-the-start is also
+         slightly faster for this compute-heavy suite. -->
+    <TieredCompilation>false</TieredCompilation>
   </PropertyGroup>
 
   <ItemGroup>

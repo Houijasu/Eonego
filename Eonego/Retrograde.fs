@@ -14,12 +14,9 @@
 /// reads `Volatile.Read`-published immutable arrays (the Reductions-table pattern) — LazySMP-safe.
 module Eonego.Retrograde
 
-#nowarn "9" // NativePtr.stackalloc — AllowUnsafeBlocks is already set in the .fsproj
-
 open System
 open System.Diagnostics
 open System.Text
-open Microsoft.FSharp.NativeInterop
 open Eonego.Bitboard
 open Eonego.Move
 open Eonego.Position
@@ -187,10 +184,14 @@ let internal initSignature
     let promoRank = if owner = White then 6 else 1
     let pos = Position()
     let sb = StringBuilder(80)
-    let p = NativePtr.stackalloc<Move> MaxMoves
-    let buf = Span<Move>(NativePtr.toVoidPtr p, MaxMoves)
+    // Heap buffer, NOT the perft stackalloc idiom: a Span over stackalloc'd memory held across a
+    // 524k-iteration loop is unsafe under tiered-JIT on-stack replacement (the test host runs the
+    // engine DLL with tiering on; observed as a mid-scan NRE in movegen). Cold build-time code —
+    // one small array is free.
+    let arr: Move[] = Array.zeroCreate MaxMoves
 
     for idx = 0 to RetroSize - 1 do
+        let buf = Span<Move>(arr)
         let stm = idxStm idx
         let wk = idxWk idx
         let bk = idxBk idx
@@ -221,3 +222,255 @@ let internal initSignature
 
                             if v < 0y then
                                 pendingWin.[retroDtm v + 1].Add idx
+
+// ---------------------------------------------------------------------------
+// (6) Arithmetic retraction — predecessors of a legal successor index, no Position involved.
+//
+//     Candidates are filtered by the caller with `values.[P] <> RetroIllegal` ONLY, which is a
+//     complete validity test: occupancy collisions and pawn-rank violations land on illegal
+//     indices; P's own legality (incl. discovered check after an owner-king un-move) was computed
+//     by the init pass with P's full occupancy; and forward-move legality P->S decomposes into
+//     clear path (reverse attack set with the kings as blockers), empty destination (S's squares
+//     are distinct), and mover-king-safe-after-move — which is exactly S's own legality, and only
+//     legal frontier members are ever retracted. The single check retraction adds itself: a pawn
+//     double un-push needs the intermediate square king-free (it is not part of P's index).
+//
+//     No un-captures (nothing to capture) and no un-promotions within a signature (those
+//     predecessors live in the pawn signature and are irrelevant when solving a piece signature).
+// ---------------------------------------------------------------------------
+
+/// Fills `out` with the predecessor indices of successor `sIdx` (which MUST be legal) and returns
+/// the count. Max 35 candidates (8 king retreats + 27 queen retreats); size `out` accordingly.
+let internal predecessorsInto (pce: Piece) (sIdx: int) (out: int[]) : int =
+    let stmS = idxStm sIdx
+    let wk = idxWk sIdx
+    let bk = idxBk sIdx
+    let pc = idxPc sIdx
+    let owner = pieceColor pce
+    let mover = flipColor stmS
+    let occKK = bit wk ||| bit bk
+    let mutable n = 0
+
+    if mover = owner then
+        // Owner king retreats (kings-adjacent / attacked-in-P cases die on the RetroIllegal filter).
+        let fromK = if owner = White then wk else bk
+        let mutable cand = kingAttacks fromK &&& ~~~(occKK ||| bit pc)
+
+        while cand <> 0UL do
+            let preSq = popLsb &cand
+
+            out.[n] <-
+                (if owner = White then
+                     idxOf mover preSq bk pc
+                 else
+                     idxOf mover wk preSq pc)
+
+            n <- n + 1
+
+        // The piece un-moves.
+        let pt = pieceType pce
+
+        if pt = Pawn then
+            let push = if owner = White then 8 else -8
+            let pre1 = pc - push
+            out.[n] <- idxOf mover wk bk pre1 // rank-1/8 or king-square collisions -> RetroIllegal
+            n <- n + 1
+            let dblRank = if owner = White then 3 else 4
+
+            if rankOf pc = dblRank && not (testBit occKK pre1) then
+                out.[n] <- idxOf mover wk bk (pc - 2 * push)
+                n <- n + 1
+        else
+            let mutable cand =
+                (if pt = Queen then queenAttacks pc occKK
+                 elif pt = Rook then rookAttacks pc occKK
+                 elif pt = Bishop then bishopAttacks pc occKK
+                 else knightAttacks pc)
+                &&& ~~~occKK
+
+            while cand <> 0UL do
+                let preSq = popLsb &cand
+                out.[n] <- idxOf mover wk bk preSq
+                n <- n + 1
+    else
+        // Bare (defender) king retreats.
+        let fromK = if owner = White then bk else wk
+        let mutable cand = kingAttacks fromK &&& ~~~(occKK ||| bit pc)
+
+        while cand <> 0UL do
+            let preSq = popLsb &cand
+
+            out.[n] <-
+                (if owner = White then
+                     idxOf mover wk preSq pc
+                 else
+                     idxOf mover preSq bk pc)
+
+            n <- n + 1
+
+    n
+
+// ---------------------------------------------------------------------------
+// (7) The retrograde solve: init, then backward BFS by DTM level, then the draw sweep.
+//     Level arithmetic (values encode sign*(dtm+1)): a loss finalized at level d propagates
+//     WinIn(d+1) = +(d+2) to its predecessors; when a predecessor's counter of unresolved
+//     successors hits zero during win level d+1, it is LossIn(d+2) = -(d+3). Promotion win
+//     candidates merge at exactly their level, before that win level is processed.
+// ---------------------------------------------------------------------------
+let internal solveSignature (pce: Piece) (promoTables: sbyte[][]) : sbyte[] =
+    let values = Array.create RetroSize RetroUnknown
+    let counter: byte[] = Array.zeroCreate RetroSize
+    let lossQ = Array.init 128 (fun _ -> ResizeArray<int>())
+    let winQ = Array.init 128 (fun _ -> ResizeArray<int>())
+    let pendingWin = Array.init 128 (fun _ -> ResizeArray<int>())
+    initSignature pce promoTables values counter lossQ.[0] pendingWin
+    let owner = pieceColor pce
+    let bare = flipColor owner
+    let preds: int[] = Array.zeroCreate 40
+    let mutable d = 0
+
+    while d <= 124 do
+        // (a) losses at level d: every predecessor is a win at level d+1.
+        for s in lossQ.[d] do
+            let n = predecessorsInto pce s preds
+
+            for i = 0 to n - 1 do
+                let p = preds.[i]
+
+                if values.[p] = RetroUnknown then
+                    Debug.Assert(idxStm p = owner) // wins only with the owner to move
+                    values.[p] <- sbyte (d + 2)
+                    winQ.[d + 1].Add p
+
+        // (b) promotion win candidates merge at exactly their level (same level as step (a) wins,
+        //     so ordering between (a) and (b) cannot change a DTM).
+        for p in pendingWin.[d + 1] do
+            if values.[p] = RetroUnknown then
+                Debug.Assert(idxStm p = owner)
+                values.[p] <- sbyte (d + 2)
+                winQ.[d + 1].Add p
+
+        // (c) wins at level d+1: decrement each predecessor's unresolved-successor counter; at
+        //     zero, ALL its moves are proven wins for the opponent -> loss at level d+2.
+        for s in winQ.[d + 1] do
+            let n = predecessorsInto pce s preds
+
+            for i = 0 to n - 1 do
+                let p = preds.[i]
+
+                if values.[p] = RetroUnknown then
+                    counter.[p] <- counter.[p] - 1uy
+
+                    if counter.[p] = 0uy then
+                        Debug.Assert(idxStm p = bare) // losses only with the bare side to move
+                        values.[p] <- sbyte (-(d + 3))
+                        lossQ.[d + 2].Add p
+
+        d <- d + 2
+
+    // Fixpoint reached: every remaining unknown legal entry can never be forced into the win/loss
+    // lattice — a proven draw.
+    for i = 0 to RetroSize - 1 do
+        if values.[i] = RetroUnknown then
+            values.[i] <- 0y
+
+    values
+
+// ---------------------------------------------------------------------------
+// (8) Verification pass — a complete self-consistency proof, independent of all retraction code.
+//     For every index: illegal indices must be RetroIllegal; terminals must match the mate/
+//     stalemate rules; every other value must equal the minimax (via retroOrd) over succToPred of
+//     the REAL legal moves' successor values (captures -> KK draw; promotions -> the promotion
+//     signature's table). Returns Some error on the first mismatch, None when the table is proven.
+// ---------------------------------------------------------------------------
+let internal verifySignature (pce: Piece) (values: sbyte[]) (promoTables: sbyte[][]) : string option =
+    let pos = Position()
+    let sb = StringBuilder(80)
+    // Heap buffer for the same reason as initSignature: no stackalloc span across a 524k loop.
+    let arr: Move[] = Array.zeroCreate MaxMoves
+    let mutable err: string option = None
+    let mutable idx = 0
+
+    while idx < RetroSize && err.IsNone do
+        let buf = Span<Move>(arr)
+        let stm = idxStm idx
+        let wk = idxWk idx
+        let bk = idxBk idx
+        let pc = idxPc idx
+
+        if not (arithLegal pce stm wk bk pc) then
+            if values.[idx] <> RetroIllegal then
+                err <- Some("illegal index not marked: " + fenOf sb pce stm wk bk pc)
+        else
+            pos.LoadFen(fenOf sb pce stm wk bk pc)
+            let n = generateLegal pos buf
+
+            let expected =
+                if n = 0 then
+                    if pos.InCheck then -1y else 0y
+                else
+                    let mutable best = 0y
+                    let mutable bestOrd = System.Int32.MinValue
+
+                    for i = 0 to n - 1 do
+                        let m = buf.[i]
+                        Debug.Assert(not (isEnPassant m)) // no EP exists in these endings
+                        pos.Make m
+
+                        let vSucc =
+                            if popCount pos.Occupied = 2 then
+                                0y // KxPiece -> bare kings, dead draw
+                            else
+                                let sq = lsb (pos.Occupied ^^^ pos.Pieces King)
+                                let tbl = if isPromotion m then promoTables.[promoType m] else values
+                                tbl.[idxOf pos.SideToMove (pos.KingSquare White) (pos.KingSquare Black) sq]
+
+                        pos.Unmake m
+                        let cand = succToPred vSucc
+                        let o = retroOrd cand
+
+                        if o > bestOrd then
+                            bestOrd <- o
+                            best <- cand
+
+                    best
+
+            if values.[idx] <> expected then
+                err <-
+                    Some(
+                        "mismatch at "
+                        + fenOf sb pce stm wk bk pc
+                        + ": got "
+                        + string (int values.[idx])
+                        + " expected "
+                        + string (int expected)
+                    )
+
+        idx <- idx + 1
+
+    err
+
+/// Aggregate stats of a solved table: struct (legal, wins, losses, maxWinDtm, maxLossDtm).
+/// Draws = legal - wins - losses. Asserts no build sentinel survived to publication.
+let internal statsOf (values: sbyte[]) : struct (int * int * int * int * int) =
+    let mutable legal = 0
+    let mutable wins = 0
+    let mutable losses = 0
+    let mutable maxWin = 0
+    let mutable maxLoss = 0
+
+    for i = 0 to RetroSize - 1 do
+        let v = values.[i]
+        Debug.Assert(v <> RetroUnknown)
+
+        if v <> RetroIllegal then
+            legal <- legal + 1
+
+            if v > 0y then
+                wins <- wins + 1
+                maxWin <- max maxWin (retroDtm v)
+            elif v < 0y then
+                losses <- losses + 1
+                maxLoss <- max maxLoss (retroDtm v)
+
+    struct (legal, wins, losses, maxWin, maxLoss)
