@@ -370,7 +370,12 @@ let internal solveSignature (pce: Piece) (promoTables: sbyte[][]) : sbyte[] =
         d <- d + 2
 
     // Fixpoint reached: every remaining unknown legal entry can never be forced into the win/loss
-    // lattice — a proven draw.
+    // lattice — a proven draw. The d <= 124 sweep bound is a hard DTM ceiling: step (c) of the last
+    // iteration can still WRITE LossIn(126) values whose predecessors would then be swept as draws
+    // (an inconsistent frontier) — irrelevant for 3-man (max observed level is 56, KPK), but assert
+    // the frontier stayed empty so any future deeper material class trips loudly here.
+    Debug.Assert(lossQ.[126].Count = 0 && winQ.[125].Count = 0)
+
     for i = 0 to RetroSize - 1 do
         if values.[i] = RetroUnknown then
             values.[i] <- 0y
