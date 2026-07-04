@@ -1776,10 +1776,10 @@ let private reportLine (w: Worker) (depth: int) (pvNum: int) (score: int) (bound
             sb.Append(' ').Append(toUci mv) |> ignore
             i <- i + 1
 
-    // A mate PV can end well short of the announced distance: the search stops deepening once the
-    // mate is proven (clock-saving), qsearch keeps no PV rows, and mate-distance pruning returns at
-    // PV nodes before any move once the window is mate-bounded — while the TT still holds the whole
-    // proof. Extend the REPORTED line by replaying the array PV on the worker's root position and
+    // A mate PV can end well short of the announced distance: qsearch keeps no PV rows, and
+    // mate-distance pruning returns at PV nodes before any move once the window is mate-bounded —
+    // while the TT still holds the whole proof.
+    // Extend the REPORTED line by replaying the array PV on the worker's root position and
     // following legal TT moves from the tail, capped at the exact mate distance. Cold reporting path:
     // main worker only, between searches, make/unmake balanced; every step legality-checked so a
     // stale or replaced TT entry can never print an illegal line (the walk just stops short instead).
@@ -2067,12 +2067,14 @@ let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
                 for k in 0 .. multiPv - 1 do
                     reportLine w depth (k + 1) lineScores.[k] "" linePvs (k * MaxSearchPly) lineMoves.[k]
 
-            // Stop on a proven mate: a forced mate score cannot be improved by deeper iterations, so
-            // deepening further only burns the clock (and, at extreme depth, pushes the search toward the
-            // ply cap). Stop the whole search (shared flag) the moment the main worker confirms one.
-            // MultiPV keeps deepening — the user is exploring alternatives, not just the mate line.
-            if w.IsMain && multiPv = 1 && abs lineScores.[0] >= MATE_IN_MAX_PLY then
-                w.Control.Stop()
+            // NO self-stop on a mate score (removed 2026-07-05). A mate at depth d does NOT preclude
+            // a SHORTER mate found deeper: zugzwang nets hide quick mates behind reduced quiet moves,
+            // and refinement can need nominal depth FAR beyond the mate length (the reference engine
+            // needed d240+ to converge mate-13 -> mate-8 on rk6/p7/P1pN4/K1N5/8/8/2P5/8 w — a
+            // depth >= matePlies bound was tried here and still froze the 13). The old unconditional
+            // stop also fired during `go infinite`/ponder, emitting bestmove the GUI never asked for.
+            // Games lose nothing: the soft/hard time budgets already bound every search, and a
+            // fixed-depth/infinite request is the user's own bound.
 
         depth <- depth + 1
 
