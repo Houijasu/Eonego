@@ -33,7 +33,7 @@ let private withNet (f: Network -> unit) =
     match repoRoot () with
     | None -> ()
     | Some root ->
-        let p = Path.Combine(root, "nets", "nn-f8a759c05f9f.nnue")
+        let p = Path.Combine(root, "nets", "main.nnue")
 
         if File.Exists p then
             match load p with

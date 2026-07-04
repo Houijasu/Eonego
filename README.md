@@ -49,8 +49,9 @@ node-count sweeps and SPRT self-play matches.
 Requirements:
 - .NET SDK with `net10.0` support
 - Visual Studio **"Desktop development with C++"** workload (NativeAOT links with MSVC)
-- The NNUE net file at `nets/nn-f8a759c05f9f.nnue` (gitignored — it is a Stockfish
-  network and subject to Stockfish's licensing; the engine refuses to search without a net)
+- The NNUE net file at `nets/main.nnue` (gitignored — a name-stable slot; drop any compatible
+  FullThreats net there, currently a copy of the Stockfish master `nn-f8a759c05f9f`, subject to
+  Stockfish's licensing; the engine refuses to search without a net)
 
 ```powershell
 pwsh ./publish.ps1

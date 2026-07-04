@@ -63,7 +63,7 @@ let tryLoadNet () : Network option =
         dir <- dir.Parent
     match root with
     | Some r ->
-        let p = System.IO.Path.Combine(r, "nets", "nn-f8a759c05f9f.nnue")
+        let p = System.IO.Path.Combine(r, "nets", "main.nnue")
         if System.IO.File.Exists p then (match Eonego.Nnue.load p with Loaded n -> Some n | _ -> None) else None
     | None -> None
 

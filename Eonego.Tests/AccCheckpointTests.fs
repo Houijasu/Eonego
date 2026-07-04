@@ -39,7 +39,7 @@ let private netPath () : string option =
 
     match found with
     | Some root ->
-        let p = Path.Combine(root, "nets", "nn-f8a759c05f9f.nnue")
+        let p = Path.Combine(root, "nets", "main.nnue")
         if File.Exists p then Some p else None
     | None -> None
 
