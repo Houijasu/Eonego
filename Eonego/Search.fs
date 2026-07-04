@@ -1227,7 +1227,10 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                                 result <- ttScore
                             else
                                 if useTt then
-                                    w.Control.Tt.Store pos.Key (depthIn - 3) BoundLower (valueToTt v ply) staticEval pcMove false
+                                    // rawStaticEval, NOT staticEval: every TT store persists the RAW eval (the
+                                    // contract at step 3 — the ttEval-reuse path re-applies correction history,
+                                    // so storing the corrected value here double-corrected on re-probe).
+                                    w.Control.Tt.Store pos.Key (depthIn - 3) BoundLower (valueToTt v ply) rawStaticEval pcMove false
 
                                 result <- v
 
