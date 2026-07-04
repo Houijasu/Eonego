@@ -17,6 +17,7 @@ module Eonego.Retrograde
 open System
 open System.Diagnostics
 open System.Text
+open System.Threading
 open Eonego.Bitboard
 open Eonego.Move
 open Eonego.Position
@@ -449,6 +450,115 @@ let internal verifySignature (pce: Piece) (values: sbyte[]) (promoTables: sbyte[
         idx <- idx + 1
 
     err
+
+// ---------------------------------------------------------------------------
+// (9) Publication + orchestration. One slot per Piece code (10 solvable signatures); a slot is
+//     null until its signature is solved, then holds the immutable value table forever. Solving
+//     runs under one lock (a pawn signature recursively solves its four promotion signatures
+//     first, so leaves publish before the pawn); the search only ever does a Volatile.Read of a
+//     slot — the read-only-after-publication pattern that keeps LazySMP workers synchronization-
+//     free. Nothing is solved until a low-material root shows up (requestSolveFor).
+// ---------------------------------------------------------------------------
+let private solved: sbyte[][] = Array.zeroCreate 12
+let private solveLock = obj ()
+
+let rec private ensureSolvedInLock (pce: Piece) : unit =
+    if isNull (Volatile.Read(&solved.[pce])) then
+        if pieceType pce = Pawn then
+            let owner = pieceColor pce
+            ensureSolvedInLock (makePiece owner Knight)
+            ensureSolvedInLock (makePiece owner Bishop)
+            ensureSolvedInLock (makePiece owner Rook)
+            ensureSolvedInLock (makePiece owner Queen)
+
+        let promoTables =
+            if pieceType pce = Pawn then
+                let owner = pieceColor pce
+                let t: sbyte[][] = Array.zeroCreate 6
+                t.[Knight] <- Volatile.Read(&solved.[makePiece owner Knight])
+                t.[Bishop] <- Volatile.Read(&solved.[makePiece owner Bishop])
+                t.[Rook] <- Volatile.Read(&solved.[makePiece owner Rook])
+                t.[Queen] <- Volatile.Read(&solved.[makePiece owner Queen])
+                t
+            else
+                Array.empty
+
+        Volatile.Write(&solved.[pce], solveSignature pce promoTables)
+
+/// Synchronously solve a signature (and, for pawns, its promotion signatures first). Idempotent,
+/// double-checked-locked — safe to race from tests, the background trigger, and tooling.
+let ensureSolved (pce: Piece) : unit =
+    if isNull (Volatile.Read(&solved.[pce])) then
+        lock solveLock (fun () -> ensureSolvedInLock pce)
+
+let isSolved (pce: Piece) : bool =
+    not (isNull (Volatile.Read(&solved.[pce])))
+
+/// The solved table of a signature, or null. Tooling/tests only — the search goes through `probe`.
+let internal solvedTable (pce: Piece) : sbyte[] = Volatile.Read(&solved.[pce])
+
+/// Signatures worth solving for this root: a 3-man root's own signature; for a 4-man root, the
+/// signature each single capture leaves behind (promotion signatures follow inside ensureSolved).
+let internal signatureClosure (pos: Position) : int list =
+    let nonKings = pos.Occupied ^^^ pos.Pieces King
+
+    match popCount pos.Occupied with
+    | 3 -> [ pos.PieceOn(lsb nonKings) ]
+    | 4 ->
+        let mutable bb = nonKings
+        let mutable acc = []
+
+        while bb <> 0UL do
+            let pce = pos.PieceOn(popLsb &bb)
+
+            if not (List.contains pce acc) then
+                acc <- pce :: acc
+
+        acc
+    | _ -> []
+
+/// Root trigger: called when a new game position arrives. Fire-and-forget — a BelowNormal
+/// background thread solves whatever the root material makes reachable; probes simply return
+/// ValueNone until each signature publishes. Never blocks, never throws (a failed solve leaves
+/// its slot null: the search falls through to normal evaluation forever — degraded but correct).
+let requestSolveFor (pos: Position) : unit =
+    if popCount pos.Occupied <= 4 then
+        let sigs = signatureClosure pos
+
+        if sigs |> List.exists (fun pce -> not (isSolved pce)) then
+            let th =
+                Thread(
+                    ThreadStart(fun () ->
+                        try
+                            for pce in sigs do
+                                ensureSolved pce
+                        with _ ->
+                            ())
+                )
+
+            th.IsBackground <- true
+            th.Priority <- ThreadPriority.BelowNormal
+            th.Start()
+
+/// Probe a real search position. ValueNone unless: exactly 3 men, no live castling rights (a
+/// 3-man position with O-O available is real and un-modeled), and the signature has published.
+/// The value is from `pos.SideToMove`'s perspective; EpSquare is ignored (no EP capture exists
+/// in these endings). Zero allocation.
+let probe (pos: Position) : sbyte voption =
+    if pos.CastlingRights <> 0 then
+        ValueNone
+    elif popCount pos.Occupied <> 3 then
+        ValueNone
+    else
+        let sq = lsb (pos.Occupied ^^^ pos.Pieces King)
+        let table = Volatile.Read(&solved.[pos.PieceOn sq])
+
+        if isNull table then
+            ValueNone
+        else
+            let v = table.[idxOf pos.SideToMove (pos.KingSquare White) (pos.KingSquare Black) sq]
+            Debug.Assert(v <> RetroIllegal) // a real legal position never maps to an illegal index
+            if v = RetroIllegal then ValueNone else ValueSome v
 
 /// Aggregate stats of a solved table: struct (legal, wins, losses, maxWinDtm, maxLossDtm).
 /// Draws = legal - wins - losses. Asserts no build sentinel survived to publication.

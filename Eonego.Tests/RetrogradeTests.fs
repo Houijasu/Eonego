@@ -335,3 +335,65 @@ let ``white pawn signature passes the full self-consistency proof`` () =
 [<Trait("Category", "Slow")>]
 let ``black pawn signature passes the full self-consistency proof`` () =
     Assert.Equal(None, verifySignature (makePiece Black Pawn) (bpSolved.Force()) (promoTablesBlack.Force()))
+
+// ---------------------------------------------------------------------------
+// Publication, probe, root trigger
+// ---------------------------------------------------------------------------
+
+[<Fact>]
+let ``probe returns solved values through the public path`` () =
+    ensureSolved (makePiece White Queen)
+    // wKg6/Qb3 vs bKh8: mate in 1 with White to move, stalemate with Black to move.
+    Assert.Equal(ValueSome 2y, probe (Position.OfFen "7k/8/6K1/8/8/1Q6/8/8 w - - 0 1"))
+    Assert.Equal(ValueSome 0y, probe (Position.OfFen "7k/8/6K1/8/8/1Q6/8/8 b - - 0 1"))
+
+[<Fact>]
+let ``probe handles a black-owner signature directly`` () =
+    ensureSolved (makePiece Black Queen)
+    // The rank-mirrored twin of the mate-in-1: bKg3/qb6 vs wKh1, Black to move.
+    Assert.Equal(ValueSome 2y, probe (Position.OfFen "8/8/1q6/8/8/6k1/8/7K b - - 0 1"))
+
+[<Fact>]
+let ``probe declines castling rights, wrong man counts, and unsolved signatures`` () =
+    // Live castling rights: O-O is legal there and un-modeled by the index.
+    Assert.Equal(ValueNone, probe (Position.OfFen "4k3/8/8/8/8/8/8/4K2R w K - 0 1"))
+    // 4 men and bare kings are out of probe scope.
+    Assert.Equal(ValueNone, probe (Position.OfFen "4k3/8/8/3q4/8/8/3R4/4K3 w - - 0 1"))
+    Assert.Equal(ValueNone, probe (Position.OfFen "8/8/4k3/8/8/4K3/8/8 w - - 0 1"))
+    // Black-knight signature: nothing in this suite solves it through the PUBLIC slots (its only
+    // public solver is ensureSolved of the black PAWN — keep it that way or this goes order-
+    // dependent). The slot must be null and the probe must fall through.
+    Assert.Equal(ValueNone, probe (Position.OfFen "4k3/8/8/8/4n3/8/8/4K3 w - - 0 1"))
+
+[<Fact>]
+let ``signatureClosure lists the signatures one capture away`` () =
+    Assert.Equal<int list>([ makePiece White Queen ], signatureClosure (Position.OfFen "7k/8/6K1/8/8/1Q6/8/8 w - - 0 1"))
+    // KQ vs KR, 4 men: either capture leaves the other piece's signature.
+    let closure = signatureClosure (Position.OfFen "4k3/8/8/3q4/8/8/3R4/4K3 w - - 0 1")
+    Assert.Equal(2, closure.Length)
+    Assert.Contains(makePiece Black Queen, closure)
+    Assert.Contains(makePiece White Rook, closure)
+    Assert.Equal<int list>([], signatureClosure (Position.OfFen StartPosFen))
+
+[<Fact>]
+let ``concurrent ensureSolved is idempotent and publishes one table`` () =
+    let pce = makePiece White Rook
+
+    let tasks =
+        Array.init 8 (fun _ -> System.Threading.Tasks.Task.Run(fun () -> ensureSolved pce))
+
+    System.Threading.Tasks.Task.WaitAll tasks
+    Assert.True(isSolved pce)
+    Assert.Same(solvedTable pce, solvedTable pce)
+    Assert.Equal(ValueSome 2y, probe (Position.OfFen "k7/8/1K6/8/8/8/8/7R w - - 0 1"))
+
+[<Fact>]
+let ``root trigger solves the signature in the background`` () =
+    let pos = Position.OfFen "k7/8/1K6/8/8/8/8/7R w - - 0 1"
+    requestSolveFor pos
+    let sw = System.Diagnostics.Stopwatch.StartNew()
+
+    while not (isSolved (makePiece White Rook)) && sw.ElapsedMilliseconds < 30000L do
+        System.Threading.Thread.Sleep 25
+
+    Assert.True(isSolved (makePiece White Rook))
