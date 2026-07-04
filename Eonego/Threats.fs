@@ -165,7 +165,7 @@ let appendActiveThreats (perspective: int) (pos: Position) (buf: int[]) : int =
     let allPawns = pos.Pieces Pawn
     let mutable n = 0
 
-    let emit (attacker: int) (from: int) (too: int) =
+    let inline emit (attacker: int) (from: int) (too: int) =
         let attacked = ofEonego (pos.PieceOn too)
         let idx = makeIndexOriented orientation swap attacker from too attacked
 
@@ -249,7 +249,7 @@ let appendActiveThreatsBoth (pos: Position) (bufW: int[]) (bufB: int[]) : int64 
     let mutable nW = 0
     let mutable nB = 0
 
-    let emit (attacker: int) (from: int) (too: int) =
+    let inline emit (attacker: int) (from: int) (too: int) =
         let attacked = ofEonego (pos.PieceOn too)
         let wIdx = makeIndexOriented orientW 0 attacker from too attacked
 
