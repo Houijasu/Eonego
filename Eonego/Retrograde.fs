@@ -459,11 +459,13 @@ let internal verifySignature (pce: Piece) (values: sbyte[]) (promoTables: sbyte[
 //     slot — the read-only-after-publication pattern that keeps LazySMP workers synchronization-
 //     free. Nothing is solved until a low-material root shows up (requestSolveFor).
 // ---------------------------------------------------------------------------
-let private solved: sbyte[][] = Array.zeroCreate 12
+// Unsolved sentinel = the shared Array.empty singleton, NOT null (keeps the file clean under the
+// nullness analyzer); a slot is replaced exactly once by the immutable solved table.
+let private solved: sbyte[][] = Array.init 12 (fun _ -> Array.empty)
 let private solveLock = obj ()
 
 let rec private ensureSolvedInLock (pce: Piece) : unit =
-    if isNull (Volatile.Read(&solved.[pce])) then
+    if (Volatile.Read(&solved.[pce])).Length = 0 then
         if pieceType pce = Pawn then
             let owner = pieceColor pce
             ensureSolvedInLock (makePiece owner Knight)
@@ -488,13 +490,13 @@ let rec private ensureSolvedInLock (pce: Piece) : unit =
 /// Synchronously solve a signature (and, for pawns, its promotion signatures first). Idempotent,
 /// double-checked-locked — safe to race from tests, the background trigger, and tooling.
 let ensureSolved (pce: Piece) : unit =
-    if isNull (Volatile.Read(&solved.[pce])) then
+    if (Volatile.Read(&solved.[pce])).Length = 0 then
         lock solveLock (fun () -> ensureSolvedInLock pce)
 
 let isSolved (pce: Piece) : bool =
-    not (isNull (Volatile.Read(&solved.[pce])))
+    (Volatile.Read(&solved.[pce])).Length <> 0
 
-/// The solved table of a signature, or null. Tooling/tests only — the search goes through `probe`.
+/// The solved table of a signature (empty until solved). Tooling/tests only — the search probes.
 let internal solvedTable (pce: Piece) : sbyte[] = Volatile.Read(&solved.[pce])
 
 /// Signatures worth solving for this root: a 3-man root's own signature; for a 4-man root, the
@@ -553,7 +555,7 @@ let probe (pos: Position) : sbyte voption =
         let sq = lsb (pos.Occupied ^^^ pos.Pieces King)
         let table = Volatile.Read(&solved.[pos.PieceOn sq])
 
-        if isNull table then
+        if table.Length = 0 then
             ValueNone
         else
             let v = table.[idxOf pos.SideToMove (pos.KingSquare White) (pos.KingSquare Black) sq]
