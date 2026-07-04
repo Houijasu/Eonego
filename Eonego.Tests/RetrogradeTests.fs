@@ -3,9 +3,12 @@
 /// publication, and probe behavior.
 module Eonego.Tests.RetrogradeTests
 
+open System.Text
 open Xunit
 open Eonego.Bitboard
+open Eonego.Position
 open Eonego.Retrograde
+open Eonego.Tests.TestFixtures
 
 // LERF square shorthands used across the fixtures (a1 = 0 .. h8 = 63).
 let private A1 = 0
@@ -92,3 +95,70 @@ let ``a quiet legal placement is legal for both sides to move`` () =
     let wq = makePiece White Queen
     Assert.True(arithLegal wq White E1 E8 B3)
     Assert.True(arithLegal wq Black E1 E8 B3)
+
+// ---------------------------------------------------------------------------
+// FEN builder + init pass
+// ---------------------------------------------------------------------------
+
+let private G6 = 46
+let private C7 = 50
+let private G7 = 54
+let private B6 = 41
+let private H8 = 63
+
+[<Fact>]
+let ``fenOf round-trips through Position for sampled indices`` () =
+    let sb = StringBuilder(80)
+
+    for (pce, stm, wk, bk, pc) in
+        [ (makePiece White Queen, White, E1, E8, B3)
+          (makePiece White Queen, Black, G6, H8, G7)
+          (makePiece Black Queen, White, D1, A8, D5)
+          (makePiece Black Pawn, Black, E4, A8, D5)
+          (makePiece White Rook, White, A1, H8, D8) ] do
+        let pos = Position.OfFen(fenOf sb pce stm wk bk pc)
+        Assert.Equal(stm, pos.SideToMove)
+        Assert.Equal(wk, pos.KingSquare White)
+        Assert.Equal(bk, pos.KingSquare Black)
+        Assert.Equal(pce, pos.PieceOn pc)
+        Assert.Equal(3, popCount pos.Occupied)
+        Assert.Equal(0, pos.Rule50)
+        Assert.Equal(0, pos.CastlingRights)
+        Assert.Equal(NoSquare, pos.EpSquare)
+
+/// Shared one-shot init of the White-queen signature (~1M index scan; lazy so the cost is paid once).
+let private wqInit =
+    lazy
+        (let values = Array.create RetroSize RetroUnknown
+         let counter: byte[] = Array.zeroCreate RetroSize
+         let lossQ0 = ResizeArray<int>()
+         initSignature (makePiece White Queen) Array.empty values counter lossQ0 Array.empty
+         struct (values, counter, lossQ0))
+
+[<Fact>]
+let ``init classifies checkmate as LossIn0 and seeds the level-0 queue`` () =
+    let struct (values, _, lossQ0) = wqInit.Force()
+    // wKg6, Qg7, bKh8, Black to move: Qg7 is protected mate.
+    let idx = idxOf Black G6 H8 G7
+    Assert.Equal(-1y, values.[idx])
+    Assert.Contains(idx, lossQ0)
+
+[<Fact>]
+let ``init classifies stalemate as a finalized draw`` () =
+    let struct (values, _, _) = wqInit.Force()
+    // wKb6, Qc7, bKa8, Black to move: no legal move, not in check.
+    Assert.Equal(0y, values.[idxOf Black B6 A8 C7])
+
+[<Fact>]
+let ``init marks arithmetically illegal indices RetroIllegal`` () =
+    let struct (values, _, _) = wqInit.Force()
+    Assert.Equal(RetroIllegal, values.[idxOf White E4 E5 H1]) // adjacent kings
+    Assert.Equal(RetroIllegal, values.[idxOf White A1 D8 D5]) // bare king in check, owner to move
+
+[<Fact>]
+let ``init counter equals the legal move count`` () =
+    let struct (values, counter, _) = wqInit.Force()
+    let idx = idxOf White E1 E8 B3
+    Assert.Equal(RetroUnknown, values.[idx]) // non-terminal, untouched by init
+    let pos = Position.OfFen "4k3/8/8/8/8/1Q6/8/4K3 w - - 0 1"
+    Assert.Equal((collectLegal pos).Length, int counter.[idx])

@@ -14,7 +14,16 @@
 /// reads `Volatile.Read`-published immutable arrays (the Reductions-table pattern) — LazySMP-safe.
 module Eonego.Retrograde
 
+#nowarn "9" // NativePtr.stackalloc — AllowUnsafeBlocks is already set in the .fsproj
+
+open System
+open System.Diagnostics
+open System.Text
+open Microsoft.FSharp.NativeInterop
 open Eonego.Bitboard
+open Eonego.Move
+open Eonego.Position
+open Eonego.MoveGeneration
 
 // ---------------------------------------------------------------------------
 // (1) Value encoding — one sbyte per position of a signature.
@@ -108,3 +117,107 @@ let arithLegal (pce: Piece) (stm: Color) (wk: Square) (bk: Square) (pc: Square) 
             // Owner is not to move: the bare side has only a king, and king-checks are already
             // excluded by the adjacency rule — always consistent.
             true
+
+// ---------------------------------------------------------------------------
+// (4) FEN builder — the bridge from an index to the battle-tested Position/movegen machinery.
+//     A reused StringBuilder + one reused net-free Position keep the init pass allocation-light.
+//     EP is always "-" (no EP capture exists with a bare defending king) and castling always "-"
+//     (never representable in the index; real positions with live rights are declined at the probe).
+// ---------------------------------------------------------------------------
+let internal fenOf (sb: StringBuilder) (pce: Piece) (stm: Color) (wk: Square) (bk: Square) (pc: Square) : string =
+    let pieceCh = (if pieceColor pce = White then "PNBRQK" else "pnbrqk").[pieceType pce]
+    sb.Clear() |> ignore
+
+    for r = 7 downto 0 do
+        let mutable run = 0
+
+        for f = 0 to 7 do
+            let sq = mkSquare f r
+
+            let ch =
+                if sq = wk then 'K'
+                elif sq = bk then 'k'
+                elif sq = pc then pieceCh
+                else ' '
+
+            if ch = ' ' then
+                run <- run + 1
+            else
+                if run > 0 then
+                    sb.Append(char (int '0' + run)) |> ignore
+                    run <- 0
+
+                sb.Append ch |> ignore
+
+        if run > 0 then
+            sb.Append(char (int '0' + run)) |> ignore
+
+        if r > 0 then
+            sb.Append '/' |> ignore
+
+    sb.Append(if stm = White then " w - - 0 1" else " b - - 0 1") |> ignore
+    sb.ToString()
+
+// ---------------------------------------------------------------------------
+// (5) Init pass (forward): every index gets RetroIllegal, a terminal value, or a legal-move counter.
+//
+//     Counter protocol: `counter.[idx]` counts ALL legal moves, including out-of-signature ones
+//     (captures -> KK, promotions). Only within-signature successors finalized as wins ever
+//     decrement it during the backward pass — a draw successor (KxPiece, promotion into a drawn or
+//     stalemate position) never does, holding the counter above zero forever, which is exactly
+//     "this position has a drawing escape and can never be a loss". The bare side can never win,
+//     so there are no init-time decrements at all and BFS level order alone makes loss DTM exact.
+//
+//     Pawn signatures additionally read the ALREADY-SOLVED promotion signatures (same owner, the
+//     promoted piece type) for each promotion move of the just-generated legal move list — never
+//     an arithmetic promotion square: the bare king may legally stand there, and that colliding
+//     index is RetroIllegal, not a value. A winning promotion (successor lost for the bare side)
+//     is queued in `pendingWin.[dtm]` and merged at exactly that BFS level.
+// ---------------------------------------------------------------------------
+let internal initSignature
+    (pce: Piece)
+    (promoTables: sbyte[][]) // length 6, PieceType-indexed; consulted only for pawn signatures
+    (values: sbyte[]) // RetroSize, pre-filled RetroUnknown
+    (counter: byte[]) // RetroSize, zeroed
+    (lossQ0: ResizeArray<int>) // out: checkmate indices (LossIn 0)
+    (pendingWin: ResizeArray<int>[]) // dtm-indexed promotion win candidates (pawn signatures)
+    : unit =
+    let owner = pieceColor pce
+    let isPawnSig = pieceType pce = Pawn
+    let promoRank = if owner = White then 6 else 1
+    let pos = Position()
+    let sb = StringBuilder(80)
+    let p = NativePtr.stackalloc<Move> MaxMoves
+    let buf = Span<Move>(NativePtr.toVoidPtr p, MaxMoves)
+
+    for idx = 0 to RetroSize - 1 do
+        let stm = idxStm idx
+        let wk = idxWk idx
+        let bk = idxBk idx
+        let pc = idxPc idx
+
+        if not (arithLegal pce stm wk bk pc) then
+            values.[idx] <- RetroIllegal
+        else
+            pos.LoadFen(fenOf sb pce stm wk bk pc)
+            let n = generateLegal pos buf
+
+            if n = 0 then
+                if pos.InCheck then
+                    values.[idx] <- -1y // checkmate: mated now
+                    lossQ0.Add idx
+                else
+                    values.[idx] <- 0y // stalemate: finalized draw
+            else
+                counter.[idx] <- byte n
+
+                if isPawnSig && stm = owner && rankOf pc = promoRank then
+                    for i = 0 to n - 1 do
+                        let m = buf.[i]
+
+                        if isPromotion m then
+                            let v = promoTables.[promoType m].[idxOf (flipColor stm) wk bk (toSq m)]
+                            Debug.Assert(v <> RetroIllegal) // successor of a legal move is legal
+
+                            if v < 0y then
+                                pendingWin.[retroDtm v + 1].Add idx
