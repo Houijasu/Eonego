@@ -293,11 +293,27 @@ let run () =
     // Startup banner (conventional for UCI engines; GUIs log it and show it in their engine lists).
     writeLine (Engine.Name + " " + Engine.Version + " by " + Engine.Author)
 
-    // The NNUE net is embedded in the binary (see Eonego.fsproj <EmbeddedResource>); load it once at startup.
+    // The NNUE net is embedded in the binary (see Eonego.fsproj <EmbeddedResource>); load it once at
+    // startup. EONEGO_NET=<path> overrides with a net file from disk (same architecture required) —
+    // the A/B channel for net experiments (blends, candidates) without a rebuild per arm.
     let net =
-        match readEmbedded "eval.nnue" with
-        | Some bytes -> (match Nnue.loadBytes bytes with Loaded n -> Some n | Failed _ -> None)
-        | None -> None
+        match Environment.GetEnvironmentVariable("EONEGO_NET") with
+        | null
+        | "" ->
+            match readEmbedded "eval.nnue" with
+            | Some bytes -> (match Nnue.loadBytes bytes with Loaded n -> Some n | Failed _ -> None)
+            | None -> None
+        | path ->
+            match Nnue.load path with
+            | Loaded n ->
+                writeLine ("info string net override: " + path)
+                Some n
+            | Failed why ->
+                writeLine ("info string EONEGO_NET load FAILED (" + why + "); falling back to embedded")
+
+                match readEmbedded "eval.nnue" with
+                | Some bytes -> (match Nnue.loadBytes bytes with Loaded n -> Some n | Failed _ -> None)
+                | None -> None
 
     let st =
         { Threads = 1
