@@ -4,7 +4,8 @@
 /// `Accumulator.makeIndex`, threats from `Threats`. Bound positions use Position's lazy incremental
 /// accumulator; unbound positions keep the from-scratch path as an oracle.
 ///
-/// Licensing: net files are public-domain (CC0); this loader is a clean-room implementation of the
+/// Licensing: trained network weights (`nets/main.nnue`) are original to this project and distributed
+/// under the same license as the engine (see LICENSE). The loader is an original implementation of the
 /// (non-copyrightable) file format and integer inference.
 ///
 /// AOT/F#: pure byte parsing; no printf; fail-soft; forward is stackalloc'd (0 heap alloc on the hot path).

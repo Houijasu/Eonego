@@ -16,7 +16,7 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
-      # nets/ is gitignored (large/licensed), so the NNUE net is not embedded here; the engine still builds
+      # nets/ is gitignored (large trained weights), so the NNUE net is not embedded here; the engine still builds
       # (conditional EmbeddedResource) and the net-dependent tests soft-skip (they load nets from disk).
       - name: Restore
         run: dotnet restore Eonego.slnx

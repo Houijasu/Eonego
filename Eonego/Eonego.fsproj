@@ -9,7 +9,7 @@
     <Version>0.0.4</Version>
     <Product>Eonego</Product>
     <Authors>Houijasu</Authors>
-    <Copyright>Copyright (C) 2026 Houijasu — AGPL-3.0-or-later</Copyright>
+    <Copyright>Copyright (C) 2026 Houijasu — MIT</Copyright>
 
     <!-- Compiler optimizations -->
     <Optimize>true</Optimize>
@@ -70,10 +70,10 @@
   </ItemGroup>
 
   <!-- Embed the NNUE evaluator into the binary so the exe is self-contained. The canonical net is
-       nets/main.nnue (a name-stable slot — drop in any compatible net and rebuild; currently a copy
-       of the FullThreats master nn-f8a759c05f9f). Conditional on the net existing: nets/ is
-       gitignored (the net is large/licensed), so a fresh checkout (CI, a new contributor) builds
-       without it — the exe then has no embedded net and tests that need one soft-skip. -->
+       nets/main.nnue (a name-stable slot — drop in any compatible FullThreats-architecture net and
+       rebuild). Conditional on the net existing: nets/ is gitignored (the trained weights are large),
+       so a fresh checkout (CI, a new contributor) builds without it — the exe then has no embedded net
+       and tests that need one soft-skip. -->
   <ItemGroup Condition="Exists('..\nets\main.nnue')">
     <EmbeddedResource Include="..\nets\main.nnue" LogicalName="eval.nnue" />
   </ItemGroup>

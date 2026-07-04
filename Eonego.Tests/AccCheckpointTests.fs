@@ -7,7 +7,7 @@
 ///      parity with the cache enabled vs disabled; a hit restores the same accumulator as a from-scratch
 ///      materialization of the same position.
 ///
-/// Real-net tests SOFT-SKIP when `nets/nn-f8a759c05f9f.nnue` is absent (mirrors `NnueTests.fs`); pure-cache
+/// Real-net tests SOFT-SKIP when `nets/main.nnue` is absent (mirrors `NnueTests.fs`); pure-cache
 /// tests always run.
 module Eonego.Tests.AccCheckpointTests
 
@@ -224,7 +224,7 @@ let ``distinct Zobrist keys with identical payloads round-trip independently`` (
 
 // ---------------------------------------------------------------------------
 // 2. NNUE integration tests via Position.EnsureBothComputed. SOFT-SKIP if the
-//    embedded/local net is absent (CC0 but large — see NnueTests.fs).
+//    embedded/local net is absent (large trained weights — see NnueTests.fs).
 // ---------------------------------------------------------------------------
 let private bindAndEval (net: Network) (fen: string) (cache: AccCheckpointTable) : int =
     let pos = Position()

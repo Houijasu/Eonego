@@ -436,7 +436,7 @@ type MovePickBench() =
         acc
 
 /// Static eval throughput for the FullThreats NNUE — the sole evaluator. Soft-skips (does nothing)
-/// if `nets/nn-f8a759c05f9f.nnue` is absent. These four benchmarks DECOMPOSE the per-node cost so the
+/// if `nets/main.nnue` is absent. These four benchmarks DECOMPOSE the per-node cost so the
 /// eval-vs-make-time-threat-tracking question can be settled empirically (the previous EvalBench loaded a
 /// stale filename and measured nothing; it also only exercised the unbound from-scratch path, never the
 /// production incremental delta-apply). All return an XOR-fold so BDN cannot dead-code-eliminate the loop.

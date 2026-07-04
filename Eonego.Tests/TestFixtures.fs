@@ -54,7 +54,7 @@ let snap (p: Position) : Snap =
       Rule50 = p.Rule50
       Stm = p.SideToMove }
 
-/// Load the NNUE net for eval-dependent tests; None when nets/nn-f8a759c05f9f.nnue is absent (soft-skip).
+/// Load the NNUE net for eval-dependent tests; None when nets/main.nnue is absent (soft-skip).
 let tryLoadNet () : Network option =
     let mutable dir = System.IO.DirectoryInfo(System.AppContext.BaseDirectory)
     let mutable root = None

@@ -110,7 +110,7 @@ venv/
 *.pt
 trainer/*_state*.json
 
-# External NNUE nets (large, downloaded — not committed)
+# Trained NNUE weights (large — not committed; build with nets/main.nnue locally)
 nets/
 *.nnue
 

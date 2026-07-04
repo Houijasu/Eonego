@@ -54,7 +54,7 @@ let private fens =
       "8/8/8/3k4/8/3K4/4P3/8 w - -" // KPK (3) bucket 0
       "1nbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQk - 0 1" ] // white up the a1 rook
 
-// Captured 2026-07-04 for the KGA-specialist main.nnue (stack fine-tune of the FullThreats master;
+// Captured 2026-07-04 for the KGA-specialist main.nnue;
 // values change whenever the canonical net is retrained — recapture via the protocol above).
 // Empty => capture mode (writes eonego-golden-eval.txt, skips assert). Order matches `fens`.
 let private golden: int list =

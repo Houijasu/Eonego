@@ -2,7 +2,7 @@
 
 A UCI chess engine written from scratch in **F# on .NET 10**, compiled to a single
 self-contained native binary with **NativeAOT** (Windows x64). It plays strong, positionally
-minded chess driven by a bit-exact port of Stockfish's NNUE evaluation and a heavily
+minded chess driven by an in-house **FullThreats-architecture NNUE** and a heavily
 measured alpha-beta search — every search feature in the engine earned its place through
 node-count sweeps and SPRT self-play matches.
 
@@ -15,8 +15,7 @@ node-count sweeps and SPRT self-play matches.
   (the latter two feed correction history)
 
 ### Evaluation
-- Bit-exact F# port of the Stockfish **"FullThreats" NNUE** (`nn-f8a759c05f9f.nnue`,
-  dual-input HalfKA + threat features, L1 = 1024)
+- **FullThreats-architecture NNUE** (dual-input HalfKA + threat features, L1 = 1024), trained in-house
 - Incremental **int16 accumulator** with lazy catch-up walks, finny (bucket-refresh) tables,
   a fused delta-apply kernel and sparse fc0 propagation
 - **AVX2 / AVX-VNNI** kernels with a bit-exact scalar fallback (`EONEGO_FORCE_SCALAR=1`)
@@ -49,14 +48,16 @@ node-count sweeps and SPRT self-play matches.
 Requirements:
 - .NET SDK with `net10.0` support
 - Visual Studio **"Desktop development with C++"** workload (NativeAOT links with MSVC)
-- The NNUE net file at `nets/main.nnue` (gitignored — a name-stable slot; drop any compatible
-  FullThreats net there, currently a copy of the Stockfish master `nn-f8a759c05f9f`, subject to
-  Stockfish's licensing; the engine refuses to search without a net)
+- The NNUE net file at `nets/main.nnue` (gitignored — a name-stable slot; place a compatible
+  FullThreats-architecture net there and rebuild; the engine refuses to search without a net)
 
 ```powershell
 pwsh ./publish.ps1
-# -> Eonego/bin/Release/net10.0/win-x64/publish/Eonego.exe  (~90 MB, net embedded)
+# -> Eonego/bin/Release/net10.0/win-x64/publish/Eonego.exe  (~110 MB with net embedded, ~40 MB without)
 ```
+
+Equivalent: `dotnet publish Eonego/Eonego.fsproj -c Release -r win-x64` (the script also puts the VS
+Installer on `PATH` so the MSVC link step does not fail with exit code 123).
 
 Note: the project sets `<IlcInstructionSet>native</IlcInstructionSet>` — the AOT binary
 targets the **build machine's** exact CPU features (PEXT, AVX2, AVX-VNNI, …) and will
@@ -67,7 +68,7 @@ For development, a JIT build works anywhere the SDK does:
 
 ```powershell
 dotnet build Eonego/Eonego.fsproj -c Release
-dotnet test  Eonego.Tests/Eonego.Tests.fsproj -c Release   # 288 tests
+dotnet test  Eonego.Tests/Eonego.Tests.fsproj -c Release   # 332 tests
 ```
 
 ## UCI options
@@ -121,14 +122,18 @@ adjudicate tree mechanics; SPRT matches adjudicate everything else.
 
 ## Testing
 
-288 xunit tests cover perft, make/unmake round-trips (full state + all three incremental
+332 xunit tests cover perft, make/unmake round-trips (full state + all three incremental
 keys), SEE, the staged move picker, TT torn-read behavior, NNUE bit-exactness against
 golden evals (AVX2 == scalar), draw detection, LazySMP determinism at 1 thread, thread
 voting, and oracle equivalence of the pruned search against plain full-window alpha-beta.
 
+## License
+
+MIT — see [LICENSE](LICENSE). Engine source and trained network weights distributed with
+this repository are original to the project.
+
 ## Status
 
 Actively developed. Strength is tracked against the engine's own history via SPRT
-(hundreds of Elo gained through 2026 search/eval campaigns); on equal hardware it still
-searches a larger tree than Stockfish to reach the same depth — closing that gap, plus
-training an own network, is the roadmap.
+(hundreds of Elo gained through 2026 search/eval campaigns). Further search efficiency
+gains and continued net training are the roadmap.

@@ -1,5 +1,5 @@
-/// "FullThreats" NNUE loader + evaluator tests. The net (nn-f8a759c05f9f.nnue, version
-/// 0x6A448AFA, ~90 MB) is NOT committed (CC0 but large) — these SOFT-SKIP when absent. Without a way to run
+/// "FullThreats" NNUE loader + evaluator tests. The net (`nets/main.nnue`, version
+/// 0x6A448AFA, ~90 MB) is NOT committed (large trained weights) — these SOFT-SKIP when absent. Without a way to run
 /// a reference engine here we cannot bit-exact-verify the inference, so these are STRUCTURAL (loads-to-EOF +
 /// dimensions) and SANITY (startpos balanced, up-a-rook large). The parity scaffold at the bottom is ready
 /// for reference "NNUE evaluation" pawn values from a reference engine on this net.
