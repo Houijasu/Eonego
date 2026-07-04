@@ -2200,10 +2200,18 @@ type Position() =
                     (occ ^^^ (1UL <<< from) ^^^ (1UL <<< rf)) ||| (1UL <<< dst) ||| (1UL <<< rt)
 
                 (rookAttacks rt occ' &&& (1UL <<< theirKing)) <> 0UL
-            | _ -> // EnPassant: post-EP occupancy recompute
+            | _ -> // EnPassant: direct check from the landing square, plus the occupancy recompute.
+                // AttackersTo's leaper terms read the LIVE bitboards (the mover is still on `from`
+                // there; occ' only affects sliders), so the pawn's own check from `dst` is invisible
+                // to it — test it explicitly, same CheckSquares idiom as the non-special arm. The
+                // stale `from` square cannot false-positive (a pawn already attacking the enemy king
+                // on our move would be an illegal position), and the captured pawn is filtered by
+                // the &&& byColorBB.[us].
                 let capSq = dst + (if us = White then -8 else 8)
                 let occ' = (occ ^^^ (1UL <<< from) ^^^ (1UL <<< capSq)) ||| (1UL <<< dst)
-                (this.AttackersTo theirKing occ' &&& byColorBB.[us]) <> 0UL
+
+                testBit (this.CheckSquares Pawn) dst
+                || (this.AttackersTo theirKing occ' &&& byColorBB.[us]) <> 0UL
 
     // --- in-check resolution shared by IsPseudoLegal's NORMAL/Promotion arms -----------------------
     // king=true  -> destination must be safe with the king REMOVED from occ (X-ray through the vacated

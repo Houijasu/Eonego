@@ -364,6 +364,18 @@ let ``GivesCheck: en passant exposes a rank check`` () =
     Assert.True(p.GivesCheck(mkEnPassant e5 d6)) // exd6 e.p. clears rank 5 -> Ra5+ on h5
 
 [<Fact>]
+let ``GivesCheck: en passant delivers a DIRECT pawn check from the landing square`` () =
+    // Regression: the EP arm's AttackersTo recompute only sees sliders through occ' (the leaper
+    // terms read the live bitboards where the mover is still on `from`), so the capturing pawn's
+    // own check from dst was invisible. No sliders here — the check is purely the pawn on d6.
+    let e5 = mkSquare 4 4
+    let d6 = mkSquare 3 5
+    let p = Position.OfFen "8/4k3/8/3pP3/8/8/8/4K3 w - d6 0 1" // bKe7: d6 pawn attacks e7
+    Assert.True(p.GivesCheck(mkEnPassant e5 d6))
+    let q = Position.OfFen "4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1" // bKe8: no check from d6
+    Assert.False(q.GivesCheck(mkEnPassant e5 d6))
+
+[<Fact>]
 let ``GivesCheck: promotion down a shadowed file (occ ^ from recompute)`` () =
     let p = Position.OfFen "K7/4P3/8/8/8/8/8/4k3 w - - 0 1" // Pe7, black Ke1 down the e-file
     Assert.True(p.GivesCheck(mkPromotion (mkSquare 4 6) (mkSquare 4 7) Queen)) // e8=Q+ (pawn shadowed e-file)
