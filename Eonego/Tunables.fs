@@ -135,6 +135,12 @@ let RootLmrCap = envInt "EONEGO_T_ROOT_LMR_CAP" 99 0 99
 let StatBonusMul = envInt "EONEGO_T_STATB_MUL" 167 16 1000 // was 160
 let StatBonusCap = envInt "EONEGO_T_STATB_CAP" 1735 100 7000 // was 1700
 
+// --- Capture ordering: MVV multiplier in MovePick capture scoring (score = Mul*pieceValue + captHist) ---
+let CaptScoreMul = envInt "EONEGO_T_CAPSCORE_MUL" 7 1 20
+
+// --- Quiet partial-sort threshold: moves scoring >= Limit*depth are insertion-sorted to the front ---
+let QuietSortLimit = envInt "EONEGO_T_QSORT_LIM" -3000 -10000 0
+
 // --- df-pn mate oracle (EONEGO_DFPN=1 gate lives in UCI.fs): proof-number table size and node
 //     budgets. VNodes bounds the verification replay (fail-closed: an over-budget verify just
 //     declines to publish). Nodes = 0 means uncapped (the stop flag still bounds the solve). ---

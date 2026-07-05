@@ -129,6 +129,9 @@ type SearchConfig =
       // Position.MinorKey (knights+bishops+kings), summed with the pawn term before the /CorrApplyDiv
       // scale and taught the same clamped error at the same update gate.
       UseCorrMinor: bool
+      UseCorrMajor: bool
+      UseCorrNonPawn: bool
+      UseCorrCont: bool
       // Capture futility: at shallow reduced depth, skip a non-checking capture when even banking the
       // captured piece's full value cannot lift the static eval to alpha (capture analogue of the
       // quiet futility gate; promotions excluded — their material swing isn't in capturedValue).
@@ -218,6 +221,9 @@ let defaultConfig =
       UseQsEvasionCap = false
       UseCorrHist = true
       UseCorrMinor = false
+      UseCorrMajor = false
+      UseCorrNonPawn = false
+      UseCorrCont = false
       UseCaptFut = false
       UsePartialCommit = false
       UseCont4 = false
@@ -491,6 +497,7 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     let moveBuf: Move[] = Array.zeroCreate (MaxSearchPly * MaxMoves)
     let scoreBuf: int[] = Array.zeroCreate (MaxSearchPly * MaxMoves)
     let quietsBuf: Move[] = Array.zeroCreate (MaxSearchPly * MaxMoves)
+    let capturesBuf: Move[] = Array.zeroCreate (MaxSearchPly * MaxMoves)
     // Dedicated per-ply buffers for the singular-extension exclusion search (which re-enters negamax at the
     // SAME ply). Must be per-ply, NOT a single set: SE at ply P recurses into a normal child at P+1 that can
     // trigger its OWN exclusion search, so two exclusion searches at different plies are live on the call
@@ -499,6 +506,7 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     let exclMoveBuf: Move[] = Array.zeroCreate (MaxSearchPly * MaxMoves)
     let exclScoreBuf: int[] = Array.zeroCreate (MaxSearchPly * MaxMoves)
     let exclQuietsBuf: Move[] = Array.zeroCreate (MaxSearchPly * MaxMoves)
+    let exclCapturesBuf: Move[] = Array.zeroCreate (MaxSearchPly * MaxMoves)
     let pv: Move[] = Array.zeroCreate (MaxSearchPly * MaxSearchPly)
     let mutable nodes = 0L
     let mutable selDepth = 0
@@ -527,9 +535,11 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     member _.MoveBuf = moveBuf
     member _.ScoreBuf = scoreBuf
     member _.QuietsBuf = quietsBuf
+    member _.CapturesBuf = capturesBuf
     member _.ExclMoveBuf = exclMoveBuf
     member _.ExclScoreBuf = exclScoreBuf
     member _.ExclQuietsBuf = exclQuietsBuf
+    member _.ExclCapturesBuf = exclCapturesBuf
     member _.Pv = pv
 
     member _.Nodes
@@ -633,7 +643,7 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
         pos.BindCheckpoint control.AccCheckpoint
         pos.SeedCheckpoint()
 
-        tables.EnsureAux control.Config.UseCont4 control.Config.UseCorrMinor
+        tables.EnsureAux control.Config.UseCont4 control.Config.UseCorrMinor control.Config.UseCorrMajor control.Config.UseCorrNonPawn
 
         if defaultArg keepHistory false then
             tables.NewSearch()
@@ -824,10 +834,21 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
             // for the TT stores below).
             let rawSp =
                 if usePruning && cfg.UseCorrHist then
+                    let stm = pos.SideToMove
+
                     let corrSum =
-                        w.Tables.CorrHist pos.SideToMove pos.PawnKey
-                        + (if cfg.UseCorrMinor then
-                               w.Tables.CorrHistMinor pos.SideToMove pos.MinorKey
+                        w.Tables.CorrHist stm pos.PawnKey
+                        + (if cfg.UseCorrMinor then w.Tables.CorrHistMinor stm pos.MinorKey else 0)
+                        + (if cfg.UseCorrMajor then w.Tables.CorrHistMajor stm pos.MajorKey else 0)
+                        + (if cfg.UseCorrNonPawn then w.Tables.CorrHistNonPawn stm pos.NonPawnKey else 0)
+                        + (if cfg.UseCorrCont && ply > 0 then
+                               let pm = w.Stack.[ply + StackOffset - 1].CurrentMove
+                               let pp = w.Stack.[ply + StackOffset - 1].MovedPiece
+
+                               if pm <> MoveNone && pm <> MoveNull && pp <> NoPiece then
+                                   w.Tables.CorrHistCont stm pp (toSq pm)
+                               else
+                                   0
                            else
                                0)
 
@@ -1099,10 +1120,21 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
             staticEval <-
                 if rawStaticEval <> VALUE_NONE && usePruning && cfg.UseCorrHist then
+                    let stm = pos.SideToMove
+
                     let corrSum =
-                        w.Tables.CorrHist pos.SideToMove pos.PawnKey
-                        + (if cfg.UseCorrMinor then
-                               w.Tables.CorrHistMinor pos.SideToMove pos.MinorKey
+                        w.Tables.CorrHist stm pos.PawnKey
+                        + (if cfg.UseCorrMinor then w.Tables.CorrHistMinor stm pos.MinorKey else 0)
+                        + (if cfg.UseCorrMajor then w.Tables.CorrHistMajor stm pos.MajorKey else 0)
+                        + (if cfg.UseCorrNonPawn then w.Tables.CorrHistNonPawn stm pos.NonPawnKey else 0)
+                        + (if cfg.UseCorrCont && ply > 0 then
+                               let pm = w.Stack.[ssCur - 1].CurrentMove
+                               let pp = w.Stack.[ssCur - 1].MovedPiece
+
+                               if pm <> MoveNone && pm <> MoveNull && pp <> NoPiece then
+                                   w.Tables.CorrHistCont stm pp (toSq pm)
+                               else
+                                   0
                            else
                                0)
 
@@ -1326,6 +1358,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
             let moves = (if useExcl then w.ExclMoveBuf else w.MoveBuf).AsSpan(bufBase, MaxMoves)
             let scores = (if useExcl then w.ExclScoreBuf else w.ScoreBuf).AsSpan(bufBase, MaxMoves)
             let quietsBuf = if useExcl then w.ExclQuietsBuf else w.QuietsBuf
+            let capturesBuf = if useExcl then w.ExclCapturesBuf else w.CapturesBuf
 
             let mutable mp =
                 mkMain pos w.Tables ttMove k1 k2 cm depth prev1Pc prev1To prev2Pc prev2To moves scores
@@ -1334,10 +1367,12 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                 w.Pv.[ply * MaxSearchPly] <- MoveNone
 
             let quietsBase = bufBase
+            let capturesBase = bufBase
             let mutable best = -INF
             let mutable bestMove = MoveNone
             let mutable moveCount = 0
             let mutable nQuiets = 0
+            let mutable nCaptures = 0
             let mutable skipQuiets = false
             let mutable cutoff = false
             // Multicut (set in the singular block): the node fails high on TWO moves at reduced depth, so
@@ -1534,9 +1569,14 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                         pos.Make m
                         w.Control.Tt.Prefetch pos.Key // child probes this exact key at entry
 
-                        if isQuiet && nQuiets < MaxMoves - 1 then
-                            quietsBuf.[quietsBase + nQuiets] <- m
-                            nQuiets <- nQuiets + 1
+                        if isQuiet then
+                            if nQuiets < MaxMoves - 1 then
+                                quietsBuf.[quietsBase + nQuiets] <- m
+                                nQuiets <- nQuiets + 1
+                        else
+                            if nCaptures < MaxMoves - 1 then
+                                capturesBuf.[capturesBase + nCaptures] <- m
+                                nCaptures <- nCaptures + 1
 
                         let mutable v = 0
 
@@ -1683,6 +1723,17 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
                                         w.Tables.UpdateCapture (pos.PieceOn(fromSq m)) (toSq m) capPt bonus
 
+                                        for ci in 0 .. nCaptures - 2 do
+                                            let c = capturesBuf.[capturesBase + ci]
+
+                                            let cCapPt =
+                                                if isEnPassant c then
+                                                    Pawn
+                                                else
+                                                    pieceType (pos.PieceOn(toSq c))
+
+                                            w.Tables.UpdateCapture (pos.PieceOn(fromSq c)) (toSq c) cCapPt (-bonus)
+
                 m <-
                     if cutoff then
                         MoveNone
@@ -1724,10 +1775,24 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                 then
                     let bonus =
                         max -Tunables.CorrClamp (min Tunables.CorrClamp ((best - staticEval) * depth / Tunables.CorrDepthDiv))
-                    w.Tables.UpdateCorr pos.SideToMove pos.PawnKey bonus
+                    let stm = pos.SideToMove
+                    w.Tables.UpdateCorr stm pos.PawnKey bonus
 
                     if cfg.UseCorrMinor then
-                        w.Tables.UpdateCorrMinor pos.SideToMove pos.MinorKey bonus
+                        w.Tables.UpdateCorrMinor stm pos.MinorKey bonus
+
+                    if cfg.UseCorrMajor then
+                        w.Tables.UpdateCorrMajor stm pos.MajorKey bonus
+
+                    if cfg.UseCorrNonPawn then
+                        w.Tables.UpdateCorrNonPawn stm pos.NonPawnKey bonus
+
+                    if cfg.UseCorrCont && ply > 0 then
+                        let pm = w.Stack.[ssCur - 1].CurrentMove
+                        let pp = w.Stack.[ssCur - 1].MovedPiece
+
+                        if pm <> MoveNone && pm <> MoveNull && pp <> NoPiece then
+                            w.Tables.UpdateCorrCont stm pp (toSq pm) bonus
 
                 result <- best
 
@@ -1736,13 +1801,20 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 // ---------------------------------------------------------------------------
 // Reporting (Console only — never printfn)
 // ---------------------------------------------------------------------------
-let private scoreString (score: int) : string =
+let internal scoreString (score: int) : string =
     if score >= MATE_IN_MAX_PLY then
         "mate " + string ((MATE - score + 1) / 2)
     elif score <= -MATE_IN_MAX_PLY then
         "mate " + string (-((MATE + score + 1) / 2))
     else
-        "cp " + string score
+        // Decayed mate scores: a mate deeper than MaxSearchPly plies is unrepresentable, and
+        // repeated TT ply adjustment walks such scores below the mate band, where they circulate
+        // as huge "centipawn" values (reproduced: cp -31752 on the trapped-queen position
+        // 8/qp6/p7/pk6/P1R5/3K4/8/8 b). ChessBase GUIs then decode big cp with their own
+        // 32768-based mate convention — a leaked -29262 displayed as "#1753". Everything between
+        // the eval ceiling and the mate band is therefore clamped to +/-EvalMax for DISPLAY only;
+        // internal search values are untouched (the clamp lives in the one score->text seam).
+        "cp " + string (max -NNUE.EvalMax (min NNUE.EvalMax score))
 
 /// One `info ... multipv k ...` line. `bound` is "" or " lowerbound"/" upperbound" (aspiration fail
 /// high/low). The PV is read from `pv.[pvBase..]` (MoveNone-terminated); `fallback` covers an empty PV.

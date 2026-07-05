@@ -220,7 +220,7 @@ let private scoreCaptures (mp: byref<MovePick>) (s: int) (e: int) : unit =
             else
                 pieceType (pos.PieceOn(toSq m))
 
-        mp.Scores.[i] <- 7 * pieceValueOf capturedPT + tables.CaptureHistory pc (toSq m) capturedPT
+        mp.Scores.[i] <- Tunables.CaptScoreMul * pieceValueOf capturedPT + tables.CaptureHistory pc (toSq m) capturedPT
 
 let private scoreQuiets (mp: byref<MovePick>) (s: int) (e: int) : unit =
     let pos = mp.Pos
@@ -407,7 +407,7 @@ let nextMove (mp: byref<MovePick>) (skipQuiets: bool) : Move =
                 Debug.Assert((qStart + cnt <= MaxMoves), "MovePick: capture+quiet overflow")
                 mp.EndMoves <- qStart + cnt
                 scoreQuiets &mp qStart mp.EndMoves
-                partialInsertionSort &mp qStart mp.EndMoves (-3000 * mp.Depth)
+                partialInsertionSort &mp qStart mp.EndMoves (Tunables.QuietSortLimit * mp.Depth)
                 mp.Cur <- qStart
                 mp.Stage <- StgQuiet
 

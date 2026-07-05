@@ -59,15 +59,27 @@ type Tables() =
     // Minor-piece correction history: same contract, keyed by Position.MinorKey (knights+bishops+kings).
     // Lazily allocated like cont4 (UseCorrMinor defaults OFF; 64 KiB per worker).
     let mutable corrMinor: int16[] = Array.empty
+    // Major-piece correction history: keyed by Position.MajorKey (rooks+queens).
+    let mutable corrMajor: int16[] = Array.empty
+    // Non-pawn correction history: keyed by Position.NonPawnKey (all non-pawn pieces).
+    let mutable corrNonPawn: int16[] = Array.empty
+    // Continuation correction history: keyed by previous move (prevPc*64+prevTo), 2 sides.
+    let corrCont: int16[] = Array.zeroCreate (2 * 768)
 
     /// Allocate the config-gated tables this search will actually use (idempotent; called by
     /// Worker.SetupRoot with the active config flags before the search starts).
-    member _.EnsureAux (useCont4: bool) (useCorrMinor: bool) : unit =
+    member _.EnsureAux (useCont4: bool) (useCorrMinor: bool) (useCorrMajor: bool) (useCorrNonPawn: bool) : unit =
         if useCont4 && cont4.Length = 0 then
             cont4 <- Array.zeroCreate (768 * 768)
 
         if useCorrMinor && corrMinor.Length = 0 then
             corrMinor <- Array.zeroCreate (2 * 16384)
+
+        if useCorrMajor && corrMajor.Length = 0 then
+            corrMajor <- Array.zeroCreate (2 * 16384)
+
+        if useCorrNonPawn && corrNonPawn.Length = 0 then
+            corrNonPawn <- Array.zeroCreate (2 * 16384)
 
     /// Zero every table (new game / clear between searches).
     member _.Clear() : unit =
@@ -80,6 +92,9 @@ type Tables() =
         Array.Clear(cont4, 0, cont4.Length)
         Array.Clear(corr, 0, corr.Length)
         Array.Clear(corrMinor, 0, corrMinor.Length)
+        Array.Clear(corrMajor, 0, corrMajor.Length)
+        Array.Clear(corrNonPawn, 0, corrNonPawn.Length)
+        Array.Clear(corrCont, 0, corrCont.Length)
 
     /// Worker pool, between MOVES of one game: drop the per-search hint moves (killers are ply-indexed
     /// and ply meanings shift; counters conservatively too) but keep every gravity table — warm
@@ -134,6 +149,22 @@ type Tables() =
     member _.CorrHistMinor (c: Color) (minorKey: uint64) : int =
         int corrMinor.[(c <<< 14) ||| int (minorKey &&& 16383UL)]
 
+    /// Raw major-piece correction-history entry for (side to move, major structure); same scaling contract.
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+    member _.CorrHistMajor (c: Color) (majorKey: uint64) : int =
+        int corrMajor.[(c <<< 14) ||| int (majorKey &&& 16383UL)]
+
+    /// Raw non-pawn correction-history entry for (side to move, non-pawn structure); same scaling contract.
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+    member _.CorrHistNonPawn (c: Color) (nonPawnKey: uint64) : int =
+        int corrNonPawn.[(c <<< 14) ||| int (nonPawnKey &&& 16383UL)]
+
+    /// Raw continuation correction-history entry for (side to move, previous move); same scaling contract.
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+    member _.CorrHistCont (c: Color) (prevPc: int) (prevTo: int) : int =
+        if prevPc < 0 then 0
+        else int corrCont.[(c <<< 10) ||| (prevPc * 64 + prevTo)]
+
     // --- writes -----------------------------------------------------------------------------------
     member _.SetCounter (prevPc: Piece) (prevTo: Square) (m: Move) : unit = counter.[prevPc * 64 + prevTo] <- m
 
@@ -180,6 +211,28 @@ type Tables() =
         let b = max -CorrHistD (min CorrHistD bonus)
         let v = int corrMinor.[i]
         corrMinor.[i] <- int16 (v + b - v * (abs b) / CorrHistD)
+
+    /// Gravity update of major-piece correction history.
+    member _.UpdateCorrMajor (c: Color) (majorKey: uint64) (bonus: int) : unit =
+        let i = (c <<< 14) ||| int (majorKey &&& 16383UL)
+        let b = max -CorrHistD (min CorrHistD bonus)
+        let v = int corrMajor.[i]
+        corrMajor.[i] <- int16 (v + b - v * (abs b) / CorrHistD)
+
+    /// Gravity update of non-pawn correction history.
+    member _.UpdateCorrNonPawn (c: Color) (nonPawnKey: uint64) (bonus: int) : unit =
+        let i = (c <<< 14) ||| int (nonPawnKey &&& 16383UL)
+        let b = max -CorrHistD (min CorrHistD bonus)
+        let v = int corrNonPawn.[i]
+        corrNonPawn.[i] <- int16 (v + b - v * (abs b) / CorrHistD)
+
+    /// Gravity update of continuation correction history (no-op when prevPc < 0).
+    member _.UpdateCorrCont (c: Color) (prevPc: int) (prevTo: int) (bonus: int) : unit =
+        if prevPc >= 0 then
+            let i = (c <<< 10) ||| (prevPc * 64 + prevTo)
+            let b = max -CorrHistD (min CorrHistD bonus)
+            let v = int corrCont.[i]
+            corrCont.[i] <- int16 (v + b - v * (abs b) / CorrHistD)
 
     /// Gravity update of 2-ply continuation history (no-op when prevPc < 0).
     member _.UpdateCont2 (prevPc: int) (prevTo: int) (pc: Piece) (dst: Square) (bonus: int) : unit =

@@ -220,3 +220,18 @@ let ``mate score round-trips through store and probe at every ply`` (ply: int) =
     let struct (h2, _, sc2, _, _, _, _) = tt.Probe key
     Assert.True h2
     Assert.Equal(vLose, valueFromTt sc2 ply)
+
+[<Fact>]
+let ``scoreString clamps decayed mate scores to the eval ceiling`` () =
+    // Genuine mate band: exact distances.
+    Assert.Equal("mate 1", scoreString (MATE - 1))
+    Assert.Equal("mate -4", scoreString (-MATE + 7))
+    // Normal evals pass through.
+    Assert.Equal("cp -300", scoreString -300)
+    Assert.Equal("cp " + string Eonego.NNUE.EvalMax, scoreString Eonego.NNUE.EvalMax)
+    // The no-man's-land between EvalMax and the mate band = decayed mate scores (TT ply
+    // adjustment walked them out of the band). Display-clamped so GUIs cannot re-decode them
+    // as fictitious mate announcements (the Fritz "#1753" incident).
+    Assert.Equal("cp 10000", scoreString (MATE_IN_MAX_PLY - 1))
+    Assert.Equal("cp -10000", scoreString (-MATE_IN_MAX_PLY + 1))
+    Assert.Equal("cp -10000", scoreString -29262) // the exact leaked score behind "#1753"

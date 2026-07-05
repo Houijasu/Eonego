@@ -208,6 +208,8 @@ type StateInfo =
       // Minor-piece Zobrist key (both colors' knights, bishops AND kings — minor corrhist keying;
       // the king term makes king-safety structures distinguishable). Same contract as PawnKey.
       mutable MinorKey: uint64
+      mutable MajorKey: uint64
+      mutable NonPawnKey: uint64
       mutable CastlingRights: int
       mutable EpSquare: Square // landing square, or NoSquare (64)
       mutable Rule50: int
@@ -239,6 +241,8 @@ type Position() =
     let mutable currentKey = 0UL
     let mutable currentPawnKey = 0UL
     let mutable currentMinorKey = 0UL
+    let mutable currentMajorKey = 0UL
+    let mutable currentNonPawnKey = 0UL
     let states: StateInfo[] = Array.zeroCreate MaxPly
     let mutable stPly = 0
 
@@ -461,8 +465,12 @@ type Position() =
         currentKey <- currentKey ^^^ zPiece pc sq
         if pt = Pawn then
             currentPawnKey <- currentPawnKey ^^^ zPiece pc sq
-        elif pt = Knight || pt = Bishop || pt = King then
-            currentMinorKey <- currentMinorKey ^^^ zPiece pc sq
+        else
+            currentNonPawnKey <- currentNonPawnKey ^^^ zPiece pc sq
+            if pt = Knight || pt = Bishop || pt = King then
+                currentMinorKey <- currentMinorKey ^^^ zPiece pc sq
+            elif pt = Rook || pt = Queen then
+                currentMajorKey <- currentMajorKey ^^^ zPiece pc sq
         if active then
             dirtyPc.[dirtyN] <- pc; dirtySq.[dirtyN] <- sq; dirtySign.[dirtyN] <- 1; dirtyN <- dirtyN + 1
             this.UpdatePieceThreats(pc, true, sq, true, System.UInt64.MaxValue)
@@ -483,8 +491,12 @@ type Position() =
         currentKey <- currentKey ^^^ zPiece pc sq
         if pt = Pawn then
             currentPawnKey <- currentPawnKey ^^^ zPiece pc sq
-        elif pt = Knight || pt = Bishop || pt = King then
-            currentMinorKey <- currentMinorKey ^^^ zPiece pc sq
+        else
+            currentNonPawnKey <- currentNonPawnKey ^^^ zPiece pc sq
+            if pt = Knight || pt = Bishop || pt = King then
+                currentMinorKey <- currentMinorKey ^^^ zPiece pc sq
+            elif pt = Rook || pt = Queen then
+                currentMajorKey <- currentMajorKey ^^^ zPiece pc sq
         if active then
             dirtyPc.[dirtyN] <- pc; dirtySq.[dirtyN] <- sq; dirtySign.[dirtyN] <- -1; dirtyN <- dirtyN + 1
 
@@ -506,8 +518,12 @@ type Position() =
         currentKey <- currentKey ^^^ zPiece pc from ^^^ zPiece pc dst
         if pt = Pawn then
             currentPawnKey <- currentPawnKey ^^^ zPiece pc from ^^^ zPiece pc dst
-        elif pt = Knight || pt = Bishop || pt = King then
-            currentMinorKey <- currentMinorKey ^^^ zPiece pc from ^^^ zPiece pc dst
+        else
+            currentNonPawnKey <- currentNonPawnKey ^^^ zPiece pc from ^^^ zPiece pc dst
+            if pt = Knight || pt = Bishop || pt = King then
+                currentMinorKey <- currentMinorKey ^^^ zPiece pc from ^^^ zPiece pc dst
+            elif pt = Rook || pt = Queen then
+                currentMajorKey <- currentMajorKey ^^^ zPiece pc from ^^^ zPiece pc dst
         if active then
             dirtyPc.[dirtyN] <- pc; dirtySq.[dirtyN] <- from; dirtySign.[dirtyN] <- -1; dirtyN <- dirtyN + 1
             dirtyPc.[dirtyN] <- pc; dirtySq.[dirtyN] <- dst;  dirtySign.[dirtyN] <- 1;  dirtyN <- dirtyN + 1
@@ -525,8 +541,12 @@ type Position() =
         currentKey <- currentKey ^^^ zPiece oldPc sq
         if pieceType oldPc = Pawn then
             currentPawnKey <- currentPawnKey ^^^ zPiece oldPc sq
-        elif pieceType oldPc = Knight || pieceType oldPc = Bishop || pieceType oldPc = King then
-            currentMinorKey <- currentMinorKey ^^^ zPiece oldPc sq
+        else
+            currentNonPawnKey <- currentNonPawnKey ^^^ zPiece oldPc sq
+            if pieceType oldPc = Knight || pieceType oldPc = Bishop || pieceType oldPc = King then
+                currentMinorKey <- currentMinorKey ^^^ zPiece oldPc sq
+            elif pieceType oldPc = Rook || pieceType oldPc = Queen then
+                currentMajorKey <- currentMajorKey ^^^ zPiece oldPc sq
         if active then
             dirtyPc.[dirtyN] <- oldPc; dirtySq.[dirtyN] <- sq; dirtySign.[dirtyN] <- -1; dirtyN <- dirtyN + 1
             this.UpdatePieceThreats(oldPc, false, sq, false, 0UL)
@@ -538,8 +558,12 @@ type Position() =
         currentKey <- currentKey ^^^ zPiece newPc sq
         if pieceType newPc = Pawn then
             currentPawnKey <- currentPawnKey ^^^ zPiece newPc sq
-        elif pieceType newPc = Knight || pieceType newPc = Bishop || pieceType newPc = King then
-            currentMinorKey <- currentMinorKey ^^^ zPiece newPc sq
+        else
+            currentNonPawnKey <- currentNonPawnKey ^^^ zPiece newPc sq
+            if pieceType newPc = Knight || pieceType newPc = Bishop || pieceType newPc = King then
+                currentMinorKey <- currentMinorKey ^^^ zPiece newPc sq
+            elif pieceType newPc = Rook || pieceType newPc = Queen then
+                currentMajorKey <- currentMajorKey ^^^ zPiece newPc sq
         if active then
             dirtyPc.[dirtyN] <- newPc; dirtySq.[dirtyN] <- sq; dirtySign.[dirtyN] <- 1; dirtyN <- dirtyN + 1
             this.UpdatePieceThreats(newPc, true, sq, false, 0UL)
@@ -1427,6 +1451,8 @@ type Position() =
     member _.Key: uint64 = let st = &states.[stPly] in st.Key
     member _.PawnKey: uint64 = let st = &states.[stPly] in st.PawnKey
     member _.MinorKey: uint64 = let st = &states.[stPly] in st.MinorKey
+    member _.MajorKey: uint64 = let st = &states.[stPly] in st.MajorKey
+    member _.NonPawnKey: uint64 = let st = &states.[stPly] in st.NonPawnKey
     member _.StPly: int = stPly
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
@@ -1738,6 +1764,28 @@ type Position() =
 
         key
 
+    /// From-scratch major-key oracle (piece-square terms of both colors' rooks and queens).
+    member _.RecomputeMajorKey() : uint64 =
+        let mutable key = 0UL
+        let mutable occ = byTypeBB.[Rook] ||| byTypeBB.[Queen]
+
+        while occ <> 0UL do
+            let sq = popLsb &occ
+            key <- key ^^^ zPiece board.[sq] sq
+
+        key
+
+    /// From-scratch non-pawn-key oracle (piece-square terms of all non-pawn pieces, both colors).
+    member _.RecomputeNonPawnKey() : uint64 =
+        let mutable key = 0UL
+        let mutable occ = byTypeBB.[AllPieces] &&& ~~~byTypeBB.[Pawn]
+
+        while occ <> 0UL do
+            let sq = popLsb &occ
+            key <- key ^^^ zPiece board.[sq] sq
+
+        key
+
     // --- shared en-passant capturer test (the pawn-inversion, single source) -
     /// True iff a `capturer`-colored pawn can legally capture onto `epSq` (squares a `capturer` pawn
     /// attacks `epSq` from = pawnAttacks (flipColor capturer) epSq). Reused by Make / LoadFen / ToFen.
@@ -1760,6 +1808,8 @@ type Position() =
         currentKey <- 0UL
         currentPawnKey <- 0UL
         currentMinorKey <- 0UL
+        currentMajorKey <- 0UL
+        currentNonPawnKey <- 0UL
         stPly <- 0
         gamePly <- 0
         // A bulk board load invalidates the incremental accumulator: disable it so the piece-placement
@@ -1890,6 +1940,8 @@ type Position() =
         st.Key <- currentKey
         st.PawnKey <- currentPawnKey
         st.MinorKey <- currentMinorKey
+        st.MajorKey <- currentMajorKey
+        st.NonPawnKey <- currentNonPawnKey
         st.CastlingRights <- rights
         st.EpSquare <- ep
         st.Rule50 <- rule50
@@ -1917,6 +1969,8 @@ type Position() =
         Debug.Assert((this.RecomputeKey() = currentKey), "LoadFen: incremental key != from-scratch")
         Debug.Assert((this.RecomputePawnKey() = currentPawnKey), "LoadFen: incremental pawn key != from-scratch")
         Debug.Assert((this.RecomputeMinorKey() = currentMinorKey), "LoadFen: incremental minor key != from-scratch")
+        Debug.Assert((this.RecomputeMajorKey() = currentMajorKey), "LoadFen: incremental major key != from-scratch")
+        Debug.Assert((this.RecomputeNonPawnKey() = currentNonPawnKey), "LoadFen: incremental non-pawn key != from-scratch")
 
     member _.ToFen() : string =
         let sb = System.Text.StringBuilder()
@@ -1996,6 +2050,8 @@ type Position() =
         currentKey <- prev.Key ^^^ Side
         currentPawnKey <- prev.PawnKey // no side/ep/castle terms; the choke points do the rest
         currentMinorKey <- prev.MinorKey
+        currentMajorKey <- prev.MajorKey
+        currentNonPawnKey <- prev.NonPawnKey
 
         if prev.EpSquare <> NoSquare then
             currentKey <- currentKey ^^^ zEp (fileOf prev.EpSquare)
@@ -2078,6 +2134,8 @@ type Position() =
         st.Key <- currentKey
         st.PawnKey <- currentPawnKey
         st.MinorKey <- currentMinorKey
+        st.MajorKey <- currentMajorKey
+        st.NonPawnKey <- currentNonPawnKey
         this.SetCheckInfo()
         // NNUE: persist dirty pieces + physical FullThreats deltas, then eagerly materialize the child
         // accumulator (copy parent + apply deltas). Eval becomes O(1) — no lazy frame walk at eval time.
@@ -2125,6 +2183,8 @@ type Position() =
         currentKey <- (let p = &states.[stPly] in p.Key)
         currentPawnKey <- (let p = &states.[stPly] in p.PawnKey)
         currentMinorKey <- (let p = &states.[stPly] in p.MinorKey)
+        currentMajorKey <- (let p = &states.[stPly] in p.MajorKey)
+        currentNonPawnKey <- (let p = &states.[stPly] in p.NonPawnKey)
         // NNUE: pop the lazy frame. Parent materialization, if needed, is computed on demand.
         if active then
             Debug.Assert((top > 0), "Unmake: top underflow")
@@ -2157,6 +2217,8 @@ type Position() =
         st.Key <- currentKey
         st.PawnKey <- currentPawnKey // null move touches no pawns
         st.MinorKey <- currentMinorKey // ... nor any minors/kings
+        st.MajorKey <- currentMajorKey
+        st.NonPawnKey <- currentNonPawnKey
         this.SetCheckInfo()
 
     member this.UnmakeNull() : unit =
@@ -2167,6 +2229,8 @@ type Position() =
         currentKey <- (let p = &states.[stPly] in p.Key)
         currentPawnKey <- (let p = &states.[stPly] in p.PawnKey)
         currentMinorKey <- (let p = &states.[stPly] in p.MinorKey)
+        currentMajorKey <- (let p = &states.[stPly] in p.MajorKey)
+        currentNonPawnKey <- (let p = &states.[stPly] in p.NonPawnKey)
         // NNUE: a null move left the accumulator unchanged ⇒ nothing to restore.
 
     // --- GivesCheck: does `m` give check? (search/movegen; perft does not use it) -------------------

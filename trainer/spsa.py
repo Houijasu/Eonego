@@ -80,7 +80,26 @@ PARAMS_WAVE2 = {
     "EONEGO_T_STATB_CAP":       (1735, 500, 5000, 150),
 }
 
-WAVES = {1: PARAMS_WAVE1, 2: PARAMS_WAVE2}
+# Wave-3 (2026-07-05): history/ordering signal tuning. Tunes the gravity divisors (how fast history
+# decays), stat bonus shape (how strongly depth scales the learning signal), MVV capture ordering
+# weight, quiet partial-sort threshold, correction history application, and the LMR history gate.
+# Run with --shared containing whichever correction channels survived Phase 2 SPRT.
+PARAMS_WAVE3 = {
+    "EONEGO_T_MAINHIST_D":    (7183,  1024, 32000, 500),
+    "EONEGO_T_CAPTHIST_D":    (10692, 1024, 32000, 800),
+    "EONEGO_T_CONTHIST_D":    (29952, 1024, 32000, 2000),
+    "EONEGO_T_CORRHIST_D":    (2048,  256,  32000, 150),
+    "EONEGO_T_CAPSCORE_MUL":  (7,     1,    20,    1),
+    "EONEGO_T_CORR_DIV":      (16,    1,    256,   2),
+    "EONEGO_T_CORR_CLAMP":    (256,   16,   2047,  20),
+    "EONEGO_T_CORR_DDIV":     (8,     1,    64,    1),
+    "EONEGO_T_QSORT_LIM":    (-3000, -10000, 0,   300),
+    "EONEGO_T_LMR_HIST":     (-11499,-25000, 0,   1000),
+    "EONEGO_T_STATB_MUL":    (167,   60,    500,   16),
+    "EONEGO_T_STATB_CAP":    (1735,  500,   5000,  150),
+}
+
+WAVES = {1: PARAMS_WAVE1, 2: PARAMS_WAVE2, 3: PARAMS_WAVE3}
 PARAMS = PARAMS_WAVE1  # rebound in run() from --wave; module-level default keeps wave-1 semantics
 
 
@@ -210,7 +229,7 @@ def main():
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--fake-objective", action="store_true", help="synthetic convergence self-test (no engines)")
     ap.add_argument("--wave", type=int, default=1, choices=sorted(WAVES),
-                    help="parameter table: 1 = original margins, 2 = cont4/captfut joint retune")
+                    help="parameter table: 1 = original margins, 2 = cont4/captfut joint retune, 3 = history/ordering signal")
     ap.add_argument("--shared", default="",
                     help="env overrides for BOTH arms, e.g. 'EONEGO_CONT4=1,EONEGO_CAPFUT=1' (wave 2)")
     ns = ap.parse_args()
