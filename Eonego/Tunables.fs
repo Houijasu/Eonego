@@ -56,6 +56,8 @@ let LmpBase = envInt "EONEGO_T_LMP_BASE" 9 1 20 // was 3 — the wave's biggest 
 //     ±MainHistD saturation band or the gate goes dead (soft constraint; SPSA just wastes the region).
 let HistPruneBase = envInt "EONEGO_T_HISTPRUNE_BASE" 521 0 3000 // was 500
 let HistPruneSlope = envInt "EONEGO_T_HISTPRUNE_SLOPE" 747 0 1200 // was 800
+let HistPruneCombinedBase = envInt "EONEGO_T_HISTPRUNE_CBASE" 4000 0 20000
+let HistPruneCombinedSlope = envInt "EONEGO_T_HISTPRUNE_CSLOPE" 4000 0 20000
 
 // --- Move-loop futility: staticEval + Base + Slope*lmrDepth <= alpha ---
 let FutBase = envInt "EONEGO_T_FUT_BASE" 124 1 1000 // was 120

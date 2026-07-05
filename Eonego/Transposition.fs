@@ -21,6 +21,7 @@ module Eonego.Transposition
 
 open System
 open System.Threading
+open System.Runtime.InteropServices
 open Microsoft.FSharp.NativeInterop
 open Eonego.Move
 
@@ -85,12 +86,19 @@ let private clustersFor (mb: int) : int =
 
     int nc
 
+let private pinnedBaseAddr (arr: TtEntry[]) : nativeint =
+    let h = GCHandle.Alloc(arr, GCHandleType.Pinned)
+    let a = h.AddrOfPinnedObject()
+    h.Free()
+    a
+
 [<Sealed>]
 type TranspositionTable(mb: int) =
-    let mutable entries: TtEntry[] = Array.zeroCreate (clustersFor mb * ClusterSize)
+    let mutable entries: TtEntry[] = GC.AllocateArray<TtEntry>(clustersFor mb * ClusterSize, true)
     let mutable clusterMask: int = (entries.Length / ClusterSize) - 1
     let mutable clusterMask64: uint64 = uint64 clusterMask
     let mutable generation: int = 0 // 5-bit; (g+1) &&& 0x1F per NewSearch
+    let mutable baseAddr: nativeint = pinnedBaseAddr entries
 
     member private _.Base(key: uint64) : int =
         (int ((key >>> 32) &&& clusterMask64)) * ClusterSize
@@ -102,10 +110,11 @@ type TranspositionTable(mb: int) =
 
     /// Reallocate for a new size (MiB). Caller guarantees no search is running.
     member _.Resize(newMb: int) : unit =
-        entries <- Array.zeroCreate (clustersFor newMb * ClusterSize)
+        entries <- GC.AllocateArray<TtEntry>(clustersFor newMb * ClusterSize, true)
         clusterMask <- (entries.Length / ClusterSize) - 1
         clusterMask64 <- uint64 clusterMask
         generation <- 0
+        baseAddr <- pinnedBaseAddr entries
 
     /// Advance the age counter at the start of a search (5-bit wrap).
     member _.NewSearch() : unit = generation <- (generation + 1) &&& 0x1F
@@ -119,8 +128,7 @@ type TranspositionTable(mb: int) =
     member this.Prefetch(key: uint64) : unit =
         if System.Runtime.Intrinsics.X86.Sse.IsSupported then
             let b = this.Base key
-            use p = fixed &entries.[b].Key
-            System.Runtime.Intrinsics.X86.Sse.Prefetch0(NativePtr.toVoidPtr p)
+            System.Runtime.Intrinsics.X86.Sse.Prefetch0(NativePtr.toVoidPtr (NativePtr.ofNativeInt<byte> (baseAddr + nativeint (b * 16))))
 
     /// Approximate occupancy in permille for `info hashfull`, sampled over the first 1000 clusters.
     /// Counts only entries written during the current generation (the conventional definition), so the

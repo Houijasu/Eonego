@@ -220,6 +220,7 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
               UseIir = true
               UseRazoring = true
               UseHistoryPruning = true
+              UseHistPruneCombined = (Environment.GetEnvironmentVariable("EONEGO_HISTCOMBINED") = "1")
               UseDeltaPruning = true
               UseContHist = true
               UseSingular = true
@@ -232,6 +233,7 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
               UseTtEvalAdjust = (Environment.GetEnvironmentVariable("EONEGO_TTEVADJ") <> "0")
               UseCheckExt = (Environment.GetEnvironmentVariable("EONEGO_CHECKEXT") = "1")
               UseQsEvasionCap = (Environment.GetEnvironmentVariable("EONEGO_QSEVCAP") = "1")
+              UseTtCapture = (Environment.GetEnvironmentVariable("EONEGO_TTCAPTURE") = "1")
               UseCorrHist = (Environment.GetEnvironmentVariable("EONEGO_CORRHIST") <> "0")
               UseCorrMinor = (Environment.GetEnvironmentVariable("EONEGO_CORRMINOR") = "1")
               UseCorrMajor = (Environment.GetEnvironmentVariable("EONEGO_CORRMAJOR") = "1")
@@ -239,7 +241,7 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
               UseCorrCont = (Environment.GetEnvironmentVariable("EONEGO_CORRCONT") = "1")
               UseCaptFut = (Environment.GetEnvironmentVariable("EONEGO_CAPFUT") = "1")
               UsePartialCommit = (Environment.GetEnvironmentVariable("EONEGO_PARTIAL") = "1")
-              UseCont4 = (Environment.GetEnvironmentVariable("EONEGO_CONT4") = "1")
+              UseCont4 = (Environment.GetEnvironmentVariable("EONEGO_CONT4") <> "0")
               UseR50Damp = (Environment.GetEnvironmentVariable("EONEGO_R50DAMP") <> "0")
               UseQsChecks = (Environment.GetEnvironmentVariable("EONEGO_QSCHECKS") = "1")
               UseRootEffort = (Environment.GetEnvironmentVariable("EONEGO_ROOTEFFORT") = "1")
@@ -302,6 +304,7 @@ let private handleSetOption (st: UCIState) (tokens: string[]) =
 
         if String.Equals(name, "Threads", StringComparison.OrdinalIgnoreCase) then
             st.Threads <- max 1 (min 256 v)
+            Search.resizeHelpers st.Threads
         elif String.Equals(name, "Hash", StringComparison.OrdinalIgnoreCase) then
             // Resize must never run under a live probe: stop+join any active search first (same
             // guarantee ucinewgame provides for Clear).
@@ -434,5 +437,6 @@ let run () =
                 | "setoption" -> handleSetOption st tokens
                 | "quit" ->
                     stopAndJoin st
+                    Search.shutdownHelpers ()
                     running <- false
                 | _ -> ()

@@ -93,6 +93,7 @@ type SearchConfig =
       UseIir: bool
       UseRazoring: bool
       UseHistoryPruning: bool
+      UseHistPruneCombined: bool
       UseDeltaPruning: bool
       UseContHist: bool
       UseSingular: bool
@@ -120,6 +121,10 @@ type SearchConfig =
       // +35% suite-node REGRESSION at d14/d15 (2026-07-02) — the pessimistic leaf values it injects
       // cost more tree than the skipped evasions save. Kept behind the flag for a future SPRT only.
       UseQsEvasionCap: bool
+      // TT-move-is-capture awareness: gates ttCapture-informed adjustments to RFP (skip when TT
+      // move is quiet), NMP (extra reduction when TT move is quiet), and LMR (extra reduction for
+      // non-TT quiets when TT found a capture). Standard in the reference engine.
+      UseTtCapture: bool
       // Correction history: a per-(stm, pawn-structure) gravity table of persistent (bestValue −
       // staticEval) error corrects the WORKING static eval wherever it feeds pruning (negamax step 3 +
       // qsearch stand-pat). Every TT store keeps the RAW eval. Adjudicated by self-play match — node
@@ -209,6 +214,7 @@ let defaultConfig =
       UseIir = true
       UseRazoring = true
       UseHistoryPruning = true
+      UseHistPruneCombined = false
       UseDeltaPruning = true
       UseContHist = true
       UseSingular = true
@@ -219,6 +225,7 @@ let defaultConfig =
       UseTtEvalAdjust = true
       UseCheckExt = false
       UseQsEvasionCap = false
+      UseTtCapture = false
       UseCorrHist = true
       UseCorrMinor = false
       UseCorrMajor = false
@@ -1104,6 +1111,9 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                         result <- ttScore
                         produced <- true
 
+        let ttCapture =
+            ttMove <> MoveNone && (pos.PieceOn(toSq ttMove) <> NoPiece || isEnPassant ttMove)
+
         // 3. static eval (+ "improving": static eval higher than 2 plies ago — hoisted up so ProbCut/pruning
         //    can read it; prunes less when our position is improving). `staticEval` is the CORRECTED value
         //    (correction history) consumed by Stack/improving/pruning; `rawStaticEval` is what the TT store
@@ -1170,8 +1180,9 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
         if not produced && usePruning && not isPv && not inCheck && excludedMove = MoveNone then
             if
                 depthIn <= 6
-                && workingEval - Tunables.RfpMargin * depthIn - (if ttPv then Tunables.RfpTtPvBonus else 0) >= beta
+                && workingEval - Tunables.RfpMargin * (depthIn - (if improving && not cutNode then 1 else 0)) - (if ttPv then Tunables.RfpTtPvBonus else 0) >= beta
                 && abs beta < MATE_IN_MAX_PLY
+                && (not cfg.UseTtCapture || ttMove = MoveNone || ttCapture)
             then
                 result <- workingEval
                 produced <- true
@@ -1199,6 +1210,8 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                     Tunables.NmpBase
                     + depthIn / Tunables.NmpDepthDiv
                     + (if workingEval - beta > Tunables.NmpEvalMargin then 1 else 0)
+                    + (if improving then 1 else 0)
+                    + (if cfg.UseTtCapture && not ttCapture then 1 else 0)
                 w.Stack.[ssCur].CurrentMove <- MoveNull
                 w.Stack.[ssCur].MovedPiece <- NoPiece
                 pos.MakeNull()
@@ -1453,13 +1466,16 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                             // history — a late quiet with very negative butterfly history. Per-move
                             // skip (NOT skipQuiets): the picker only partial-sorts quiets, so a worse
                             // quiet can precede a better one in the unsorted tail.
-                            elif
-                                cfg.UseHistoryPruning
-                                && lmrDepth <= 6
-                                && moveCount > 3
-                                && w.Tables.MainHistory us (fromTo m) < -Tunables.HistPruneBase - Tunables.HistPruneSlope * lmrDepth
-                            then
-                                doMove <- false
+                            elif cfg.UseHistoryPruning && lmrDepth <= 6 && moveCount > 3 then
+                                let histBelow =
+                                    if cfg.UseHistPruneCombined then
+                                        let pc = pos.PieceOn(fromSq m)
+                                        let histSum = w.Tables.MainHistory us (fromTo m) + w.Tables.ContHistory1 prev1Pc prev1To pc (toSq m) + w.Tables.ContHistory2 prev2Pc prev2To pc (toSq m)
+                                        histSum < -(Tunables.HistPruneCombinedBase + Tunables.HistPruneCombinedSlope * lmrDepth)
+                                    else
+                                        w.Tables.MainHistory us (fromTo m) < -(Tunables.HistPruneBase + Tunables.HistPruneSlope * lmrDepth)
+
+                                if histBelow then doMove <- false
                             // futility — a quiet that can't lift alpha at shallow (reduced) depth
                             elif
                                 (not givesCheck)
@@ -1616,6 +1632,9 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                                     if cfg.UseLmrTweaks then
                                         if cutNode && m <> ttMove then
                                             rr <- rr + 2
+
+                                        if cfg.UseTtCapture && ttCapture && isQuiet then
+                                            rr <- rr + 1
 
                                         let pc = w.Stack.[ssCur].MovedPiece
 
@@ -2301,6 +2320,70 @@ let private runDFPNOracle (control: SearchControl) : unit =
             if l.Mate > 0 && not l.Infinite && not l.Ponder && r.MatePlies <= 2 * l.Mate - 1 then
                 control.Stop()
 
+// ---------------------------------------------------------------------------
+// Persistent helper threads: park N-1 OS threads on ManualResetEventSlim between searches.
+// Eliminates 15-26ms/go of thread creation at 16T. Managed by `resizeHelpers`/`shutdownHelpers`.
+// ---------------------------------------------------------------------------
+[<Sealed>]
+type private HelperSlot() =
+    let wake = new ManualResetEventSlim(false)
+    let done_ = new ManualResetEventSlim(true)
+    let mutable worker: Worker = Unchecked.defaultof<_>
+    let mutable maxDepth = 0
+    let mutable quit = false
+
+    member _.Run() =
+        while not quit do
+            wake.Wait()
+            wake.Reset()
+
+            if not quit then
+                iterativeDeepening worker maxDepth
+                done_.Set()
+
+    member _.Launch(w: Worker, d: int) =
+        done_.Reset()
+        worker <- w
+        maxDepth <- d
+        wake.Set()
+
+    member _.Wait() = done_.Wait()
+
+    member _.Shutdown() =
+        quit <- true
+        wake.Set()
+
+let mutable private helperSlots: HelperSlot[] = [||]
+let mutable private helperThreads: Thread[] = [||]
+
+let resizeHelpers (n: int) =
+    for s in helperSlots do
+        s.Shutdown()
+
+    for t in helperThreads do
+        t.Join()
+
+    let count = max 0 (n - 1)
+    helperSlots <- Array.init count (fun _ -> HelperSlot())
+
+    helperThreads <-
+        Array.init count (fun i ->
+            let s = helperSlots.[i]
+            let t = Thread(ThreadStart(fun () -> s.Run()), 16 * 1024 * 1024)
+            t.IsBackground <- true
+            t.Start()
+            t)
+
+let shutdownHelpers () =
+    for s in helperSlots do
+        s.Shutdown()
+
+    for t in helperThreads do
+        t.Join()
+
+    helperSlots <- [||]
+    helperThreads <- [||]
+
 /// Shared orchestration body: `workers` are already created (or pool-rebound) and SetupRoot-ed by the
 /// caller; everything from the clock start through the bestmove print lives here.
 let private goCore (control: SearchControl) (workers: Worker[]) : Move =
@@ -2328,21 +2411,22 @@ let private goCore (control: SearchControl) (workers: Worker[]) : Move =
         else
             (MaxSearchPly - 1)
 
-    let threads =
-        [| for i in 1 .. n - 1 ->
-               let w = workers.[i]
+    let usePersist = helperSlots.Length = n - 1 && n > 1
 
-               let t =
-                   Thread(ThreadStart(fun () -> iterativeDeepening w maxDepth), 16 * 1024 * 1024)
+    let freshThreads =
+        if usePersist then
+            for i in 1 .. n - 1 do
+                helperSlots.[i - 1].Launch(workers.[i], maxDepth)
 
-               t.IsBackground <- true
-               t.Start()
-               t |]
+            [||]
+        else
+            [| for i in 1 .. n - 1 ->
+                   let w = workers.[i]
+                   let t = Thread(ThreadStart(fun () -> iterativeDeepening w maxDepth), 16 * 1024 * 1024)
+                   t.IsBackground <- true
+                   t.Start()
+                   t |]
 
-    // df-pn mate oracle: one extra BelowNormal thread (the Retrograde background-solve precedent).
-    // Not spawned under MultiPV (bestmove must match the reported line 1) or searchmoves (a proof
-    // through an excluded root move must never override). Joined below — it never outlives a `go`,
-    // which keeps stopAndJoin, the pool path, and process exit correct for free.
     let oracleThread =
         if
             control.Config.UseDFPN
@@ -2360,8 +2444,12 @@ let private goCore (control: SearchControl) (workers: Worker[]) : Move =
     iterativeDeepening workers.[0] maxDepth
     control.Stop()
 
-    for t in threads do
-        t.Join()
+    if usePersist then
+        for i in 0 .. n - 2 do
+            helperSlots.[i].Wait()
+    else
+        for t in freshThreads do
+            t.Join()
 
     match oracleThread with
     | Some t -> t.Join()
