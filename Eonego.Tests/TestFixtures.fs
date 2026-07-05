@@ -12,7 +12,7 @@ open Eonego.Bitboard
 open Eonego.Move
 open Eonego.Position
 open Eonego.MoveGeneration
-open Eonego.Nnue
+open Eonego.NNUE
 
 // ---------------------------------------------------------------------------
 // Canonical perft FEN set (CPW positions 1-6). Same strings as PositionTests.perftFens.
@@ -64,7 +64,7 @@ let tryLoadNet () : Network option =
     match root with
     | Some r ->
         let p = System.IO.Path.Combine(r, "nets", "main.nnue")
-        if System.IO.File.Exists p then (match Eonego.Nnue.load p with Loaded n -> Some n | _ -> None) else None
+        if System.IO.File.Exists p then (match Eonego.NNUE.load p with Loaded n -> Some n | _ -> None) else None
     | None -> None
 
 /// Make then Unmake must restore every byte; and after Make incremental key == from-scratch (full + pawn + minor).
@@ -75,7 +75,7 @@ let assertRoundTrips (p: Position) (m: Move) =
     Assert.Equal(p.RecomputePawnKey(), p.PawnKey)
     Assert.Equal(p.RecomputeMinorKey(), p.MinorKey)
     p.Unmake m
-    Assert.True((before = snap p), "Make/Unmake did not restore full state for " + toUci m)
+    Assert.True((before = snap p), "Make/Unmake did not restore full state for " + toUCI m)
 
 // ---------------------------------------------------------------------------
 // Movegen helper — collect the legal move list into an array (cold path; allocates).

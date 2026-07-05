@@ -7,7 +7,7 @@
 ///      parity with the cache enabled vs disabled; a hit restores the same accumulator as a from-scratch
 ///      materialization of the same position.
 ///
-/// Real-net tests SOFT-SKIP when `nets/main.nnue` is absent (mirrors `NnueTests.fs`); pure-cache
+/// Real-net tests SOFT-SKIP when `nets/main.nnue` is absent (mirrors `NNUETests.fs`); pure-cache
 /// tests always run.
 module Eonego.Tests.AccCheckpointTests
 
@@ -21,11 +21,11 @@ open Eonego.AccCheckpoint
 open Eonego.Bitboard
 open Eonego.Move
 open Eonego.Position
-open Eonego.Nnue
+open Eonego.NNUE
 open Eonego.Tests.TestFixtures
 
 // ---------------------------------------------------------------------------
-// Soft-skip helper mirroring NnueTests.fs: locate the NNUE net under nets/.
+// Soft-skip helper mirroring NNUETests.fs: locate the NNUE net under nets/.
 // ---------------------------------------------------------------------------
 let private netPath () : string option =
     let mutable dir = DirectoryInfo(AppContext.BaseDirectory)
@@ -224,12 +224,12 @@ let ``distinct Zobrist keys with identical payloads round-trip independently`` (
 
 // ---------------------------------------------------------------------------
 // 2. NNUE integration tests via Position.EnsureBothComputed. SOFT-SKIP if the
-//    embedded/local net is absent (large trained weights — see NnueTests.fs).
+//    embedded/local net is absent (large trained weights — see NNUETests.fs).
 // ---------------------------------------------------------------------------
 let private bindAndEval (net: Network) (fen: string) (cache: AccCheckpointTable) : int =
     let pos = Position()
     pos.LoadFen fen
-    bindNnue net pos
+    bindNNUE net pos
     if not (obj.ReferenceEquals(cache, null)) then
         pos.BindCheckpoint cache
     // EnsureBothComputed fires lazily here once evalCp touches the accumulators.
@@ -259,10 +259,10 @@ let ``EnsureBothComputed cache hit yields bit-exact acc vs from-scratch`` () =
         (fun net ->
             let pos = Position()
             pos.LoadFen StartPosFen
-            bindNnue net pos
+            bindNNUE net pos
             let cache = AccCheckpointTable(4)
             pos.BindCheckpoint cache
-            // `bindNnue`/EnableNnue already materialized root frame 0 and set computed flags, so
+            // `bindNNUE`/EnableNNUE already materialized root frame 0 and set computed flags, so
             // the early-return path inside EnsureBothComputed would skip the cache populate. Mirror
             // what `Worker.SetupRoot` does: explicitly seed the cache for the already-computed root.
             pos.SeedCheckpoint()
@@ -295,7 +295,7 @@ let ``eager accumulator materializes during Make (no cache needed)`` () =
         (fun net ->
             let pos = Position()
             pos.LoadFen StartPosFen
-            bindNnue net pos
+            bindNNUE net pos
             // Eager mode is opt-in since the lazy default landed (audit 2026-07-01); this test covers the
             // eager machinery explicitly: Make itself computes both perspectives, eval is O(1) afterwards.
             pos.SetEagerUpdates true

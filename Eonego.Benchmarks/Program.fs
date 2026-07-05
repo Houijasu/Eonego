@@ -12,7 +12,7 @@ open BenchmarkDotNet.Running
 open Eonego.Bitboard
 open Eonego.Move
 open Eonego.Position
-open Eonego.Nnue
+open Eonego.NNUE
 open Eonego.MoveGeneration
 open Eonego.History
 open Eonego.MovePick
@@ -197,7 +197,7 @@ type AttackBench() =
 
 /// Move encode/decode/UCI throughput. 4096 mixed moves (normal/promo/ep/castle),
 /// folded so nothing is elided. The hot encode/decode/byref paths should report
-/// 0 B/op; the cold UCI string paths (ToUci/ParseUci) are benched separately to
+/// 0 B/op; the cold UCI string paths (ToUCI/ParseUCI) are benched separately to
 /// document their allocation profile.
 [<MemoryDiagnoser>]
 [<ShortRunJob>]
@@ -234,7 +234,7 @@ type MoveBench() =
 
             moves.[i] <- m
             scored.[i] <- mkScored m (rng.Next())
-            strs.[i] <- toUci m
+            strs.[i] <- toUCI m
 
     /// Encode then decode: build a move and fold its decoded fields (0 B/op expected).
     [<Benchmark(Baseline = true)>]
@@ -291,21 +291,21 @@ type MoveBench() =
 
     /// COLD path: format to a UCI string (allocates).
     [<Benchmark>]
-    member _.ToUci() =
+    member _.ToUCI() =
         let mutable acc = 0
 
         for i in 0 .. n - 1 do
-            acc <- acc ^^^ (toUci moves.[i]).Length
+            acc <- acc ^^^ (toUCI moves.[i]).Length
 
         acc
 
     /// COLD path: parse from a UCI string (allocates / branches).
     [<Benchmark>]
-    member _.ParseUci() =
+    member _.ParseUCI() =
         let mutable acc = 0
 
         for i in 0 .. n - 1 do
-            acc <- acc ^^^ parseUci strs.[i]
+            acc <- acc ^^^ parseUCI strs.[i]
 
         acc
 
@@ -473,7 +473,7 @@ type EvalBench() =
         match net with
         | Some n ->
             bound <- Position.OfFen richFen
-            Eonego.Nnue.bindNnue n bound // Active = true; root frame (0) materialized -> incremental path live
+            Eonego.NNUE.bindNNUE n bound // Active = true; root frame (0) materialized -> incremental path live
             nMoves <- generateLegal bound (Span<Move>(moves))
         | None -> ()
 

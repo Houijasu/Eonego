@@ -282,7 +282,7 @@ type Position() =
     // (own-king move / threat overflow barrier) becomes a board DIFF against the entry instead of a
     // from-scratch rebuild; threats are NEVER cached (re-enumerated fresh — they depend on the live board).
     // Entry state is path-independent (add/sub are exact modular inverses), so entries survive unmakes and
-    // whole searches; the only invalidation point is EnableNnue (net rebind) via ResetFinny.
+    // whole searches; the only invalidation point is EnableNNUE (net rebind) via ResetFinny.
     // ~292 KB per Position: acc 64*2*L1 int16 + psqt 64*2*8 int32 + board 64*2*64 int32.
     let mutable finnyAcc: int16[] = Array.empty
     let mutable finnyPsqt: int[] = Array.empty
@@ -295,7 +295,7 @@ type Position() =
     // 64B-alignment element offsets (2026-07-02): row 0 / frame 0 of the corresponding array starts at this
     // element so that its address is 64B-aligned (allocAligned64/copyAligned64). Frame and row strides are
     // all 64B multiples, so a single base offset aligns every frame/row. halfW/threatW come from the
-    // Network (EnableNnue); the accumulator-stack and finny bases are set by EnsureStorage.
+    // Network (EnableNNUE); the accumulator-stack and finny bases are set by EnsureStorage.
     let mutable halfWBase = 0
     let mutable threatWBase = 0
     let mutable accBaseW = 0
@@ -658,7 +658,7 @@ type Position() =
     // walk (EnsureComputed/EnsureBothComputedCore) replays SEVERAL frames' payloads, so flattening these to a
     // shared single-frame buffer silently corrupts any >=2-frame walk (the 2026-07-01 audit bug — eager
     // materialization consumed each frame immediately and hid it). Guarded by the multi-frame walk test in
-    // NnueTests.
+    // NNUETests.
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member private _.DirtyOff(frame: int) = frame * Accumulator.MaxDirtyPieces
 
@@ -969,7 +969,7 @@ type Position() =
             PosProf.nApply <- PosProf.nApply + 1L
 
     /// Re-seed every finny entry to the empty-board state (acc = biases, board = NoPiece). Called by
-    /// EnableNnue only — entries are otherwise self-correcting via the board diff and survive unmakes and
+    /// EnableNNUE only — entries are otherwise self-correcting via the board diff and survive unmakes and
     /// whole searches (path independence: HalfKA add/sub are exact modular inverses).
     member private _.ResetFinny() =
         for e in 0 .. 127 do
@@ -1231,13 +1231,13 @@ type Position() =
     /// release the worker's borrowed reference; the position can continue to be reused by tests/tools.
     member _.UnbindCheckpoint() : unit = checkpoint <- null
 
-    /// TEST HOOK: toggle eager materialization after `EnableNnue` (which sets the production default).
+    /// TEST HOOK: toggle eager materialization after `EnableNNUE` (which sets the production default).
     /// With `false`, Make records dirty frames only and evaluation pays the lazy multi-frame catch-up walk —
     /// the path the guardrail tests exercise. Production call sites never touch this.
     member internal _.SetEagerUpdates(v: bool) : unit = eagerUpdates <- v
 
     /// Unconditionally publish the current frame's computed accumulator snapshot to the bound checkpoint
-    /// cache, if any. Used by `Worker.SetupRoot` to seed the root after `EnableNnue` has already set the
+    /// cache, if any. Used by `Worker.SetupRoot` to seed the root after `EnableNNUE` has already set the
     /// `computed` flags (so the early-return path inside `EnsureBothComputed` skips the populate).
     /// No-op when the accumulator is inactive, the current frame is not yet materialized, or no cache is bound.
     member this.SeedCheckpoint() : unit =
@@ -1337,7 +1337,7 @@ type Position() =
         src.[this.PsqOff pColor top .. this.PsqOff pColor top + Accumulator.PsqtBuckets - 1]
 
     /// Bind weights + threat enumerators + materialize root. ROOT ONLY.
-    member this.EnableNnue
+    member this.EnableNNUE
         (biasesIn: int16[])
         (halfWeightsIn: int16[])
         (halfWOffIn: int)
@@ -1764,7 +1764,7 @@ type Position() =
         gamePly <- 0
         // A bulk board load invalidates the incremental accumulator: disable it so the piece-placement
         // below records NO deltas (32 PutPiece calls would overflow the small dirty buffer). The caller
-        // re-enables via EnableNnue, which rebuilds both perspectives from scratch (Refresh).
+        // re-enables via EnableNNUE, which rebuilds both perspectives from scratch (Refresh).
         active <- false
         top <- 0
         dirtyN <- 0

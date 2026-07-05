@@ -167,7 +167,7 @@ let private promoChar (pt: PieceType) : char =
     | _ -> 'q'
 
 /// Render a move as a UCI string ("e2e4" / "e7e8q" / "e1g1"). MoveNone AND MoveNull both render "0000".
-let toUci (m: Move) : string =
+let toUCI (m: Move) : string =
     if m = MoveNone || m = MoveNull then
         "0000"
     else
@@ -190,7 +190,7 @@ let toUci (m: Move) : string =
 /// Parse a UCI move string (context-free). Returns Normal/Promotion only — the Position layer re-stamps
 /// EnPassant/Castling against the legal move list (keyed on moveMatchKey). Strict: length must be exactly
 /// 4 or 5, lowercase only. "0000", any malformed input, and any from==dst all yield MoveNone.
-let parseUci (s: string) : Move =
+let parseUCI (s: string) : Move =
     if System.String.IsNullOrEmpty s then
         MoveNone
     elif s = "0000" then

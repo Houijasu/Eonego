@@ -73,4 +73,4 @@ let ``new pruning does not increase nodes`` (fen: string) (depth: int) =
 let ``new pruning keeps the same best move on clear positions`` (fen: string) (depth: int) =
     let struct (_, _, mOn) = searchToDepth fen [||] depth cfgOn
     let struct (_, _, mOff) = searchToDepth fen [||] depth cfgOff
-    Assert.Equal(toUci mOff, toUci mOn)
+    Assert.Equal(toUCI mOff, toUCI mOn)

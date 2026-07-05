@@ -9,7 +9,7 @@ open Eonego.Search
 open Eonego.Tests.TestFixtures
 
 let private play (p: Position) (uci: string) =
-    let t = parseUci uci
+    let t = parseUCI uci
     let mutable chosen = MoveNone
 
     for m in collectLegal p do

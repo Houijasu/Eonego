@@ -18,7 +18,7 @@ open Microsoft.FSharp.NativeInterop
 open Eonego.Bitboard
 open Eonego.Move
 open Eonego.Position
-open Eonego.Nnue
+open Eonego.NNUE
 open Eonego.MoveGeneration
 open Eonego.History
 open Eonego.MovePick
@@ -165,6 +165,11 @@ type SearchConfig =
       // appears). Exactness, not pruning — deliberately independent of UsePruning; the pruning-off
       // oracle configs must pin this false themselves.
       UseRetro: bool
+      // df-pn mate oracle (DFPN.fs): one extra BelowNormal thread per `go` proves/disproves a
+      // checks-only forced mate from the root and, on a VERIFIED proof, overrides the final
+      // bestmove (never the tree — node counts are identical either way, and it never sets the
+      // stop flag outside the `go mate N` clause; the 9585509 no-mate-self-stop rule stands).
+      UseDFPN: bool
       MoveOverhead: int
       // Phase 1: NNUE accumulator checkpoint cache. Set to 0 to disable; ~4 MiB is the recommended default
       // (1024 slots, ~4.1 KiB/slot). Cleared per search by `SearchControl.NewSearch` (alongside the TT gen
@@ -221,6 +226,7 @@ let defaultConfig =
       UseRootEffort = false
       UseRootVerify = false
       UseRetro = true
+      UseDFPN = false
       MoveOverhead = 10
       AccCheckpointMb = 0
       MultiPv = 1 }
@@ -392,6 +398,9 @@ type SearchControl
     member _.AccCheckpoint: AccCheckpointTable = accCheckpoint
     member val LastBest: Move = MoveNone with get, set // result of the most recent go()
     member val LastScore: int = 0 with get, set
+    /// df-pn oracle publication slot — fresh per control (= per `go`), so there is no clearing
+    /// protocol; the oracle thread Publishes, goCore reads after joining it.
+    member val Oracle: Eonego.DFPN.OracleResult = Eonego.DFPN.OracleResult() with get
     /// Aggregate live node count across all workers (relaxed reads — reporting only, set by go()).
     member val NodeSum: unit -> int64 = (fun () -> 0L) with get, set
     member _.Stopped: bool = Volatile.Read(&stopFlag) <> 0
@@ -608,18 +617,18 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
         // Replay the game history BEFORE binding NNUE: with the net bound, every Make pushes an
         // accumulator frame, and a `position ... moves` list longer than AccMaxPly (256) overflowed the
         // frame stack (real crash: long games in a GUI / the match harness). Binding after the replay
-        // rebases the accumulator stack at the search root (EnableNnue materializes frame 0 from the
+        // rebases the accumulator stack at the search root (EnableNNUE materializes frame 0 from the
         // current board), so search depth alone bounds frame usage.
         for m in control.RootMoves do
             pos.Make m
 
         match control.Net with
-        | Some net -> Nnue.bindNnue net pos
+        | Some net -> NNUE.bindNNUE net pos
         | None -> ()
 
         // Phase 1: borrow the per-search checkpoint cache so `EnsureBothComputed` can probe/store snapshots
         // during the upcoming search. `null` disables the fast-path entirely. Seed the root snapshot now —
-        // `EnableNnue` just materialized frame 0 and set the computed flags, so the early-return path inside
+        // `EnableNNUE` just materialized frame 0 and set the computed flags, so the early-return path inside
         // `EnsureBothComputed` would otherwise skip the populate on the first eval at the root.
         pos.BindCheckpoint control.AccCheckpoint
         pos.SeedCheckpoint()
@@ -667,12 +676,12 @@ let evalPos (w: Worker) (pos: Position) : int =
         let v =
             if PosProf.Enabled then
                 let profT0 = System.Diagnostics.Stopwatch.GetTimestamp()
-                let v = Nnue.evalCp net pos
+                let v = NNUE.evalCp net pos
                 PosProf.tEval <- PosProf.tEval + (System.Diagnostics.Stopwatch.GetTimestamp() - profT0)
                 PosProf.nEval <- PosProf.nEval + 1L
                 v
             else
-                Nnue.evalCp net pos
+                NNUE.evalCp net pos
         // Rule-50 shuffle damping (see SearchConfig.UseR50Damp): identity at rule50 = 0, and damping
         // only shrinks magnitude, so the EvalMax clamp inside evalCp still bounds the result.
         if w.Control.Config.UseR50Damp then
@@ -1370,7 +1379,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                             "info depth "
                             + string depthIn
                             + " currmove "
-                            + toUci m
+                            + toUCI m
                             + " currmovenumber "
                             + string (moveCount + w.RootPvIdx)
                         )
@@ -1773,7 +1782,7 @@ let private reportLine (w: Worker) (depth: int) (pvNum: int) (score: int) (bound
         if mv = MoveNone then
             cont <- false
         else
-            sb.Append(' ').Append(toUci mv) |> ignore
+            sb.Append(' ').Append(toUCI mv) |> ignore
             i <- i + 1
 
     // A mate PV can end well short of the announced distance: qsearch keeps no PV rows, and
@@ -1804,7 +1813,7 @@ let private reportLine (w: Worker) (depth: int) (pvNum: int) (score: int) (bound
             let struct (hit, m, _, _, _, _, _) = w.Control.Tt.Probe pos.Key
 
             if hit && isLegalRoot pos m then
-                sb.Append(' ').Append(toUci m) |> ignore
+                sb.Append(' ').Append(toUCI m) |> ignore
                 pos.Make m
                 made.[nMade] <- m
                 nMade <- nMade + 1
@@ -1815,7 +1824,7 @@ let private reportLine (w: Worker) (depth: int) (pvNum: int) (score: int) (bound
             pos.Unmake made.[j]
 
     if i = 0 && fallback <> MoveNone then
-        sb.Append(' ').Append(toUci fallback) |> ignore
+        sb.Append(' ').Append(toUCI fallback) |> ignore
 
     writeLine (sb.ToString())
 
@@ -2191,6 +2200,35 @@ let internal voteBest (moves: Move[]) (scores: int[]) (depths: int[]) (n: int) :
 
             chosen
 
+/// df-pn oracle thread body: solve the root for a checks-only forced mate, publish a VERIFIED
+/// proof into the control's Oracle slot, and report it as an info string. The oracle NEVER sets
+/// the stop flag (rule 9585509 — no self-stop on a mate score, and no bestmove during
+/// `go infinite`/ponder) with ONE certified exception: `go mate N`, neither infinite nor
+/// pondering, when the proof meets the user's bound — there the stop is the feature (today
+/// `go mate N` runs untimed to depth 245).
+let private runDFPNOracle (control: SearchControl) : unit =
+    if control.RootMoves.Length <= Eonego.DFPN.MaxRootHistory then
+        let r =
+            Eonego.DFPN.shared().Solve(control.RootFen, control.RootMoves, fun () -> control.Stopped)
+
+        if r.Proven then
+            control.Oracle.Publish(r.Move, r.MatePlies, r.PV)
+
+            let sb = System.Text.StringBuilder(160)
+
+            sb.Append("info string DFPN mate ").Append((r.MatePlies + 1) / 2).Append(" pv")
+            |> ignore
+
+            for m in r.PV do
+                sb.Append(' ').Append(toUCI m) |> ignore
+
+            writeLine (sb.ToString())
+
+            let l = control.Limits
+
+            if l.Mate > 0 && not l.Infinite && not l.Ponder && r.MatePlies <= 2 * l.Mate - 1 then
+                control.Stop()
+
 /// Shared orchestration body: `workers` are already created (or pool-rebound) and SetupRoot-ed by the
 /// caller; everything from the clock start through the bestmove print lives here.
 let private goCore (control: SearchControl) (workers: Worker[]) : Move =
@@ -2229,11 +2267,33 @@ let private goCore (control: SearchControl) (workers: Worker[]) : Move =
                t.Start()
                t |]
 
+    // df-pn mate oracle: one extra BelowNormal thread (the Retrograde background-solve precedent).
+    // Not spawned under MultiPV (bestmove must match the reported line 1) or searchmoves (a proof
+    // through an excluded root move must never override). Joined below — it never outlives a `go`,
+    // which keeps stopAndJoin, the pool path, and process exit correct for free.
+    let oracleThread =
+        if
+            control.Config.UseDFPN
+            && control.Config.MultiPv = 1
+            && control.Limits.SearchMoves.Length = 0
+        then
+            let t = Thread(ThreadStart(fun () -> runDFPNOracle control), 16 * 1024 * 1024)
+            t.IsBackground <- true
+            t.Priority <- ThreadPriority.BelowNormal
+            t.Start()
+            Some t
+        else
+            None
+
     iterativeDeepening workers.[0] maxDepth
     control.Stop()
 
     for t in threads do
         t.Join()
+
+    match oracleThread with
+    | Some t -> t.Join()
+    | None -> ()
 
     // EONEGO_PROF=1: one-line phase breakdown (Threads=1 semantics; see PosProf doc). String concat, not
     // sprintf — Printf formatters crash under NativeAOT (see fsharp-dotnet-aot-gotchas).
@@ -2282,19 +2342,50 @@ let private goCore (control: SearchControl) (workers: Worker[]) : Move =
 
     let rb = chosen.RootBest
 
-    let best =
+    let searchBest =
         if isLegalRoot workers.[0].Pos rb then
             rb
         else
             firstLegalMove workers.[0].Pos
 
+    // df-pn override: a VERIFIED checks-only mate beats anything except an equal-or-shorter mate
+    // the search itself proved (voteBest already prefers search-found mates among voters). The
+    // tree is untouched — only the printed bestmove/score change, so node counts stay identical
+    // with the oracle on or off.
+    let struct (DFPNHas, DFPNMove, DFPNPlies) = control.Oracle.TryGet()
+
+    let DFPNWins =
+        DFPNHas
+        && isLegalRoot workers.[0].Pos DFPNMove
+        && not (chosen.RootScore >= MATE_IN_MAX_PLY && MATE - chosen.RootScore <= DFPNPlies)
+
+    let best = if DFPNWins then DFPNMove else searchBest
+
     control.LastBest <- best
-    control.LastScore <- chosen.RootScore
+    control.LastScore <- (if DFPNWins then MATE - DFPNPlies else chosen.RootScore)
 
     if chosen.CompletedDepth > 0 then
         reportInfo chosen chosen.CompletedDepth chosen.RootScore
 
-    writeLine ("bestmove " + toUci best)
+    if DFPNWins then
+        // Final certified line AFTER the search's own report, so the GUI's last-seen score is the
+        // mate it is about to receive. String concat/StringBuilder only (NativeAOT printf ban).
+        let sb = System.Text.StringBuilder(160)
+
+        sb
+            .Append("info depth ")
+            .Append(max chosen.CompletedDepth DFPNPlies)
+            .Append(" score mate ")
+            .Append((DFPNPlies + 1) / 2)
+            .Append(" pv")
+        |> ignore
+
+        for m in control.Oracle.PV do
+            sb.Append(' ').Append(toUCI m) |> ignore
+
+        writeLine (sb.ToString())
+
+    writeLine ("bestmove " + toUCI best)
     best
 
 /// Arm a control for one search: clear the stop flag/counters and bump the TT age. The UCI driver

@@ -6,7 +6,7 @@
 
     <!-- Engine identity (keep in sync with Engine.fs — the runtime reads the F# literals, this
          block only stamps the Windows file/product metadata of the published exe). -->
-    <Version>0.0.4</Version>
+    <Version>0.0.5</Version>
     <Product>Eonego</Product>
     <Authors>Houijasu</Authors>
     <Copyright>Copyright (C) 2026 Houijasu — MIT</Copyright>
@@ -63,6 +63,7 @@
     <Compile Include="History.fs" />
     <Compile Include="MovePick.fs" />
     <Compile Include="Transposition.fs" />
+    <Compile Include="DFPN.fs" />
     <Compile Include="Search.fs" />
     <Compile Include="Tooling.fs" />
     <Compile Include="UCI.fs" />

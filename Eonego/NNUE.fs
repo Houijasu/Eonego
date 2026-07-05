@@ -10,7 +10,7 @@
 ///
 /// AOT/F#: pure byte parsing; no printf; fail-soft; forward is stackalloc'd (0 heap alloc on the hot path).
 #nowarn "9"
-module Eonego.Nnue
+module Eonego.NNUE
 
 open System
 open System.Runtime.CompilerServices
@@ -798,8 +798,8 @@ let dumpFeatures (net: Network) (pos: Position) (ftOut: byte[]) : struct (int * 
 /// Bind the net into the Position's incremental accumulator (root only). The threat enumerator is passed as
 /// a delegate so Position needn't depend on Threats. After binding, `evalInternal` reads the maintained
 /// accumulator; unbound, it falls back to the from-scratch oracle (used by tests).
-let bindNnue (net: Network) (pos: Position) : unit =
-    pos.EnableNnue
+let bindNNUE (net: Network) (pos: Position) : unit =
+    pos.EnableNNUE
         net.FtBiases
         net.Weights
         net.WOff

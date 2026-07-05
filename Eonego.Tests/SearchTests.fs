@@ -179,7 +179,7 @@ let ``mate in one is found with the correct ply-adjusted score`` () =
 
     Assert.True(score >= MATE_IN_MAX_PLY)
     Assert.Equal(MATE - 1, score)
-    Assert.Equal("h1h8", toUci m)
+    Assert.Equal("h1h8", toUCI m)
 
 [<Fact>]
 let ``mate in two is found with the correct ply-adjusted score`` () =

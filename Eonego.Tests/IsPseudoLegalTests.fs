@@ -59,13 +59,13 @@ let ``IsPseudoLegal agrees with the generator across positions`` () =
         let ksq = p.KingSquare p.SideToMove
 
         for m in legal do
-            Assert.True(p.IsPseudoLegal m, sprintf "legal move not pseudo-legal: %s in %s" (toUci m) fen)
+            Assert.True(p.IsPseudoLegal m, sprintf "legal move not pseudo-legal: %s in %s" (toUCI m) fen)
 
         for m in pl do
             if fromSq m = ksq then
                 Assert.Equal(legal.Contains m, p.IsPseudoLegal m) // king split oracle
             else
-                Assert.True(p.IsPseudoLegal m, sprintf "generated non-king not pseudo-legal: %s in %s" (toUci m) fen)
+                Assert.True(p.IsPseudoLegal m, sprintf "generated non-king not pseudo-legal: %s in %s" (toUCI m) fen)
         // no false positives among NORMAL moves from any side-to-move piece
         let mutable occ = p.ColorBB p.SideToMove
 
@@ -79,7 +79,7 @@ let ``IsPseudoLegal agrees with the generator across positions`` () =
                     if p.IsPseudoLegal m then
                         Assert.True(
                             pl.Contains m || (from = ksq && legal.Contains m),
-                            sprintf "false-positive NORMAL pseudo-legal: %s in %s" (toUci m) fen
+                            sprintf "false-positive NORMAL pseudo-legal: %s in %s" (toUCI m) fen
                         )
 
 [<Fact>]

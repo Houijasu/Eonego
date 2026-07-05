@@ -409,7 +409,7 @@ let ``search returns the exact retro mate score at depth 2`` () =
     ensureSolved (makePiece White Rook)
     let struct (score, _, m) = searchToDepth "k7/8/1K6/8/8/8/8/7R w - - 0 1" [||] 2 defaultConfig
     Assert.Equal(MATE - 1, score)
-    Assert.Equal("h1h8", toUci m)
+    Assert.Equal("h1h8", toUCI m)
 
 [<Fact>]
 let ``search backs up the table's exact DTM from probed children`` () =

@@ -32,11 +32,11 @@ let ``pooled search returns legal moves across consecutive searches (2 threads)`
     let c1 = mkControl tt StartPosFen 8 2
     let pool = Array.init 2 (fun i -> Worker(i, (i = 0), c1))
     let m1 = goPooled c1 pool
-    Assert.True(legalIn StartPosFen m1, "first pooled search: illegal move " + toUci m1)
+    Assert.True(legalIn StartPosFen m1, "first pooled search: illegal move " + toUCI m1)
     // New control (new fen, same TT), same pool — the UCI per-move flow.
     let c2 = mkControl tt AfterE4E5 8 2
     let m2 = goPooled c2 pool
-    Assert.True(legalIn AfterE4E5 m2, "second pooled search: illegal move " + toUci m2)
+    Assert.True(legalIn AfterE4E5 m2, "second pooled search: illegal move " + toUCI m2)
 
 [<Fact>]
 let ``pooled worker keeps warm history that reorders the next search`` () =
@@ -54,6 +54,6 @@ let ``pooled worker keeps warm history that reorders the next search`` () =
     let cold = [| Worker(0, true, cCold) |]
     let mCold = goPooled cCold cold
     let nCold = cold.[0].Nodes
-    Assert.True(legalIn AfterE4E5 mWarm, "warm pooled search: illegal move " + toUci mWarm)
-    Assert.True(legalIn AfterE4E5 mCold, "cold search: illegal move " + toUci mCold)
+    Assert.True(legalIn AfterE4E5 mWarm, "warm pooled search: illegal move " + toUCI mWarm)
+    Assert.True(legalIn AfterE4E5 mCold, "cold search: illegal move " + toUCI mCold)
     Assert.NotEqual(nCold, nWarm)

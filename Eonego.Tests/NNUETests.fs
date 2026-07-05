@@ -3,14 +3,14 @@
 /// a reference engine here we cannot bit-exact-verify the inference, so these are STRUCTURAL (loads-to-EOF +
 /// dimensions) and SANITY (startpos balanced, up-a-rook large). The parity scaffold at the bottom is ready
 /// for reference "NNUE evaluation" pawn values from a reference engine on this net.
-module Eonego.Tests.NnueTests
+module Eonego.Tests.NNUETests
 
 open System
 open System.IO
 open Xunit
 open Eonego.Bitboard
 open Eonego.Position
-open Eonego.Nnue
+open Eonego.NNUE
 open Eonego.Tests.TestFixtures
 
 let private netPath () : string option =
@@ -145,7 +145,7 @@ let ``incremental accumulator equals from-scratch over a make/unmake walk`` () =
 
         for fen in fens do
             let bound = Position.OfFen fen
-            bindNnue net bound // active -> incremental
+            bindNNUE net bound // active -> incremental
             let oracle = Position.OfFen fen // unbound -> from-scratch
             walk bound oracle 2)
 
@@ -158,7 +158,7 @@ let ``lazy accumulator replays unevaluated real-move chains`` () =
 
         for fen in fens do
             let bound = Position.OfFen fen
-            bindNnue net bound
+            bindNNUE net bound
             let oracle = Position.OfFen fen
             let m1 = (collectLegal bound).[0]
             bound.Make m1
@@ -209,7 +209,7 @@ let ``lazy multi-frame walk replays long unevaluated chains bit-exact`` () =
 
         for fen in fens do
             let bound = Position.OfFen fen
-            bindNnue net bound
+            bindNNUE net bound
             bound.SetEagerUpdates false
             let oracle = Position.OfFen fen
             // 4-ply unevaluated chains from 3 sibling roots.
@@ -268,7 +268,7 @@ let ``finny warm-entry refresh stays bit-exact over king-heavy walks`` () =
 
         for fen, depth in cases do
             let bound = Position.OfFen fen
-            bindNnue net bound
+            bindNNUE net bound
             let oracle = Position.OfFen fen
             walk bound oracle depth)
 
@@ -276,7 +276,7 @@ let ``finny warm-entry refresh stays bit-exact over king-heavy walks`` () =
 let ``null moves preserve top and replay across following real move`` () =
     withNet (fun net ->
         let bound = Position.OfFen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
-        bindNnue net bound
+        bindNNUE net bound
         let oracle = Position.OfFen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
         let top0 = bound.Top
         bound.MakeNull()
@@ -307,7 +307,7 @@ let ``changed threat conversion defers to eval under lazy, fires during make und
             |> Array.find (fun m -> scout.DebugCollectDirtyThreats(m, dirty) > 0)
         let bound = Position.OfFen fen
         let mutable changedCalls = 0
-        bound.EnableNnue
+        bound.EnableNNUE
             net.FtBiases
             net.Weights
             net.WOff
@@ -368,7 +368,7 @@ let ``forward AVX2 path equals scalar path bit-exactly`` () =
 
             for fen in fens do
                 let bound = Position.OfFen fen
-                bindNnue net bound
+                bindNNUE net bound
                 walk bound 2)
 
 [<Fact>]

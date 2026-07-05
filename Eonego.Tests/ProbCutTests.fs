@@ -78,7 +78,7 @@ let ``ProbCut reduces nodes on a capture-rich position`` () =
         let struct (_, nOn, mOn) = searchToDepthNet fen [||] depth cfgOn (Some net)
         let struct (_, nOff, mOff) = searchToDepthNet fen [||] depth cfgOff (Some net)
         Assert.True(nOn < nOff, "expected ProbCut to cut nodes: nOn=" + string nOn + " nOff=" + string nOff)
-        Assert.Equal(toUci mOff, toUci mOn)
+        Assert.Equal(toUCI mOff, toUCI mOn)
 
 // ---------------------------------------------------------------------------
 // Best-move agreement on a few clear positions at fixed depth: ProbCut should not change the chosen move
@@ -91,7 +91,7 @@ let ``ProbCut reduces nodes on a capture-rich position`` () =
 let ``ProbCut keeps the same best move on clear positions`` (fen: string) (depth: int) =
     let struct (_, _, mOn) = searchToDepth fen [||] depth cfgOn
     let struct (_, _, mOff) = searchToDepth fen [||] depth cfgOff
-    Assert.Equal(toUci mOff, toUci mOn)
+    Assert.Equal(toUCI mOff, toUCI mOn)
 
 // ---------------------------------------------------------------------------
 // Mate score round-trips through a BoundLower store (the bound ProbCut writes on a cutoff).

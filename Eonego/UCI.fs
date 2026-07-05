@@ -13,7 +13,7 @@ open Eonego.Move
 open Eonego.Position
 open Eonego.MoveGeneration
 open Eonego.Transposition
-open Eonego.Nnue
+open Eonego.NNUE
 open Eonego.Search
 
 let private writeLine (s: string) = Console.Out.WriteLine(s)
@@ -66,9 +66,9 @@ let private tryInt64 (s: string) : int64 =
     | true, v -> v
     | _ -> 0L
 
-/// UCI moves are castling/en-passant flag-lossy via parseUci, so re-stamp each against legal generation.
+/// UCI moves are castling/en-passant flag-lossy via parseUCI, so re-stamp each against legal generation.
 let private matchMove (pos: Position) (uci: string) : Move =
-    let t = parseUci uci
+    let t = parseUCI uci
 
     if t = MoveNone then
         MoveNone
@@ -208,7 +208,7 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
         let p = Position()
         p.LoadFen st.RootFen
         for m in st.RootMoves do p.Make m
-        writeLine ("bestmove " + toUci (Search.firstLegalMove p))
+        writeLine ("bestmove " + toUCI (Search.firstLegalMove p))
     | Some _ ->
         // All search toggles are hardwired ON; Threads/Hash/MultiPV/MoveOverhead come from state.
         let cfg =
@@ -242,6 +242,9 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
               UseRootEffort = (Environment.GetEnvironmentVariable("EONEGO_ROOTEFFORT") = "1")
               UseRootVerify = (Environment.GetEnvironmentVariable("EONEGO_ROOTVERIFY") = "1")
               UseRetro = (Environment.GetEnvironmentVariable("EONEGO_RETRO") <> "0")
+              // df-pn mate oracle: default OFF pre-SPRT (the CHECKEXT/CAPFUT class); flip to
+              // <> "0" only after a passing match verdict.
+              UseDFPN = (Environment.GetEnvironmentVariable("EONEGO_DFPN") = "1")
               MoveOverhead = st.MoveOverhead
               AccCheckpointMb = 0
               MultiPv = st.MultiPv }
@@ -321,10 +324,10 @@ let run () =
         | null
         | "" ->
             match readEmbedded "eval.nnue" with
-            | Some bytes -> (match Nnue.loadBytes bytes with Loaded n -> Some n | Failed _ -> None)
+            | Some bytes -> (match NNUE.loadBytes bytes with Loaded n -> Some n | Failed _ -> None)
             | None -> None
         | path ->
-            match Nnue.load path with
+            match NNUE.load path with
             | Loaded n ->
                 writeLine ("info string net override: " + path)
                 Some n
@@ -332,7 +335,7 @@ let run () =
                 writeLine ("info string EONEGO_NET load FAILED (" + why + "); falling back to embedded")
 
                 match readEmbedded "eval.nnue" with
-                | Some bytes -> (match Nnue.loadBytes bytes with Loaded n -> Some n | Failed _ -> None)
+                | Some bytes -> (match NNUE.loadBytes bytes with Loaded n -> Some n | Failed _ -> None)
                 | None -> None
 
     let st =
@@ -396,12 +399,12 @@ let run () =
 
                         Eonego.Retrograde.requestSolveFor p
                 | "go" ->
-                    let (lim, smUci) = parseGo tokens.[1..]
+                    let (lim, smUCI) = parseGo tokens.[1..]
 
-                    // Stamp `searchmoves` tokens against the actual position (parseUci is castling/
+                    // Stamp `searchmoves` tokens against the actual position (parseUCI is castling/
                     // en-passant flag-lossy, same reason parsePosition re-stamps). Unmatched tokens drop.
                     let lim =
-                        if smUci.Length = 0 then
+                        if smUCI.Length = 0 then
                             lim
                         else
                             let p = Position()
@@ -411,7 +414,7 @@ let run () =
                                 p.Make mv
 
                             let stamped =
-                                smUci |> Array.map (matchMove p) |> Array.filter (fun m -> m <> MoveNone)
+                                smUCI |> Array.map (matchMove p) |> Array.filter (fun m -> m <> MoveNone)
 
                             { lim with SearchMoves = stamped }
 

@@ -15,7 +15,7 @@ open System
 open System.IO
 open Xunit
 open Eonego.Position
-open Eonego.Nnue
+open Eonego.NNUE
 
 let private repoRoot () : string option =
     let mutable dir = DirectoryInfo(AppContext.BaseDirectory)

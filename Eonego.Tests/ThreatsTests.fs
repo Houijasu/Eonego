@@ -1,7 +1,7 @@
 /// FullThreats feature-enumeration invariants. Without a reference implementation we can't bit-exact-verify
 /// the threat indices, but we pin the structural invariants: every active index is in [0, Dimensions), the
 /// active count never exceeds the active-feature cap (128), and a normal middlegame has a non-empty,
-/// perspective-dependent threat set. (The material-accurate evals in NnueTests are the broader evidence.)
+/// perspective-dependent threat set. (The material-accurate evals in NNUETests are the broader evidence.)
 module Eonego.Tests.ThreatsTests
 
 open System.Collections.Generic
@@ -89,7 +89,7 @@ let private checkDirtyMove (pos: Position) (m: Move) =
     let oldKsqB = pos.KingSquare Black
     let dirty = Array.zeroCreate MaxDirtyThreats
     let dirtyN = pos.DebugCollectDirtyThreats(m, dirty)
-    Assert.True(dirtyN >= 0, sprintf "dirty threat overflow for %s in %s" (toUci m) (pos.ToFen()))
+    Assert.True(dirtyN >= 0, sprintf "dirty threat overflow for %s in %s" (toUCI m) (pos.ToFen()))
 
     pos.Make m
     let changedW = Array.zeroCreate MaxDirtyThreats
@@ -100,11 +100,11 @@ let private checkDirtyMove (pos: Position) (m: Move) =
 
     if oldKsqW = pos.KingSquare White then
         addSignedDeltas beforeW changedW nW
-        assertCountsEqual ("white " + toUci m + " in " + fen) beforeW (activeCounts White pos)
+        assertCountsEqual ("white " + toUCI m + " in " + fen) beforeW (activeCounts White pos)
 
     if oldKsqB = pos.KingSquare Black then
         addSignedDeltas beforeB changedB nB
-        assertCountsEqual ("black " + toUci m + " in " + fen) beforeB (activeCounts Black pos)
+        assertCountsEqual ("black " + toUCI m + " in " + fen) beforeB (activeCounts Black pos)
 
     pos.Unmake m
 

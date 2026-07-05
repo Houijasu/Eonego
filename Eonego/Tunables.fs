@@ -135,6 +135,13 @@ let RootLmrCap = envInt "EONEGO_T_ROOT_LMR_CAP" 99 0 99
 let StatBonusMul = envInt "EONEGO_T_STATB_MUL" 167 16 1000 // was 160
 let StatBonusCap = envInt "EONEGO_T_STATB_CAP" 1735 100 7000 // was 1700
 
+// --- df-pn mate oracle (EONEGO_DFPN=1 gate lives in UCI.fs): proof-number table size and node
+//     budgets. VNodes bounds the verification replay (fail-closed: an over-budget verify just
+//     declines to publish). Nodes = 0 means uncapped (the stop flag still bounds the solve). ---
+let DFPNMb = envInt "EONEGO_T_DFPN_MB" 32 1 1024
+let DFPNNodes = envInt "EONEGO_T_DFPN_NODES" 20_000_000 0 2_000_000_000
+let DFPNVNodes = envInt "EONEGO_T_DFPN_VNODES" 5_000_000 1 2_000_000_000
+
 // --- Gravity divisors (also the bonus clamp bounds). MUST stay < 32700: the gravity fixpoint keeps
 //     |entry| <= D, so the int16 stores in History.Tables can never overflow. ---
 let MainHistD = envInt "EONEGO_T_MAINHIST_D" 7183 1024 32000

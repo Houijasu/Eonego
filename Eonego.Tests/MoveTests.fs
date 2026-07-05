@@ -210,34 +210,34 @@ let ``ScoredMove round-trips, is 8 bytes, and reads copy-free via byref`` () =
 // ---------------------------------------------------------------------------
 
 [<Fact>]
-let ``toUci formats normal, promotion, castling, and both sentinels`` () =
-    Assert.Equal("e2e4", toUci (mkMove e2 e4))
-    Assert.Equal("e7e8q", toUci (mkPromotion e7 e8 Queen))
-    Assert.Equal("e7e8n", toUci (mkPromotion e7 e8 Knight))
-    Assert.Equal("e1g1", toUci (mkCastling e1 g1))
-    Assert.Equal("0000", toUci MoveNone)
-    Assert.Equal("0000", toUci MoveNull) // MoveNull must NOT surface as "b1b1"
+let ``toUCI formats normal, promotion, castling, and both sentinels`` () =
+    Assert.Equal("e2e4", toUCI (mkMove e2 e4))
+    Assert.Equal("e7e8q", toUCI (mkPromotion e7 e8 Queen))
+    Assert.Equal("e7e8n", toUCI (mkPromotion e7 e8 Knight))
+    Assert.Equal("e1g1", toUCI (mkCastling e1 g1))
+    Assert.Equal("0000", toUCI MoveNone)
+    Assert.Equal("0000", toUCI MoveNull) // MoveNull must NOT surface as "b1b1"
 
 [<Fact>]
-let ``parseUci is context-free: castling string parses to a Normal move`` () =
-    Assert.Equal(mkMove e1 g1, parseUci "e1g1")
-    Assert.True(isNormal (parseUci "e1g1"))
-    Assert.Equal(mkPromotion e7 e8 Knight, parseUci "e7e8n")
+let ``parseUCI is context-free: castling string parses to a Normal move`` () =
+    Assert.Equal(mkMove e1 g1, parseUCI "e1g1")
+    Assert.True(isNormal (parseUCI "e1g1"))
+    Assert.Equal(mkPromotion e7 e8 Knight, parseUCI "e7e8n")
 
 [<Fact>]
-let ``parseUci then toUci is identity over normal and promotion moves`` () =
+let ``parseUCI then toUCI is identity over normal and promotion moves`` () =
     for from in 0..63 do
         for dst in 0..63 do
             if from <> dst then
                 let nm = mkMove from dst
-                Assert.Equal(nm, parseUci (toUci nm))
+                Assert.Equal(nm, parseUCI (toUCI nm))
 
                 for promo in promos do
                     let pm = mkPromotion from dst promo
-                    Assert.Equal(pm, parseUci (toUci pm))
+                    Assert.Equal(pm, parseUCI (toUCI pm))
 
 [<Fact>]
-let ``parseUci rejects malformed input and from==dst with MoveNone`` () =
+let ``parseUCI rejects malformed input and from==dst with MoveNone`` () =
     let bad =
         [ ""
           "0000"
@@ -259,7 +259,7 @@ let ``parseUci rejects malformed input and from==dst with MoveNone`` () =
           "h8h8" ] // from==dst (must not leak sentinels)
 
     for s in bad do
-        Assert.Equal(MoveNone, parseUci s)
+        Assert.Equal(MoveNone, parseUCI s)
 
 // ---------------------------------------------------------------------------
 // Task 9 — full encode/decode oracle over (from, dst, kind, promo)

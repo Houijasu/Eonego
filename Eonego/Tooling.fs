@@ -14,7 +14,7 @@ open Eonego.Bitboard
 open Eonego.Move
 open Eonego.Position
 open Eonego.MoveGeneration
-open Eonego.Nnue
+open Eonego.NNUE
 open Eonego.Search
 
 let private inv = CultureInfo.InvariantCulture
@@ -79,7 +79,7 @@ let private flagFloat (m: Map<string, string option>) (name: string) (defaultVal
     | None -> defaultVal
 
 let private matchMove (pos: Position) (uci: string) : Move =
-    let t = parseUci uci
+    let t = parseUCI uci
 
     if t = MoveNone then
         MoveNone
@@ -129,7 +129,7 @@ let private isNoisyBest (pos: Position) (m: Move) : bool =
     isPromotion m || isEnPassant m || not (pos.IsEmpty(toSq m))
 
 let private whiteRelEval (net: Network) (pos: Position) : int =
-    let e = Nnue.evalCp net pos
+    let e = NNUE.evalCp net pos
     if pos.SideToMove = White then e else -e
 
 let private softmaxPick (rng: Random) (temp: float) (moves: Move[]) (scores: int[]) : Move =
@@ -330,11 +330,11 @@ let runGen (args: string[]) : int =
 
         match flag m "net" with
         | Some path ->
-            match Nnue.load path with
-            | Nnue.Failed r ->
+            match NNUE.load path with
+            | NNUE.Failed r ->
                 errLine ("failed to load net: " + r)
                 1
-            | Nnue.Loaded n -> runGenGames outPath startFen games depthOpt nodesOpt temp seed randomPlies maxPlies n
+            | NNUE.Loaded n -> runGenGames outPath startFen games depthOpt nodesOpt temp seed randomPlies maxPlies n
         | None ->
             errLine "gen requires --net <path> (NNUE file)"
             1
@@ -347,13 +347,13 @@ let runDumpFt (args: string[]) : int =
 
     match flag m "net", flag m "in", flag m "out" with
     | Some netPath, Some inPath, Some outPath ->
-        match Nnue.load netPath with
-        | Nnue.Failed r ->
+        match NNUE.load netPath with
+        | NNUE.Failed r ->
             errLine ("failed to load net: " + r)
             1
-        | Nnue.Loaded net ->
+        | NNUE.Loaded net ->
             use writer = new BinaryWriter(File.Create outPath)
-            let ft = Array.zeroCreate<byte> Nnue.L1
+            let ft = Array.zeroCreate<byte> NNUE.L1
             let mutable count = 0
 
             for line in File.ReadLines inPath do
@@ -362,7 +362,7 @@ let runDumpFt (args: string[]) : int =
                 if t.Length > 0 && not (t.StartsWith "#") then
                     let fen = t.Split(';').[0].Trim()
                     let pos = Position.OfFen fen
-                    let struct (bucket, psqtInternal, evalInt) = Nnue.dumpFeatures net pos ft
+                    let struct (bucket, psqtInternal, evalInt) = NNUE.dumpFeatures net pos ft
                     writer.Write(byte bucket)
                     writer.Write(if pos.SideToMove = White then 0uy else 1uy)
                     writer.Write(psqtInternal)
