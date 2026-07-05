@@ -2,7 +2,7 @@
 
 Per generation k:
   1. gen   : engine self-play from KGA with the best net (parallel workers) -> position FENs
-  2. label : teacher-label those positions (sflabel.py)                       -> labeled_gen{k}.txt
+  2. label : teacher-label those positions (label.py)                         -> labeled_gen{k}.txt
   3. window: the broad seed pool (teacher_pool0) + the last W generations' teacher labels
   4. train : fine-tune warm-started from the best net's .pt on the window    -> net_gen{k}
   5. match : net_gen{k} vs best from KGA; promote on score >= threshold
@@ -10,7 +10,7 @@ This is distribution-matched (positions come from the best net's own play) + str
 (teacher labels) + warm-start (keeps the good-playing net). Known to cap at the net's
 capacity (mid-2000s for the 64-wide region net) — the curve shows where.
 
-    python sfloop.py --generations 8 --resume
+    python teacherloop.py --generations 8 --resume
 """
 
 import argparse
@@ -66,7 +66,7 @@ def gen_positions(k, best_net, games, workers, depth, seed_base, random_plies):
 
 def label_generation(fens, k, depth, workers):
     out = os.path.join(DATA, f"labeled_gen{k}.txt")
-    run([PY, os.path.join(HERE, "sflabel.py"), "--in", fens, "--out", out,
+    run([PY, os.path.join(HERE, "label.py"), "--in", fens, "--out", out,
          "--depth", str(depth), "--workers", str(workers)])
     return out
 
