@@ -54,14 +54,17 @@ node-count sweeps and SPRT self-play matches.
 Requirements:
 - .NET SDK with `net10.0` support
 - Visual Studio **"Desktop development with C++"** workload (NativeAOT links with MSVC)
-- For a self-contained engine, place a compatible FullThreats net at `nets/main.nnue` before
-  publishing (gitignored, embedded as `eval.nnue`). A build without it still succeeds, but
-  search needs either the embedded net or `EONEGO_NET=<path>` at runtime.
+- The trained net is **not in git** (~106 MB). Clone builds need it once before publish:
 
 ```powershell
-pwsh ./publish.ps1
-# -> Eonego/bin/Release/net10.0/win-x64/publish/Eonego.exe  (~110 MB with net embedded, ~42 MB without)
+pwsh ./scripts/fetch-net.ps1   # -> nets/main.nnue from GitHub Releases
+pwsh ./publish.ps1             # auto-fetches if missing; embeds as eval.nnue
+# -> Eonego/bin/Release/net10.0/win-x64/publish/Eonego.exe  (~110 MB with net embedded)
 ```
+
+A build without `nets/main.nnue` still succeeds, but the exe cannot search until you embed a net
+or set `EONEGO_NET=<path>` at runtime. Pre-built zips on [Releases](https://github.com/Houijasu/Eonego/releases)
+already include the embedded net.
 
 Equivalent: `dotnet publish Eonego/Eonego.fsproj -c Release -r win-x64` (the script also puts the VS
 Installer on `PATH` so the MSVC link step does not fail with exit code 123).

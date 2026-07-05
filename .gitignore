@@ -110,8 +110,9 @@ venv/
 *.pt
 trainer/*_state*.json
 
-# Trained NNUE weights (large — not committed; build with nets/main.nnue locally)
-nets/
+# Trained NNUE weights (large — not committed; fetch with scripts/fetch-net.ps1)
+nets/*
+!nets/README.md
 *.nnue
 
 # Downloaded UCI teacher binary used only as a local parity oracle (never commit)

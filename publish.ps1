@@ -5,11 +5,18 @@
 #
 #   pwsh ./publish.ps1
 #
-# Output: Eonego/bin/Release/net10.0/win-x64/publish/Eonego.exe  (self-contained, ~42 MB; embeds the NNUE net
-# if nets/main.nnue is present). Requires the "Desktop development with C++" VS workload (link.exe + libs).
+# Output: Eonego/bin/Release/net10.0/win-x64/publish/Eonego.exe  (~110 MB with embedded net).
+# Auto-runs scripts/fetch-net.ps1 when nets/main.nnue is absent. Requires the "Desktop development with C++"
+# VS workload (link.exe + libs).
 
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
+
+$netPath = Join-Path $root 'nets/main.nnue'
+if (-not (Test-Path $netPath)) {
+    Write-Host "nets/main.nnue missing — fetching release net for embed ..." -ForegroundColor Yellow
+    & (Join-Path $root 'scripts/fetch-net.ps1')
+}
 
 $vsInstaller = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer'
 if (Test-Path (Join-Path $vsInstaller 'vswhere.exe')) {
