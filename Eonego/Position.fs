@@ -750,7 +750,7 @@ type Position() =
             let pc = board.[sq]
 
             if pc <> NoPiece then
-                Accumulator.addFeatureAt acc accOff psq psqOff halfWeights halfWBase halfPsqt (Accumulator.makeIndex pColor pc sq ksq) 1 Accumulator.UseAvx2
+                Accumulator.addFeatureAt acc accOff psq psqOff halfWeights halfWBase halfPsqt (Accumulator.makeIndex pColor pc sq ksq) 1 Accumulator.UseAvx512 Accumulator.UseAvx2
 
     member private this.AddActiveThreats(pColor: Color, frame: int) =
         let acc = if pColor = White then accW else accB
@@ -760,7 +760,7 @@ type Position() =
         let n = this.EnumThreats(pColor, tmpW)
 
         for k in 0 .. n - 1 do
-            Accumulator.addThreatAt acc accOff psq psqOff threatWeights threatWBase threatPsqt tmpW.[k] 1 Accumulator.UseAvx2
+            Accumulator.addThreatAt acc accOff psq psqOff threatWeights threatWBase threatPsqt tmpW.[k] 1 Accumulator.UseAvx512 Accumulator.UseAvx2
 
     member private this.BuildFull(pColor: Color, frame: int) =
         let profT0 =
@@ -797,10 +797,10 @@ type Position() =
             let nB = int (packed &&& 0xFFFFFFFFL)
 
             for k in 0 .. nW - 1 do
-                Accumulator.addThreatAt accW (this.AccOff White frame) psqW (this.PsqOff White frame) threatWeights threatWBase threatPsqt tmpW.[k] 1 Accumulator.UseAvx2
+                Accumulator.addThreatAt accW (this.AccOff White frame) psqW (this.PsqOff White frame) threatWeights threatWBase threatPsqt tmpW.[k] 1 Accumulator.UseAvx512 Accumulator.UseAvx2
 
             for k in 0 .. nB - 1 do
-                Accumulator.addThreatAt accB (this.AccOff Black frame) psqB (this.PsqOff Black frame) threatWeights threatWBase threatPsqt tmpB.[k] 1 Accumulator.UseAvx2
+                Accumulator.addThreatAt accB (this.AccOff Black frame) psqB (this.PsqOff Black frame) threatWeights threatWBase threatPsqt tmpB.[k] 1 Accumulator.UseAvx512 Accumulator.UseAvx2
 
     member private this.BuildFullBoth(frame: int) =
         let profT0 =
@@ -1018,6 +1018,7 @@ type Position() =
             nThrAdd
             fusedThrSub
             nThrSub
+            Accumulator.UseAvx512
             Accumulator.UseAvx2
 
         if PosProf.Enabled then
@@ -1092,6 +1093,7 @@ type Position() =
                 0
                 fusedThrSub
                 0
+                Accumulator.UseAvx512
                 Accumulator.UseAvx2
 
         e
@@ -1125,6 +1127,7 @@ type Position() =
             nThr
             fusedThrSub
             0
+            Accumulator.UseAvx512
             Accumulator.UseAvx2
 
         if pColor = White then
