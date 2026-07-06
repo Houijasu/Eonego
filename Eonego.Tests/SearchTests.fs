@@ -231,7 +231,7 @@ let ``scoreString clamps decayed mate scores to the eval ceiling`` () =
     Assert.Equal("cp " + string Eonego.NNUE.EvalMax, scoreString Eonego.NNUE.EvalMax)
     // The no-man's-land between EvalMax and the mate band = decayed mate scores (TT ply
     // adjustment walked them out of the band). Display-clamped so GUIs cannot re-decode them
-    // as fictitious mate announcements (the Fritz "#1753" incident).
+    // as fictitious mate announcements when GUIs mis-decode leaked cp scores.
     Assert.Equal("cp 10000", scoreString (MATE_IN_MAX_PLY - 1))
     Assert.Equal("cp -10000", scoreString (-MATE_IN_MAX_PLY + 1))
-    Assert.Equal("cp -10000", scoreString -29262) // the exact leaked score behind "#1753"
+    Assert.Equal("cp -10000", scoreString -29262) // the exact leaked cp score from the trapped-queen repro

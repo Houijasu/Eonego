@@ -58,12 +58,14 @@
     <Compile Include="Position.fs" />
     <Compile Include="Threats.fs" />
     <Compile Include="NNUE.fs" />
+    <Compile Include="Policy.fs" />
     <Compile Include="MoveGeneration.fs" />
     <Compile Include="Retrograde.fs" />
     <Compile Include="History.fs" />
     <Compile Include="MovePick.fs" />
     <Compile Include="Transposition.fs" />
     <Compile Include="DFPN.fs" />
+    <Compile Include="Syzygy.fs" />
     <Compile Include="Search.fs" />
     <Compile Include="Tooling.fs" />
     <Compile Include="UCI.fs" />

@@ -46,6 +46,7 @@ type private UCIState =
       mutable MultiPv: int
       mutable MoveOverhead: int
       Net: Network option
+      Policy: Policy.PolicyNetwork option
       Tt: TranspositionTable
       mutable RootFen: string
       mutable RootMoves: Move[]
@@ -229,33 +230,38 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
               UseAspTweaks = true
               // A/B env knobs for match.py per-player overrides (campaign step B4): defaults preserve
               // release behaviour; each flag flips for one player without a rebuild.
-              UseQsTt = (Environment.GetEnvironmentVariable("EONEGO_QSTT") <> "0")
-              UseTtEvalAdjust = (Environment.GetEnvironmentVariable("EONEGO_TTEVADJ") <> "0")
+              UseQsTt = (Environment.GetEnvironmentVariable("EONEGO_QSTT") <> "1")
+              UseTtEvalAdjust = (Environment.GetEnvironmentVariable("EONEGO_TTEVADJ") <> "1")
               UseCheckExt = (Environment.GetEnvironmentVariable("EONEGO_CHECKEXT") = "1")
               UseQsEvasionCap = (Environment.GetEnvironmentVariable("EONEGO_QSEVCAP") = "1")
               UseTtCapture = (Environment.GetEnvironmentVariable("EONEGO_TTCAPTURE") = "1")
-              UseCorrHist = (Environment.GetEnvironmentVariable("EONEGO_CORRHIST") <> "0")
+              UseCorrHist = (Environment.GetEnvironmentVariable("EONEGO_CORRHIST") <> "1")
               UseCorrMinor = (Environment.GetEnvironmentVariable("EONEGO_CORRMINOR") = "1")
               UseCorrMajor = (Environment.GetEnvironmentVariable("EONEGO_CORRMAJOR") = "1")
               UseCorrNonPawn = (Environment.GetEnvironmentVariable("EONEGO_CORRNONPAWN") = "1")
               UseCorrCont = (Environment.GetEnvironmentVariable("EONEGO_CORRCONT") = "1")
               UseCaptFut = (Environment.GetEnvironmentVariable("EONEGO_CAPFUT") = "1")
               UsePartialCommit = (Environment.GetEnvironmentVariable("EONEGO_PARTIAL") = "1")
-              UseCont4 = (Environment.GetEnvironmentVariable("EONEGO_CONT4") <> "0")
-              UseR50Damp = (Environment.GetEnvironmentVariable("EONEGO_R50DAMP") <> "0")
+              UseCont4 = (Environment.GetEnvironmentVariable("EONEGO_CONT4") <> "1")
+              UseR50Damp = (Environment.GetEnvironmentVariable("EONEGO_R50DAMP") <> "1")
               UseQsChecks = (Environment.GetEnvironmentVariable("EONEGO_QSCHECKS") = "1")
               UseRootEffort = (Environment.GetEnvironmentVariable("EONEGO_ROOTEFFORT") = "1")
               UseRootVerify = (Environment.GetEnvironmentVariable("EONEGO_ROOTVERIFY") = "1")
               UseRetro = (Environment.GetEnvironmentVariable("EONEGO_RETRO") <> "0")
+              // Syzygy WDL probe: inert until `setoption name SyzygyPath` loads tables
+              // (Syzygy.Largest = 0 gates every probe); EONEGO_SYZYGY=0 is the kill switch.
+              UseSyzygy = (Environment.GetEnvironmentVariable("EONEGO_SYZYGY") <> "1")
               // df-pn mate oracle: default OFF pre-SPRT (the CHECKEXT/CAPFUT class); flip to
               // <> "0" only after a passing match verdict.
               UseDFPN = (Environment.GetEnvironmentVariable("EONEGO_DFPN") = "1")
+              // Policy sidecar: ON iff startup actually loaded one (EONEGO_POLICY gate; see run()).
+              UsePolicy = st.Policy.IsSome
               MoveOverhead = st.MoveOverhead
               AccCheckpointMb = 0
               MultiPv = st.MultiPv }
 
         let control =
-            SearchControl(cfg, lim, st.Tt, st.RootFen, st.RootMoves, ?net = st.Net)
+            SearchControl(cfg, lim, st.Tt, st.RootFen, st.RootMoves, ?net = st.Net, ?policy = st.Policy)
 
         // Arm on the UCI thread BEFORE the search thread exists: a `stop`/`quit` arriving right
         // after t.Start() must find the stop flag armed-and-clear, not race the thread's own Reset
@@ -306,8 +312,6 @@ let private handleSetOption (st: UCIState) (tokens: string[]) =
             st.Threads <- max 1 (min 256 v)
             Search.resizeHelpers st.Threads
         elif String.Equals(name, "Hash", StringComparison.OrdinalIgnoreCase) then
-            // Resize must never run under a live probe: stop+join any active search first (same
-            // guarantee ucinewgame provides for Clear).
             stopAndJoin st
             st.HashMb <- max 1 (min MaxHashMb v)
             st.Tt.Resize st.HashMb
@@ -315,7 +319,12 @@ let private handleSetOption (st: UCIState) (tokens: string[]) =
             st.MultiPv <- max 1 (min 256 v)
         elif String.Equals(name, "Move Overhead", StringComparison.OrdinalIgnoreCase) then
             st.MoveOverhead <- max 0 (min 5000 v)
-    // Any other (legacy/hardwired) option is silently ignored.
+        elif String.Equals(name, "SyzygyPath", StringComparison.OrdinalIgnoreCase) then
+            let pathVal = String.Join(" ", tokens.[vi + 1 ..])
+            if Syzygy.init pathVal then
+                writeLine ("info string Syzygy tables loaded, largest " + string Syzygy.Largest + " pieces")
+            else
+                writeLine "info string Syzygy init failed"
     | _ -> ()
 
 let run () =
@@ -344,12 +353,41 @@ let run () =
                 | Some bytes -> (match NNUE.loadBytes bytes with Loaded n -> Some n | Failed _ -> None)
                 | None -> None
 
+    // Policy sidecar (EONEGO_POLICY): =<path> loads a .policy file; =1 asks for the embedded
+    // `policy.dat` resource (absent until the Phase-3 SPRT pass embeds one). ftHash-bound to the
+    // loaded value net — a head trained on a foreign trunk is refused. Unset => classic search,
+    // byte-identical (the nodesweep contract).
+    let policy =
+        match Environment.GetEnvironmentVariable("EONEGO_POLICY"), net with
+        | (null | ""), _ -> None
+        | _, None -> None
+        | "1", Some n ->
+            match readEmbedded "policy.dat" with
+            | Some bytes ->
+                match Policy.loadBytes bytes n.FtHash with
+                | Policy.PolicyLoaded p -> Some p
+                | Policy.PolicyFailed why ->
+                    writeLine ("info string embedded policy load FAILED (" + why + "); policy off")
+                    None
+            | None ->
+                writeLine "info string EONEGO_POLICY=1 but no policy.dat embedded; policy off"
+                None
+        | path, Some n ->
+            match Policy.load path n.FtHash with
+            | Policy.PolicyLoaded p ->
+                writeLine ("info string policy sidecar: " + path)
+                Some p
+            | Policy.PolicyFailed why ->
+                writeLine ("info string EONEGO_POLICY load FAILED (" + why + "); policy off")
+                None
+
     let st =
         { Threads = 1
           HashMb = DefaultHashMb
           MultiPv = 1
           MoveOverhead = 10
           Net = net
+          Policy = policy
           Tt = TranspositionTable(DefaultHashMb)
           RootFen = StartPosFen
           RootMoves = [||]
@@ -374,6 +412,7 @@ let run () =
                     writeLine "option name Hash type spin default 256 min 1 max 65536"
                     writeLine "option name MultiPV type spin default 1 min 1 max 256"
                     writeLine "option name Move Overhead type spin default 10 min 0 max 5000"
+                    writeLine "option name SyzygyPath type string default <empty>"
                     writeLine "uciok"
                 | "isready" ->
                     writeLine "readyok"

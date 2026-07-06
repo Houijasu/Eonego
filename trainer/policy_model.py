@@ -1,0 +1,80 @@
+"""Torch modules for the EONPOL heads — quantization-aware (STE int8 grid, engine-exact hidden
+activation): pfc0 1024->128 CReLU(>>shift0) -> pfrom/pto 128->64 raw logits; WDL 32->3 per bucket.
+
+The hidden activation uses an STE FLOOR on acc/2^shift0 so the float forward sits exactly on the
+engine's integer grid (F#'s arithmetic >>> floors); weights/biases are STE-rounded and clamped to
+the int8/int32 ranges the exporter writes. Same recipe as kga_stack_tune.cmd_train.
+"""
+
+import torch
+
+HIDDEN = 128
+SHIFT0 = 6
+WDL_SHIFT = 6
+L1 = 1024
+
+
+def ste_round(x):
+    return (torch.round(x) - x).detach() + x
+
+
+def ste_floor(x):
+    return (torch.floor(x) - x).detach() + x
+
+
+class PolicyHead(torch.nn.Module):
+    def __init__(self, seed: int = 0):
+        super().__init__()
+        g = torch.Generator().manual_seed(seed)
+        # Small int-grid init: weights a few quanta wide, biases zero.
+        self.w0 = torch.nn.Parameter(torch.randn(HIDDEN, L1, generator=g) * 3.0)
+        self.b0 = torch.nn.Parameter(torch.zeros(HIDDEN))
+        self.wf = torch.nn.Parameter(torch.randn(64, HIDDEN, generator=g) * 3.0)
+        self.bf = torch.nn.Parameter(torch.zeros(64))
+        self.wt = torch.nn.Parameter(torch.randn(64, HIDDEN, generator=g) * 3.0)
+        self.bt = torch.nn.Parameter(torch.zeros(64))
+
+    def forward(self, ft):
+        """ft: (B, 1024) float in [0,127] -> (from_logits, to_logits), each (B, 64)."""
+        w0 = torch.clamp(ste_round(self.w0), -127, 127)
+        acc = ft @ w0.T + ste_round(self.b0)
+        hid = torch.clamp(ste_floor(acc / (1 << SHIFT0)), 0, 127)
+        wf = torch.clamp(ste_round(self.wf), -127, 127)
+        wt = torch.clamp(ste_round(self.wt), -127, 127)
+        return hid @ wf.T + ste_round(self.bf), hid @ wt.T + ste_round(self.bt)
+
+
+class WDLHead(torch.nn.Module):
+    """Per-bucket 32->3 head off the frozen value stack's a1 activation."""
+
+    def __init__(self, buckets: int = 8, seed: int = 0):
+        super().__init__()
+        g = torch.Generator().manual_seed(seed + 1)
+        self.w = torch.nn.Parameter(torch.randn(buckets, 3, 32, generator=g) * 2.0)
+        self.b = torch.nn.Parameter(torch.zeros(buckets, 3))
+
+    def forward(self, a1, bucket):
+        """a1: (B, 32) float in [0,127]; bucket: (B,) long -> (B, 3) raw logits."""
+        w = torch.clamp(ste_round(self.w), -127, 127)[bucket]  # (B, 3, 32)
+        b = ste_round(self.b)[bucket]  # (B, 3)
+        return torch.bmm(w, a1.unsqueeze(2)).squeeze(2) + b
+
+
+def masked_goodset_ce(from_l, to_l, qf, qt, qn, good):
+    """Multi-label quiet-conditional CE: maximize the probability MASS on the WDL-preserving set —
+    loss = -(logsumexp over good quiets - logsumexp over all quiets). Reduces exactly to standard
+    CE when `good` is one-hot. Returns (loss_per_row, masked_logits)."""
+    ql = from_l.gather(1, qf) + to_l.gather(1, qt)  # (B, Q)
+    mask = torch.arange(qf.shape[1], device=qf.device).unsqueeze(0) < qn.unsqueeze(1)
+    ql = ql.masked_fill(~mask, float("-inf"))
+    good_ql = ql.masked_fill(~good, float("-inf"))
+    return torch.logsumexp(ql, dim=1) - torch.logsumexp(good_ql, dim=1), ql
+
+
+def masked_quiet_ce(from_l, to_l, qf, qt, qn, tgt):
+    """Quiet-conditional cross-entropy: softmax over each position's legal quiets only.
+    from_l/to_l: (B, 64); qf/qt: (B, Q) rel-square indices (padded); qn: (B,) counts; tgt: (B,)."""
+    ql = from_l.gather(1, qf) + to_l.gather(1, qt)  # (B, Q)
+    mask = torch.arange(qf.shape[1], device=qf.device).unsqueeze(0) < qn.unsqueeze(1)
+    ql = ql.masked_fill(~mask, float("-inf"))
+    return -(ql.gather(1, tgt.unsqueeze(1)).squeeze(1) - torch.logsumexp(ql, dim=1)), ql

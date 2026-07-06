@@ -40,6 +40,7 @@
     <Compile Include="SingularTests.fs" />
     <Compile Include="RetrogradeTests.fs" />
     <Compile Include="DFPNTests.fs" />
+    <Compile Include="PolicyTests.fs" />
     <Compile Include="PoolTests.fs" />
   </ItemGroup>
 

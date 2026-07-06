@@ -77,6 +77,21 @@ module PosProf =
     let mutable nEnumThreats = 0L
     let mutable nGather = 0L // calls that did WORK (missed the per-frame changed cache)
     let mutable nApply = 0L // perspective-frames materialized by walks
+    // Tree-shape counters (2026-07-06, policy-net campaign Phase 0): how often does the picker actually
+    // reach quiet scoring, and which move class causes beta cutoffs? These size the slice a policy-net
+    // ordering prior could even address (a cutoff by TT move/capture/killer/countermove is emitted by
+    // earlier picker stages regardless of quiet ordering). Written by Search.fs (nodes, cutoffs) and
+    // MovePick.fs (StgQuietInit); same 1T semantics as the rest.
+    let mutable nNodesMain = 0L // negamax nodes that reached the move loop (built a main picker)
+    let mutable nNodesQs = 0L // qsearch nodes that reached the move loop
+    let mutable nQuietInit = 0L // StgQuietInit executions that generated + scored quiets (not skipQuiets)
+    let QuietInitByDepth: int64[] = Array.zeroCreate 64 // nQuietInit bucketed by picker depth (clamped)
+    let mutable nCutoffs = 0L // negamax beta cutoffs
+    let mutable nCutTT = 0L // ... caused by the TT move
+    let mutable nCutCapture = 0L // ... caused by a capture/promotion (non-quiet)
+    let mutable nCutRefutation = 0L // ... caused by a killer1/killer2/countermove quiet
+    let mutable nCutQuietTail = 0L // ... caused by a NON-refutation quiet (the policy-addressable slice)
+    let CutQuietIdx: int64[] = Array.zeroCreate 16 // nCutQuietTail by tried-quiet index (clamped to 15)
 
     let reset () =
         tMake <- 0L
@@ -95,6 +110,16 @@ module PosProf =
         nEnumThreats <- 0L
         nGather <- 0L
         nApply <- 0L
+        nNodesMain <- 0L
+        nNodesQs <- 0L
+        nQuietInit <- 0L
+        Array.fill QuietInitByDepth 0 QuietInitByDepth.Length 0L
+        nCutoffs <- 0L
+        nCutTT <- 0L
+        nCutCapture <- 0L
+        nCutRefutation <- 0L
+        nCutQuietTail <- 0L
+        Array.fill CutQuietIdx 0 CutQuietIdx.Length 0L
 
 // ---------------------------------------------------------------------------
 // Module-level static tables — built once via `do initTables ()`. These read ONLY Bitboard [<Literal>]

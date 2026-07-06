@@ -150,6 +150,17 @@ let DFPNMb = envInt "EONEGO_T_DFPN_MB" 32 1 1024
 let DFPNNodes = envInt "EONEGO_T_DFPN_NODES" 20_000_000 0 2_000_000_000
 let DFPNVNodes = envInt "EONEGO_T_DFPN_VNODES" 5_000_000 1 2_000_000_000
 
+// --- Policy sidecar head (EONEGO_POLICY gate lives in UCI.fs; Phase-0 re-scope 2026-07-06:
+//     the LMR term is the v1 consumption, the ordering blend ships INERT at Mul=0).
+//     PolMinDepth: no policy inference below this picker depth (qsearch never pays).
+//     PolLmrThresh: quiets with from+to logit below this get one extra LMR reduction step.
+//     PolOrdMul/Shift/Clamp: scoreQuiets blend term = clamp(Mul*logit >>> Shift, +/-Clamp). ---
+let PolMinDepth = envInt "EONEGO_T_POL_MINDEPTH" 3 1 32
+let PolLmrThresh = envInt "EONEGO_T_POL_LMR" 0 -1000000 1000000
+let PolOrdMul = envInt "EONEGO_T_POL_ORDMUL" 0 0 1024
+let PolOrdShift = envInt "EONEGO_T_POL_ORDSHIFT" 8 0 16
+let PolClamp = envInt "EONEGO_T_POL_CLAMP" 4000 0 16384
+
 // --- Gravity divisors (also the bonus clamp bounds). MUST stay < 32700: the gravity fixpoint keeps
 //     |entry| <= D, so the int16 stores in History.Tables can never overflow. ---
 let MainHistD = envInt "EONEGO_T_MAINHIST_D" 7183 1024 32000

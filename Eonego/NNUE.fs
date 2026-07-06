@@ -795,6 +795,69 @@ let dumpFeatures (net: Network) (pos: Position) (ftOut: byte[]) : struct (int * 
     let evalInt = evalFromAcc net pos accW accB psqW psqB UseAvx2 UseVnni UseSparse
     struct (bucket, psqtInternal, evalInt)
 
+/// Policy-head tap (Policy.fs): fill `ft` (L1 u8, STM-perspective-first pairwise product — the exact
+/// fc_0 input) + `nnz` chunk masks (L1/32 bytes) for the CURRENT position. Incremental accumulator when
+/// bound (EnsureBothComputed — the same materialization evalInternal pays), from-scratch otherwise.
+/// Deliberately does NOT touch evalFromAcc: the value forward stays byte-identical to pre-policy builds.
+[<System.Runtime.CompilerServices.SkipLocalsInit>]
+let ftInto (net: Network) (pos: Position) (ft: Span<byte>) (nnz: Span<byte>) : unit =
+    if pos.Active then
+        pos.EnsureBothComputed()
+        let accW = pos.AccSpanComputed White
+        let accB = pos.AccSpanComputed Black
+        let stm = pos.SideToMove
+        let accUs = if stm = White then accW else accB
+        let accThem = if stm = White then accB else accW
+        ftProductInto accUs accThem ft nnz UseAvx2
+    else
+        let accWP = NativePtr.stackalloc<int16> L1
+        let accW = Span<int16>(NativePtr.toVoidPtr accWP, L1)
+        let accBP = NativePtr.stackalloc<int16> L1
+        let accB = Span<int16>(NativePtr.toVoidPtr accBP, L1)
+        let psqWP = NativePtr.stackalloc<int> PsqtBuckets
+        let psqW = Span<int>(NativePtr.toVoidPtr psqWP, PsqtBuckets)
+        let psqBP = NativePtr.stackalloc<int> PsqtBuckets
+        let psqB = Span<int>(NativePtr.toVoidPtr psqBP, PsqtBuckets)
+        buildAccProd net pos White accW psqW
+        buildAccProd net pos Black accB psqB
+        let stm = pos.SideToMove
+        let accUs = if stm = White then accW else accB
+        let accThem = if stm = White then accB else accW
+        ftProductInto accUs accThem ft nnz UseAvx2
+
+/// WDL-head tap (Policy.fs evalWDL): run the value stack forward to the a1 activation (Fc2In u8 — the
+/// fc_2 input) for the CURRENT position, from a caller-provided ft buffer already filled by `ftInto`.
+/// Returns the layer-stack bucket. Root/PV frequency only — never the per-node hot path.
+[<System.Runtime.CompilerServices.SkipLocalsInit>]
+let a1FromFt (net: Network) (pos: Position) (ft: Span<byte>) (nnz: Span<byte>) (a1out: Span<byte>) : int =
+    let bucket = (popCount pos.Occupied - 1) / 4
+    let stack = net.Stacks.[bucket]
+    let fc0Ptr = NativePtr.stackalloc<int> Fc0Out
+    let fc0 = Span<int>(NativePtr.toVoidPtr fc0Ptr, Fc0Out)
+    let concPtr = NativePtr.stackalloc<byte> Fc1In
+    let conc = Span<byte>(NativePtr.toVoidPtr concPtr, Fc1In)
+    let fc1Ptr = NativePtr.stackalloc<int> Fc1Out
+    let fc1 = Span<int>(NativePtr.toVoidPtr fc1Ptr, Fc1Out)
+
+    if UseSparse then
+        fc0GemvSparse ft nnz stack.Fc0WSparse stack.Fc0B fc0 UseVnni
+    else
+        fc0Gemv ft stack.Fc0W stack.Fc0B fc0 UseAvx2 UseVnni
+
+    for o in 0 .. 30 do
+        let x = fc0.[o]
+        conc.[o] <- byte (min 127L ((int64 x * int64 x) >>> 21))
+        conc.[31 + o] <- byte (max 0 (min 127 (x >>> 7)))
+
+    conc.[62] <- 0uy
+    conc.[63] <- 0uy
+    fc1Gemv conc stack.Fc1W stack.Fc1B fc1 UseAvx2 UseVnni
+
+    for o in 0 .. Fc2In - 1 do
+        a1out.[o] <- byte (max 0 (min 127 (fc1.[o] >>> 6)))
+
+    bucket
+
 /// Bind the net into the Position's incremental accumulator (root only). The threat enumerator is passed as
 /// a delegate so Position needn't depend on Threats. After binding, `evalInternal` reads the maintained
 /// accumulator; unbound, it falls back to the from-scratch oracle (used by tests).

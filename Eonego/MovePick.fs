@@ -112,6 +112,16 @@ type MovePick =
     val mutable PrevTo1: int
     val mutable PrevPc2: int
     val mutable PrevTo2: int
+    // Policy sidecar (null PolNet = off, the default — every factory leaves these inert; Search.fs sets
+    // them post-construction on the main picker when EONEGO_POLICY loaded a net). PolFrom/PolTo are this
+    // ply's 64-wide logit arrays (Worker-owned slices); PolKey is a 1-wide slice of the Worker's per-ply
+    // Zobrist staleness guard — logits are valid for THIS node iff PolKey[0] = Pos.Key (per-ply slots are
+    // reused across sibling nodes; a bare bool would serve a stale sibling's logits silently).
+    val mutable PolNet: Policy.PolicyNetwork
+    val mutable ValNet: NNUE.Network
+    val mutable PolFrom: Span<int>
+    val mutable PolTo: Span<int>
+    val mutable PolKey: Span<uint64>
 
     // Explicit constructor: a by-ref-like struct cannot be zero-init'd (`MovePick()` /
     // `Unchecked.defaultof` both fail — Span fields + the byref-as-generic-arg rule). The four cursors
@@ -152,7 +162,12 @@ type MovePick =
           PrevPc1 = prevPc1
           PrevTo1 = prevTo1
           PrevPc2 = prevPc2
-          PrevTo2 = prevTo2 }
+          PrevTo2 = prevTo2
+          PolNet = null
+          ValNet = Unchecked.defaultof<NNUE.Network>
+          PolFrom = Span<int>()
+          PolTo = Span<int>()
+          PolKey = Span<uint64>() }
 
 // ---------------------------------------------------------------------------
 // Helpers (module functions over byref<MovePick> so swaps/scoring persist). A move is a "capture" for
@@ -407,6 +422,35 @@ let nextMove (mp: byref<MovePick>) (skipQuiets: bool) : Move =
                 Debug.Assert((qStart + cnt <= MaxMoves), "MovePick: capture+quiet overflow")
                 mp.EndMoves <- qStart + cnt
                 scoreQuiets &mp qStart mp.EndMoves
+
+                if PosProf.Enabled then
+                    PosProf.nQuietInit <- PosProf.nQuietInit + 1L
+                    let d = if mp.Depth < 0 then 0 elif mp.Depth > 63 then 63 else mp.Depth
+                    PosProf.QuietInitByDepth.[d] <- PosProf.QuietInitByDepth.[d] + 1L
+
+                // Policy fill (lazy — only nodes that actually reach quiet scoring pay the inference,
+                // and only above PolMinDepth). The Zobrist guard makes the fill once-per-node and the
+                // arrays readable downstream (LMR term in Search.fs) for exactly this position.
+                if not (isNull mp.PolNet) && mp.Depth >= Tunables.PolMinDepth then
+                    if mp.PolKey.[0] <> mp.Pos.Key then
+                        Policy.fillLogits mp.ValNet mp.PolNet mp.Pos mp.PolFrom mp.PolTo
+                        mp.PolKey.[0] <- mp.Pos.Key
+
+                    // Ordering blend — INERT at the default PolOrdMul = 0 (Phase-0 re-scope: the LMR
+                    // term is the v1 consumption; this term buys its own SPRT later).
+                    if Tunables.PolOrdMul <> 0 then
+                        let stm = mp.Pos.SideToMove
+
+                        for i in qStart .. mp.EndMoves - 1 do
+                            let m = mp.Moves.[i]
+
+                            let ps =
+                                mp.PolFrom.[Policy.relSq stm (fromSq m)]
+                                + mp.PolTo.[Policy.relSq stm (toSq m)]
+
+                            let t = (Tunables.PolOrdMul * ps) >>> Tunables.PolOrdShift
+                            let t = max (-Tunables.PolClamp) (min Tunables.PolClamp t)
+                            mp.Scores.[i] <- mp.Scores.[i] + t
                 partialInsertionSort &mp qStart mp.EndMoves (Tunables.QuietSortLimit * mp.Depth)
                 mp.Cur <- qStart
                 mp.Stage <- StgQuiet

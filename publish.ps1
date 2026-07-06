@@ -1,4 +1,4 @@
-# Publish the NativeAOT release binary (the Fritz/ChessBase deliverable).
+# Publish the NativeAOT release binary (the shipping UCI deliverable).
 #
 # NativeAOT links with the MSVC toolchain; the link fails with an opaque "exit code 123" unless the Visual
 # Studio Installer directory (which holds vswhere.exe) is on PATH. This script puts it there, then publishes.

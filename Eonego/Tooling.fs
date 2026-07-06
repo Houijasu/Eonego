@@ -27,6 +27,8 @@ let private usage () =
     writeLine "Eonego tooling subcommands:"
     writeLine "  gen --start <fen> --games N --out <file> --net <path> [--depth D | --nodes K] [--temp T] [--seed S] [--random-plies P] [--max-plies M]"
     writeLine "  dumpft --net <path> --in <fens> --out <bin>   (trainer FT dump: 1034-byte records bucket/stm/psqt/eval/ft[1024])"
+    writeLine "  dumppolicy --net <nnue> --policy <sidecar> --in <fens> --out <txt>   (policy parity dump: fen TAB 64 from-logits TAB 64 to-logits [TAB w d l])"
+    writeLine "  tbgen --tb <dir[;dir2]> --out <file> --signatures <list> [--per-signature N] [--total N] [--seed S]   (native Syzygy-labeled records with WDL-preserving move sets)"
     writeLine "  retro <fen> [--verify]   (solve the position's retrograde signatures, print stats + its value; --verify runs the full self-consistency proof)"
 
 /// Hand-rolled `--key value` parser; returns a map of flag -> optional value.
@@ -201,7 +203,11 @@ let private searchMove
 type private PendingRec =
     { Fen: string
       Key: uint64
-      CpWhite: int }
+      CpWhite: int
+      // gen v2 (policy campaign Phase 2): the search best move at this position (STM UCI). Was
+      // computed and DISCARDED in v1 — free policy training labels. 4th `;`-field, so every v1
+      // parser (split-and-take-3) still reads v2 files.
+      BestUci: string }
 
 let private playOneGame
     (writer: StreamWriter)
@@ -234,8 +240,18 @@ let private playOneGame
                 if mvFromBook <> MoveNone then
                     mvFromBook
                 else
-                    let struct (score, _) = searchMove pos rootMoves depthOpt nodesOpt cfg (Some net)
-                    let scores = legal |> Array.map (fun _ -> score)
+                    // v1 bug: one root search score was broadcast to every legal move, making
+                    // softmaxPick uniform-random regardless of --temp. Score each move by the
+                    // static eval after making it (STM-negated) — cheap (from-scratch eval,
+                    // prefix plies only) and gives --temp its intended eval-weighted meaning.
+                    let scores =
+                        legal
+                        |> Array.map (fun m ->
+                            pos.Make m
+                            let s = -NNUE.evalCp net pos
+                            pos.Unmake m
+                            s)
+
                     softmaxPick rng temp legal scores
 
             if mv = MoveNone then
@@ -255,7 +271,9 @@ let private playOneGame
 
         if not (Double.IsNaN result) then
             for entry in pending do
-                writer.WriteLine(entry.Fen + ";" + string entry.CpWhite + ";" + result.ToString("0.0", inv))
+                writer.WriteLine(
+                    entry.Fen + ";" + string entry.CpWhite + ";" + result.ToString("0.0", inv) + ";" + entry.BestUci
+                )
 
             finished <- true
         else
@@ -265,7 +283,9 @@ let private playOneGame
                 let r = gameResult net pos ply maxPlies
 
                 for entry in pending do
-                    writer.WriteLine(entry.Fen + ";" + string entry.CpWhite + ";" + r.ToString("0.0", inv))
+                    writer.WriteLine(
+                        entry.Fen + ";" + string entry.CpWhite + ";" + r.ToString("0.0", inv) + ";" + entry.BestUci
+                    )
 
                 finished <- true
             else
@@ -276,7 +296,8 @@ let private playOneGame
                     pending.Add
                         { Fen = pos.ToFen()
                           Key = pos.Key
-                          CpWhite = cpWhite }
+                          CpWhite = cpWhite
+                          BestUci = toUCI best }
 
                 pos.Make best
                 rootMoves <- Array.append rootMoves [| best |]
@@ -287,7 +308,7 @@ let runGen (args: string[]) : int =
         let cfg = { defaultConfig with Threads = 1 }
 
         use writer = new StreamWriter(outPath, false, Encoding.UTF8)
-        writer.WriteLine("# eonego gen v1")
+        writer.WriteLine("# eonego gen v2 fen;cp_white;result_white;best_uci")
         writer.WriteLine("# start=" + startFen)
         writer.WriteLine("# games=" + string games)
         writer.WriteLine("# seed=" + string seed)
@@ -375,6 +396,282 @@ let runDumpFt (args: string[]) : int =
             0
     | _ ->
         errLine "dumpft requires --net <path> --in <fens> --out <bin>"
+        1
+
+/// Policy parity dump (trainer/policy_parity.py's engine side): for each input FEN, run the sidecar
+/// head forward from scratch and emit one text record `fen \t f0..f63 \t t0..t63 [\t w d l]`
+/// (raw i32 logits, STM-relative square order; per-mille WDL when the sidecar carries the section).
+/// The parity gate MUST include Black-to-move and promotion FENs — STM mirroring is the classic
+/// silent engine/trainer skew.
+let runDumpPolicy (args: string[]) : int =
+    let m = parseFlags args
+
+    match flag m "net", flag m "policy", flag m "in", flag m "out" with
+    | Some netPath, Some polPath, Some inPath, Some outPath ->
+        match NNUE.load netPath with
+        | NNUE.Failed r ->
+            errLine ("failed to load net: " + r)
+            1
+        | NNUE.Loaded net ->
+            match Policy.load polPath net.FtHash with
+            | Policy.PolicyFailed r ->
+                errLine ("failed to load policy: " + r)
+                1
+            | Policy.PolicyLoaded pnet ->
+                use writer = new StreamWriter(File.Create outPath)
+                let fromL = Array.zeroCreate<int> 64
+                let toL = Array.zeroCreate<int> 64
+                let mutable count = 0
+
+                for line in File.ReadLines inPath do
+                    let t = line.Trim()
+
+                    if t.Length > 0 && not (t.StartsWith "#") then
+                        let fen = t.Split(';').[0].Trim()
+                        let pos = Position.OfFen fen
+                        Policy.fillLogits net pnet pos (fromL.AsSpan()) (toL.AsSpan())
+                        let sb = Text.StringBuilder(1024)
+                        sb.Append(fen).Append('\t') |> ignore
+
+                        for i in 0 .. 63 do
+                            (if i > 0 then sb.Append(' ') else sb).Append(fromL.[i]) |> ignore
+
+                        sb.Append('\t') |> ignore
+
+                        for i in 0 .. 63 do
+                            (if i > 0 then sb.Append(' ') else sb).Append(toL.[i]) |> ignore
+
+                        if pnet.HasWdl then
+                            let struct (w, d, l) = Policy.evalWDL net pnet pos
+                            sb.Append('\t').Append(w).Append(' ').Append(d).Append(' ').Append(l) |> ignore
+
+                        writer.WriteLine(sb.ToString())
+                        count <- count + 1
+
+                writer.Flush()
+                writeLine ("dumped " + string count + " policy records to " + outPath)
+                0
+    | _ ->
+        errLine "dumppolicy requires --net <nnue> --policy <sidecar> --in <fens> --out <txt>"
+        1
+
+/// Syzygy-labeled endgame generator (`tbgen`) — NATIVE probing via Syzygy.fs (the python-chess
+/// prober in trainer/policy_endgen.py is orders of magnitude slower and dies natively on rare
+/// blocks; this replaces it for bulk generation). Samples random legal positions per material
+/// signature, probes every child, and emits gen-v2 records PLUS a 5th field: the FULL set of
+/// WDL-preserving moves. That set is the policy head's trainable definition of "100% correct
+/// play" — never worsen the theoretical result — as opposed to DTZ-argmax, which no shippable
+/// net can memorize. Cursed wins / blessed losses count as draws (50-move-aware).
+///   tbgen --tb <dir[;dir2]> --out <file> --signatures "KQvK,KRvK,..." [--per-signature N]
+///         [--total N] [--seed S]
+/// Record: fen;cp_white;result_white;best_uci;good1 good2 ...   (best = first of the good set)
+let runTbGen (args: string[]) : int =
+    let m = parseFlags args
+
+    match flag m "tb", flag m "out", flag m "signatures" with
+    | Some tbPath, Some outPath, Some sigSpec ->
+        if not (Syzygy.init tbPath) || Syzygy.Largest = 0 then
+            errLine ("tbgen: no tables found under " + tbPath)
+            1
+        else
+            let perSig = flagInt m "per-signature" 5000
+            let totalCap = flagInt m "total" 1_000_000
+            let seed = flagInt m "seed" 42
+            let rng = Random(seed)
+
+            let ptOfChar c =
+                match c with
+                | 'P' -> Pawn
+                | 'N' -> Knight
+                | 'B' -> Bishop
+                | 'R' -> Rook
+                | 'Q' -> Queen
+                | _ -> failwith ("tbgen: bad piece char " + string c)
+
+            let fenChar (white: bool) (pt: int) =
+                let c = "pnbrqk".[pt]
+                if white then Char.ToUpperInvariant c else c
+
+            // Build a FEN for a random placement; None when the placement is structurally illegal.
+            let tryBuildFen (strong: int[]) (weak: int[]) : string option =
+                let n = 2 + strong.Length + weak.Length
+                let squares = HashSet<int>()
+
+                while squares.Count < n do
+                    squares.Add(rng.Next 64) |> ignore
+
+                let sq = Array.ofSeq squares
+                let wk = sq.[0]
+                let bk = sq.[1]
+                let board = Array.create 64 ' '
+                board.[wk] <- 'K'
+                board.[bk] <- 'k'
+                let mutable ok = abs (fileOf wk - fileOf bk) > 1 || abs (rankOf wk - rankOf bk) > 1
+
+                let place (idx: int) (white: bool) (pt: int) =
+                    let s = sq.[idx]
+
+                    if pt = Pawn && (s < 8 || s >= 56) then
+                        ok <- false
+                    else
+                        board.[s] <- fenChar white pt
+
+                strong |> Array.iteri (fun i pt -> place (2 + i) true pt)
+                weak |> Array.iteri (fun i pt -> place (2 + strong.Length + i) false pt)
+
+                if not ok then
+                    None
+                else
+                    let sb = StringBuilder(80)
+
+                    for r in 7 .. -1 .. 0 do
+                        let mutable empty = 0
+
+                        for f in 0 .. 7 do
+                            let c = board.[r * 8 + f]
+
+                            if c = ' ' then
+                                empty <- empty + 1
+                            else
+                                if empty > 0 then
+                                    sb.Append(empty) |> ignore
+                                    empty <- 0
+
+                                sb.Append(c) |> ignore
+
+                        if empty > 0 then
+                            sb.Append(empty) |> ignore
+
+                        if r > 0 then
+                            sb.Append('/') |> ignore
+
+                    sb.Append(if rng.Next 2 = 0 then " w - - 0 1" else " b - - 0 1") |> ignore
+                    Some(sb.ToString())
+
+            use writer = new StreamWriter(outPath, false, Encoding.UTF8)
+            writer.WriteLine("# eonego tbgen v2 fen;cp_white;result_white;best_uci;good_ucis;quiet_ucis")
+            let mutable keptTotal = 0
+
+            for sigRaw in sigSpec.Split(',') do
+                let sigName = sigRaw.Trim()
+
+                if sigName.Length > 0 && keptTotal < totalCap then
+                    let halves = sigName.Split('v')
+                    let strong = halves.[0].[1..].ToCharArray() |> Array.map ptOfChar
+                    let weak = halves.[1].[1..].ToCharArray() |> Array.map ptOfChar
+                    let seen = HashSet<uint64>()
+                    let mutable kept = 0
+                    let mutable tries = 0
+                    let budget = perSig * 60
+
+                    while kept < perSig && tries < budget && keptTotal < totalCap do
+                        tries <- tries + 1
+
+                        match tryBuildFen strong weak with
+                        | None -> ()
+                        | Some fen ->
+                            let pos = Position.OfFen fen
+                            let us = pos.SideToMove
+                            let them = us ^^^ 1
+
+                            let illegal =
+                                pos.AttackersTo (pos.KingSquare them) pos.Occupied &&& pos.ColorBB(us) <> 0UL
+
+                            if not illegal && seen.Add pos.Key then
+                                let legal = collectLegal pos
+
+                                if legal.Length >= 2 && Syzygy.probeWDL pos <> Int32.MinValue then
+                                    // probeWDL is Fathom's -2..+2 scale, SIDE-TO-MOVE relative
+                                    // (-2 loss, 0 draw, +2 win, +/-1 cursed/blessed — exactly how
+                                    // Search.fs consumes it). Value of each move from the MOVER's
+                                    // perspective = the negated child probe. A bare KvK child has
+                                    // no table: exact draw (0).
+                                    let vals = Array.zeroCreate legal.Length
+                                    let mutable allOk = true
+
+                                    for i in 0 .. legal.Length - 1 do
+                                        pos.Make legal.[i]
+
+                                        vals.[i] <-
+                                            if popCount pos.Occupied = 2 then
+                                                0
+                                            else
+                                                let w = Syzygy.probeWDL pos
+                                                if w = Int32.MinValue then allOk <- false
+                                                -w
+
+                                        pos.Unmake legal.[i]
+
+                                    if allOk then
+                                        let bestVal = Array.max vals
+
+                                        let good =
+                                            [| for i in 0 .. legal.Length - 1 do
+                                                   if vals.[i] = bestVal then yield legal.[i] |]
+
+                                        // stm-relative outcome under best play; cursed/blessed = draw.
+                                        let resStm =
+                                            if bestVal >= 2 then 1.0
+                                            elif bestVal <= -2 then 0.0
+                                            else 0.5
+
+                                        let resWhite = if us = White then resStm else 1.0 - resStm
+                                        let cpStm = int ((resStm - 0.5) * 2000.0)
+                                        let cpWhite = if us = White then cpStm else -cpStm
+                                        let goods = good |> Array.map toUCI |> String.concat " "
+
+                                        // 6th field: ALL legal quiets (engine isQuiet) — lets the
+                                        // trainer build the quiet-conditional softmax support by
+                                        // pure text parsing (no python-side movegen over millions
+                                        // of rows).
+                                        let quiets =
+                                            legal
+                                            |> Array.filter (fun q ->
+                                                pos.PieceOn(toSq q) = NoPiece
+                                                && not (isEnPassant q)
+                                                && not (isPromotion q))
+                                            |> Array.map toUCI
+                                            |> String.concat " "
+
+                                        writer.WriteLine(
+                                            fen + ";" + string cpWhite + ";" + resWhite.ToString("0.0", inv)
+                                            + ";" + toUCI good.[0] + ";" + goods + ";" + quiets
+                                        )
+
+                                        kept <- kept + 1
+                                        keptTotal <- keptTotal + 1
+
+                    writeLine (sigName + ": kept " + string kept + " (" + string tries + " tries)")
+
+            writer.Flush()
+            writeLine ("TOTAL " + string keptTotal + " records -> " + outPath)
+            0
+    | _ ->
+        errLine "tbgen requires --tb <dir[;dir2]> --out <file> --signatures <list>"
+        1
+
+/// `tbprobe --tb <dir> <fen>` — raw Syzygy.probeWDL of the position and every legal child
+/// (debug surface for tbgen label verification; child values shown MOVER-relative, 4 - w).
+let runTbProbe (args: string[]) : int =
+    let m = parseFlags args
+
+    match flag m "tb" with
+    | Some tbPath when Syzygy.init tbPath ->
+        // Everything after `--tb <dir>` is the FEN.
+        let tbIdx = Array.findIndex ((=) "--tb") args
+        let fen = args.[tbIdx + 2 ..] |> String.concat " "
+        let pos = Position.OfFen fen
+        writeLine ("root probeWDL (stm-rel, -2=loss..+2=win): " + string (Syzygy.probeWDL pos))
+
+        for mv in collectLegal pos do
+            pos.Make mv
+            let w = if popCount pos.Occupied = 2 then 0 else Syzygy.probeWDL pos
+            pos.Unmake mv
+            writeLine (toUCI mv + ": child=" + string w + " moverVal=" + string (-w))
+
+        0
+    | _ ->
+        errLine "tbprobe requires --tb <dir> <fen>"
         1
 
 /// `retro <fen> [--verify]` — synchronously solve the position's retrograde signature closure,
