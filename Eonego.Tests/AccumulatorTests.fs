@@ -38,10 +38,29 @@ let ``addFeature AVX2 equals scalar over random rows`` () =
     for trial in 0 .. 200 do
         let idx = rng.Next(0, nFeatures)
         let sign = if rng.Next(0, 2) = 0 then 1 else -1
-        addFeature accA psqtA ftWeights ftPsqt idx sign false  // scalar
-        addFeature accB psqtB ftWeights ftPsqt idx sign true   // avx2
+        addFeature accA psqtA ftWeights ftPsqt idx sign false false // scalar
+        addFeature accB psqtB ftWeights ftPsqt idx sign false true   // avx2
     Assert.Equal<int16[]>(accA, accB) // scalar==AVX2 wrap agreement through int16 overflow
     Assert.Equal<int[]>(psqtA, psqtB)
+
+[<Fact>]
+let ``addFeature AVX-512 equals scalar over random rows`` () =
+    if System.Runtime.Intrinsics.X86.Avx512BW.IsSupported then
+        let rng = System.Random(12345)
+        let nFeatures = 64
+        let ftWeights = Array.init (nFeatures * L1) (fun _ -> int16 (rng.Next(-32768, 32768)))
+        let ftPsqt = Array.init (nFeatures * PsqtBuckets) (fun _ -> rng.Next(-100000, 100000))
+        let accA = Array.init L1 (fun _ -> int16 (rng.Next(-32768, 32768)))
+        let accB = Array.copy accA
+        let psqtA = Array.zeroCreate<int> PsqtBuckets
+        let psqtB = Array.zeroCreate<int> PsqtBuckets
+        for trial in 0 .. 200 do
+            let idx = rng.Next(0, nFeatures)
+            let sign = if rng.Next(0, 2) = 0 then 1 else -1
+            addFeature accA psqtA ftWeights ftPsqt idx sign false false
+            addFeature accB psqtB ftWeights ftPsqt idx sign true false
+        Assert.Equal<int16[]>(accA, accB)
+        Assert.Equal<int[]>(psqtA, psqtB)
 
 [<Fact>]
 let ``addThreat AVX2 equals scalar over random rows`` () =
@@ -57,11 +76,66 @@ let ``addThreat AVX2 equals scalar over random rows`` () =
     for _ in 0 .. 200 do
         let idx = rng.Next(0, nFeatures)
         let sign = if rng.Next(0, 2) = 0 then 1 else -1
-        addThreatAt accA 0 psqtA 0 threatWeights 0 threatPsqt idx sign false
-        addThreatAt accB 0 psqtB 0 threatWeights 0 threatPsqt idx sign true
+        addThreatAt accA 0 psqtA 0 threatWeights 0 threatPsqt idx sign false false
+        addThreatAt accB 0 psqtB 0 threatWeights 0 threatPsqt idx sign false true
 
     Assert.Equal<int16[]>(accA, accB) // scalar==AVX2 wrap agreement through int16 overflow
     Assert.Equal<int[]>(psqtA, psqtB)
+
+[<Fact>]
+let ``addThreat AVX-512 equals scalar over random rows`` () =
+    if System.Runtime.Intrinsics.X86.Avx512BW.IsSupported then
+        let rng = System.Random(67890)
+        let nFeatures = 64
+        let threatWeights = Array.init (nFeatures * L1) (fun _ -> sbyte (rng.Next(-128, 128)))
+        let threatPsqt = Array.init (nFeatures * PsqtBuckets) (fun _ -> rng.Next(-100000, 100000))
+        let accA = Array.init L1 (fun _ -> int16 (rng.Next(-32768, 32768)))
+        let accB = Array.copy accA
+        let psqtA = Array.zeroCreate<int> PsqtBuckets
+        let psqtB = Array.zeroCreate<int> PsqtBuckets
+
+        for _ in 0 .. 200 do
+            let idx = rng.Next(0, nFeatures)
+            let sign = if rng.Next(0, 2) = 0 then 1 else -1
+            addThreatAt accA 0 psqtA 0 threatWeights 0 threatPsqt idx sign false false
+            addThreatAt accB 0 psqtB 0 threatWeights 0 threatPsqt idx sign true false
+
+        Assert.Equal<int16[]>(accA, accB)
+        Assert.Equal<int[]>(psqtA, psqtB)
+
+[<Fact>]
+let ``addThreatPair kernels match scalar across SIMD modes`` () =
+    let rng = System.Random(24680)
+    let nFeatures = 64
+    let threatWeights = Array.init (nFeatures * L1) (fun _ -> sbyte (rng.Next(-128, 128)))
+    let threatPsqt = Array.init (nFeatures * PsqtBuckets) (fun _ -> rng.Next(-100000, 100000))
+    let acc0 = Array.init L1 (fun _ -> int16 (rng.Next(-32768, 32768)))
+    let psqt0 = Array.zeroCreate<int> PsqtBuckets
+    let paths =
+        [ false, false
+          false, true
+          true, false ]
+        |> List.filter (fun (useAvx512, _) -> not useAvx512 || System.Runtime.Intrinsics.X86.Avx512BW.IsSupported)
+
+    for _ in 0 .. 128 do
+        let subIdx = rng.Next(0, nFeatures)
+        let addIdx = rng.Next(0, nFeatures)
+        let subIdx1 = rng.Next(0, nFeatures)
+        let addIdx1 = rng.Next(0, nFeatures)
+
+        let results =
+            paths
+            |> List.map (fun (useAvx512, useAvx2) ->
+                let acc = Array.copy acc0
+                let psqt = Array.copy psqt0
+                addThreatPairAt acc 0 psqt 0 threatWeights threatPsqt subIdx addIdx useAvx512 useAvx2
+                addThreatPair2At acc 0 psqt 0 threatWeights threatPsqt subIdx addIdx subIdx1 addIdx1 useAvx512 useAvx2
+                struct (acc, psqt))
+
+        let struct (refAcc, refPsqt) = List.head results
+        for struct (acc, psqt) in results do
+            Assert.Equal<int16[]>(refAcc, acc)
+            Assert.Equal<int[]>(refPsqt, psqt)
 
 // The fused single-pass kernel must equal a sequence of the feature-outer reference kernels, for both SIMD
 // modes, for in-place AND parent->child (src<>dst) variants, and across the multi-pass chunking threshold
@@ -76,8 +150,15 @@ let ``applyFused equals sequential reference kernels (in-place, src->dst, chunke
     let thrW = Array.init (nThrRows * L1) (fun _ -> sbyte (rng.Next(-128, 128)))
     let thrPsqt = Array.init (nThrRows * PsqtBuckets) (fun _ -> rng.Next(-100000, 100000))
 
-    for useAvx2 in [ false; true ] do
-        if not useAvx2 || System.Runtime.Intrinsics.X86.Avx2.IsSupported then
+    let paths =
+        [ false, false
+          false, true
+          true, false ]
+        |> List.filter (fun (useAvx512, _) ->
+            (not useAvx512 || System.Runtime.Intrinsics.X86.Avx512BW.IsSupported))
+
+    for useAvx512, useAvx2 in paths do
+        if (not useAvx2 || System.Runtime.Intrinsics.X86.Avx2.IsSupported) then
             for trial in 0 .. 24 do
                 // Row-list sizes sweep from tiny to well past FusedMaxRowsPerPass (chunked path).
                 let nHA = rng.Next(0, 9)
@@ -96,16 +177,16 @@ let ``applyFused equals sequential reference kernels (in-place, src->dst, chunke
                 let refPsq = Array.copy srcPsq
 
                 for idx in halfAdd do
-                    addFeature refAcc refPsq halfW halfPsqt idx 1 useAvx2
+                    addFeature refAcc refPsq halfW halfPsqt idx 1 useAvx512 useAvx2
 
                 for idx in halfSub do
-                    addFeature refAcc refPsq halfW halfPsqt idx -1 useAvx2
+                    addFeature refAcc refPsq halfW halfPsqt idx -1 useAvx512 useAvx2
 
                 for idx in thrAdd do
-                    addThreatAt refAcc 0 refPsq 0 thrW 0 thrPsqt idx 1 useAvx2
+                    addThreatAt refAcc 0 refPsq 0 thrW 0 thrPsqt idx 1 useAvx512 useAvx2
 
                 for idx in thrSub do
-                    addThreatAt refAcc 0 refPsq 0 thrW 0 thrPsqt idx -1 useAvx2
+                    addThreatAt refAcc 0 refPsq 0 thrW 0 thrPsqt idx -1 useAvx512 useAvx2
 
                 // Fused, parent->child: dst is a separate buffer.
                 let dst = Array.zeroCreate<int16> L1
@@ -113,7 +194,7 @@ let ``applyFused equals sequential reference kernels (in-place, src->dst, chunke
 
                 applyFused
                     src 0 dst 0 srcPsq 0 dstPsq 0 halfW 0 halfPsqt thrW 0 thrPsqt
-                    halfAdd nHA halfSub nHS thrAdd nTA thrSub nTS useAvx2
+                    halfAdd nHA halfSub nHS thrAdd nTA thrSub nTS useAvx512 useAvx2
 
                 Assert.Equal<int16[]>(refAcc, dst)
                 Assert.Equal<int[]>(refPsq, dstPsq)
@@ -124,7 +205,7 @@ let ``applyFused equals sequential reference kernels (in-place, src->dst, chunke
 
                 applyFused
                     inPlace 0 inPlace 0 inPlacePsq 0 inPlacePsq 0 halfW 0 halfPsqt thrW 0 thrPsqt
-                    halfAdd nHA halfSub nHS thrAdd nTA thrSub nTS useAvx2
+                    halfAdd nHA halfSub nHS thrAdd nTA thrSub nTS useAvx512 useAvx2
 
                 Assert.Equal<int16[]>(refAcc, inPlace)
                 Assert.Equal<int[]>(refPsq, inPlacePsq)

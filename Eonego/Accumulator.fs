@@ -22,6 +22,13 @@ let PsqtBuckets = 8
 let UseAvx2 =
     Avx2.IsSupported && System.Environment.GetEnvironmentVariable("EONEGO_FORCE_SCALAR") <> "1"
 
+/// AVX-512 is used when the CPU supports it, scalar isn't forced, and the AVX-512 opt-out isn't set.
+let UseAvx512 =
+    Avx512F.IsSupported
+    && Avx512BW.IsSupported
+    && System.Environment.GetEnvironmentVariable("EONEGO_FORCE_SCALAR") <> "1"
+    && System.Environment.GetEnvironmentVariable("EONEGO_FORCE_NOAVX512") <> "1"
+
 /// Pinned (POH) allocation whose usable region starts 64-byte aligned: returns the array plus the element
 /// offset of the aligned region. Managed array bases land at arbitrary 8B residues (measured 16/24/32/40/56
 /// mod 64 on this runtime), which makes ~50% of the 32B accumulator/weight-row vector ops split cache lines;
@@ -124,11 +131,47 @@ let addFeatureAt
     (ftPsqt: int[])
     (idx: int)
     (sign: int)
+    (useAvx512: bool)
     (useAvx2: bool)
     =
     let wb = ftWOff + idx * L1
 
-    if useAvx2 then
+    if useAvx512 then
+        let accBase = &MemoryMarshal.GetArrayDataReference acc
+        let wBase = &MemoryMarshal.GetArrayDataReference ftWeights
+        let mutable j = 0
+
+        if sign > 0 then
+            while j < L1 do
+                let w0 = Vector512.LoadUnsafe(&wBase, unativeint (wb + j))
+                let w1 = Vector512.LoadUnsafe(&wBase, unativeint (wb + j + 32))
+                let w2 = Vector512.LoadUnsafe(&wBase, unativeint (wb + j + 64))
+                let w3 = Vector512.LoadUnsafe(&wBase, unativeint (wb + j + 96))
+                let cur0 = Vector512.LoadUnsafe(&accBase, unativeint (accOff + j))
+                let cur1 = Vector512.LoadUnsafe(&accBase, unativeint (accOff + j + 32))
+                let cur2 = Vector512.LoadUnsafe(&accBase, unativeint (accOff + j + 64))
+                let cur3 = Vector512.LoadUnsafe(&accBase, unativeint (accOff + j + 96))
+                Vector512.StoreUnsafe(cur0 + w0, &accBase, unativeint (accOff + j))
+                Vector512.StoreUnsafe(cur1 + w1, &accBase, unativeint (accOff + j + 32))
+                Vector512.StoreUnsafe(cur2 + w2, &accBase, unativeint (accOff + j + 64))
+                Vector512.StoreUnsafe(cur3 + w3, &accBase, unativeint (accOff + j + 96))
+                j <- j + 128
+        else
+            while j < L1 do
+                let w0 = Vector512.LoadUnsafe(&wBase, unativeint (wb + j))
+                let w1 = Vector512.LoadUnsafe(&wBase, unativeint (wb + j + 32))
+                let w2 = Vector512.LoadUnsafe(&wBase, unativeint (wb + j + 64))
+                let w3 = Vector512.LoadUnsafe(&wBase, unativeint (wb + j + 96))
+                let cur0 = Vector512.LoadUnsafe(&accBase, unativeint (accOff + j))
+                let cur1 = Vector512.LoadUnsafe(&accBase, unativeint (accOff + j + 32))
+                let cur2 = Vector512.LoadUnsafe(&accBase, unativeint (accOff + j + 64))
+                let cur3 = Vector512.LoadUnsafe(&accBase, unativeint (accOff + j + 96))
+                Vector512.StoreUnsafe(cur0 - w0, &accBase, unativeint (accOff + j))
+                Vector512.StoreUnsafe(cur1 - w1, &accBase, unativeint (accOff + j + 32))
+                Vector512.StoreUnsafe(cur2 - w2, &accBase, unativeint (accOff + j + 64))
+                Vector512.StoreUnsafe(cur3 - w3, &accBase, unativeint (accOff + j + 96))
+                j <- j + 128
+    elif useAvx2 then
         // Base-ref + element-offset loads/stores skip the per-iteration array bounds checks the JIT can't elide
         // when accOff/wb are runtime values. 16 int16 lanes/iter (vpaddw/vpsubw); bit-identical to scalar.
         let accBase = &MemoryMarshal.GetArrayDataReference acc
@@ -168,12 +211,36 @@ let addFeaturePairAt
     (ftPsqt: int[])
     (subIdx: int)
     (addIdx: int)
+    (useAvx512: bool)
     (useAvx2: bool)
     =
     let subBase = subIdx * L1
     let addBase = addIdx * L1
 
-    if useAvx2 then
+    if useAvx512 then
+        let accBase = &MemoryMarshal.GetArrayDataReference acc
+        let wBase = &MemoryMarshal.GetArrayDataReference ftWeights
+        let mutable j = 0
+
+        while j < L1 do
+            let cur0 = Vector512.LoadUnsafe(&accBase, unativeint (accOff + j))
+            let cur1 = Vector512.LoadUnsafe(&accBase, unativeint (accOff + j + 32))
+            let cur2 = Vector512.LoadUnsafe(&accBase, unativeint (accOff + j + 64))
+            let cur3 = Vector512.LoadUnsafe(&accBase, unativeint (accOff + j + 96))
+            let add0 = Vector512.LoadUnsafe(&wBase, unativeint (addBase + j))
+            let add1 = Vector512.LoadUnsafe(&wBase, unativeint (addBase + j + 32))
+            let add2 = Vector512.LoadUnsafe(&wBase, unativeint (addBase + j + 64))
+            let add3 = Vector512.LoadUnsafe(&wBase, unativeint (addBase + j + 96))
+            let sub0 = Vector512.LoadUnsafe(&wBase, unativeint (subBase + j))
+            let sub1 = Vector512.LoadUnsafe(&wBase, unativeint (subBase + j + 32))
+            let sub2 = Vector512.LoadUnsafe(&wBase, unativeint (subBase + j + 64))
+            let sub3 = Vector512.LoadUnsafe(&wBase, unativeint (subBase + j + 96))
+            Vector512.StoreUnsafe(cur0 + add0 - sub0, &accBase, unativeint (accOff + j))
+            Vector512.StoreUnsafe(cur1 + add1 - sub1, &accBase, unativeint (accOff + j + 32))
+            Vector512.StoreUnsafe(cur2 + add2 - sub2, &accBase, unativeint (accOff + j + 64))
+            Vector512.StoreUnsafe(cur3 + add3 - sub3, &accBase, unativeint (accOff + j + 96))
+            j <- j + 128
+    elif useAvx2 then
         let accBase = &MemoryMarshal.GetArrayDataReference acc
         let wBase = &MemoryMarshal.GetArrayDataReference ftWeights
         let mutable j = 0
@@ -198,8 +265,8 @@ let addFeaturePairAt
 
 /// Zero-offset compatibility wrapper.
 [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-let addFeature (acc: int16[]) (psqt: int[]) (ftWeights: int16[]) (ftPsqt: int[]) (idx: int) (sign: int) (useAvx2: bool) =
-    addFeatureAt acc 0 psqt 0 ftWeights 0 ftPsqt idx sign useAvx2
+let addFeature (acc: int16[]) (psqt: int[]) (ftWeights: int16[]) (ftPsqt: int[]) (idx: int) (sign: int) (useAvx512: bool) (useAvx2: bool) =
+    addFeatureAt acc 0 psqt 0 ftWeights 0 ftPsqt idx sign useAvx512 useAvx2
 
 /// As addFeatureAt but for a FullThreats feature (int8 weights -> int16 accumulator, int32 psqt).
 [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
@@ -213,11 +280,47 @@ let addThreatAt
     (threatPsqt: int[])
     (idx: int)
     (sign: int)
+    (useAvx512: bool)
     (useAvx2: bool)
     =
     let wb = thrWOff + idx * L1
 
-    if useAvx2 then
+    if useAvx512 then
+        let accBase = &MemoryMarshal.GetArrayDataReference acc
+        let wBase = &MemoryMarshal.GetArrayDataReference threatWeights
+        let mutable j = 0
+
+        if sign > 0 then
+            while j < L1 do
+                let w0 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (wb + j)))
+                let w1 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (wb + j + 32)))
+                let w2 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (wb + j + 64)))
+                let w3 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (wb + j + 96)))
+                let cur0 = Vector512.LoadUnsafe(&accBase, unativeint (accOff + j))
+                let cur1 = Vector512.LoadUnsafe(&accBase, unativeint (accOff + j + 32))
+                let cur2 = Vector512.LoadUnsafe(&accBase, unativeint (accOff + j + 64))
+                let cur3 = Vector512.LoadUnsafe(&accBase, unativeint (accOff + j + 96))
+                Vector512.StoreUnsafe(cur0 + w0, &accBase, unativeint (accOff + j))
+                Vector512.StoreUnsafe(cur1 + w1, &accBase, unativeint (accOff + j + 32))
+                Vector512.StoreUnsafe(cur2 + w2, &accBase, unativeint (accOff + j + 64))
+                Vector512.StoreUnsafe(cur3 + w3, &accBase, unativeint (accOff + j + 96))
+                j <- j + 128
+        else
+            while j < L1 do
+                let w0 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (wb + j)))
+                let w1 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (wb + j + 32)))
+                let w2 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (wb + j + 64)))
+                let w3 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (wb + j + 96)))
+                let cur0 = Vector512.LoadUnsafe(&accBase, unativeint (accOff + j))
+                let cur1 = Vector512.LoadUnsafe(&accBase, unativeint (accOff + j + 32))
+                let cur2 = Vector512.LoadUnsafe(&accBase, unativeint (accOff + j + 64))
+                let cur3 = Vector512.LoadUnsafe(&accBase, unativeint (accOff + j + 96))
+                Vector512.StoreUnsafe(cur0 - w0, &accBase, unativeint (accOff + j))
+                Vector512.StoreUnsafe(cur1 - w1, &accBase, unativeint (accOff + j + 32))
+                Vector512.StoreUnsafe(cur2 - w2, &accBase, unativeint (accOff + j + 64))
+                Vector512.StoreUnsafe(cur3 - w3, &accBase, unativeint (accOff + j + 96))
+                j <- j + 128
+    elif useAvx2 then
         // sign-extend int8 weights to int16 (vpmovsxbw) and add/subtract 16 int16 lanes at a time; base-ref +
         // offset loads/stores skip the per-iteration bounds checks (bit-identical to the scalar form).
         let accBase = &MemoryMarshal.GetArrayDataReference acc
@@ -259,12 +362,36 @@ let addThreatPairAt
     (threatPsqt: int[])
     (subIdx: int)
     (addIdx: int)
+    (useAvx512: bool)
     (useAvx2: bool)
     =
     let subBase = subIdx * L1
     let addBase = addIdx * L1
 
-    if useAvx2 then
+    if useAvx512 then
+        let accBase = &MemoryMarshal.GetArrayDataReference acc
+        let wBase = &MemoryMarshal.GetArrayDataReference threatWeights
+        let mutable j = 0
+
+        while j < L1 do
+            let cur0 = Vector512.LoadUnsafe(&accBase, unativeint (accOff + j))
+            let cur1 = Vector512.LoadUnsafe(&accBase, unativeint (accOff + j + 32))
+            let cur2 = Vector512.LoadUnsafe(&accBase, unativeint (accOff + j + 64))
+            let cur3 = Vector512.LoadUnsafe(&accBase, unativeint (accOff + j + 96))
+            let add0 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (addBase + j)))
+            let add1 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (addBase + j + 32)))
+            let add2 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (addBase + j + 64)))
+            let add3 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (addBase + j + 96)))
+            let sub0 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (subBase + j)))
+            let sub1 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (subBase + j + 32)))
+            let sub2 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (subBase + j + 64)))
+            let sub3 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (subBase + j + 96)))
+            Vector512.StoreUnsafe(cur0 + add0 - sub0, &accBase, unativeint (accOff + j))
+            Vector512.StoreUnsafe(cur1 + add1 - sub1, &accBase, unativeint (accOff + j + 32))
+            Vector512.StoreUnsafe(cur2 + add2 - sub2, &accBase, unativeint (accOff + j + 64))
+            Vector512.StoreUnsafe(cur3 + add3 - sub3, &accBase, unativeint (accOff + j + 96))
+            j <- j + 128
+    elif useAvx2 then
         let accBase = &MemoryMarshal.GetArrayDataReference acc
         let wBase = &MemoryMarshal.GetArrayDataReference threatWeights
         let mutable j = 0
@@ -301,6 +428,7 @@ let addThreatPair2At
     (addIdx0: int)
     (subIdx1: int)
     (addIdx1: int)
+    (useAvx512: bool)
     (useAvx2: bool)
     =
     let subBase0 = subIdx0 * L1
@@ -308,7 +436,42 @@ let addThreatPair2At
     let subBase1 = subIdx1 * L1
     let addBase1 = addIdx1 * L1
 
-    if useAvx2 then
+    if useAvx512 then
+        let accBase = &MemoryMarshal.GetArrayDataReference acc
+        let wBase = &MemoryMarshal.GetArrayDataReference threatWeights
+        let mutable j = 0
+
+        while j < L1 do
+            let cur0 = Vector512.LoadUnsafe(&accBase, unativeint (accOff + j))
+            let cur1 = Vector512.LoadUnsafe(&accBase, unativeint (accOff + j + 32))
+            let cur2 = Vector512.LoadUnsafe(&accBase, unativeint (accOff + j + 64))
+            let cur3 = Vector512.LoadUnsafe(&accBase, unativeint (accOff + j + 96))
+            let add00 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (addBase0 + j)))
+            let sub00 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (subBase0 + j)))
+            let add10 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (addBase1 + j)))
+            let sub10 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (subBase1 + j)))
+            let add01 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (addBase0 + j + 32)))
+            let sub01 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (subBase0 + j + 32)))
+            let add11 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (addBase1 + j + 32)))
+            let sub11 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (subBase1 + j + 32)))
+            let add02 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (addBase0 + j + 64)))
+            let sub02 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (subBase0 + j + 64)))
+            let add12 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (addBase1 + j + 64)))
+            let sub12 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (subBase1 + j + 64)))
+            let add03 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (addBase0 + j + 96)))
+            let sub03 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (subBase0 + j + 96)))
+            let add13 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (addBase1 + j + 96)))
+            let sub13 = Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&wBase, unativeint (subBase1 + j + 96)))
+            let delta0 = (add00 + add10) - (sub00 + sub10)
+            let delta1 = (add01 + add11) - (sub01 + sub11)
+            let delta2 = (add02 + add12) - (sub02 + sub12)
+            let delta3 = (add03 + add13) - (sub03 + sub13)
+            Vector512.StoreUnsafe(cur0 + delta0, &accBase, unativeint (accOff + j))
+            Vector512.StoreUnsafe(cur1 + delta1, &accBase, unativeint (accOff + j + 32))
+            Vector512.StoreUnsafe(cur2 + delta2, &accBase, unativeint (accOff + j + 64))
+            Vector512.StoreUnsafe(cur3 + delta3, &accBase, unativeint (accOff + j + 96))
+            j <- j + 128
+    elif useAvx2 then
         let accBase = &MemoryMarshal.GetArrayDataReference acc
         let wBase = &MemoryMarshal.GetArrayDataReference threatWeights
         let mutable j = 0
@@ -352,7 +515,7 @@ let addThreatPair2At
 /// Zero-offset compatibility wrapper.
 [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
 let addThreat (acc: int16[]) (psqt: int[]) (threatWeights: sbyte[]) (threatPsqt: int[]) (idx: int) (sign: int) =
-    addThreatAt acc 0 psqt 0 threatWeights 0 threatPsqt idx sign UseAvx2
+    addThreatAt acc 0 psqt 0 threatWeights 0 threatPsqt idx sign UseAvx512 UseAvx2
 
 // ---------------------------------------------------------------------------
 // Fused apply: ONE register-tiled pass over the accumulator applying ALL of a
@@ -407,9 +570,69 @@ let private applyFusedPass
     (thrSub: int[])
     (tsOff: int)
     (tsN: int)
+    (useAvx512: bool)
     (useAvx2: bool)
     =
-    if useAvx2 then
+    if useAvx512 then
+        let srcBase = &MemoryMarshal.GetArrayDataReference srcAcc
+        let dstBase = &MemoryMarshal.GetArrayDataReference dstAcc
+        let hwBase = &MemoryMarshal.GetArrayDataReference halfW
+        let twBase = &MemoryMarshal.GetArrayDataReference thrW
+
+        let mutable t = 0
+
+        while t < L1 do
+            let mutable a0 = Vector512.LoadUnsafe(&srcBase, unativeint (srcOff + t))
+            let mutable a1 = Vector512.LoadUnsafe(&srcBase, unativeint (srcOff + t + 32))
+            let mutable a2 = Vector512.LoadUnsafe(&srcBase, unativeint (srcOff + t + 64))
+            let mutable a3 = Vector512.LoadUnsafe(&srcBase, unativeint (srcOff + t + 96))
+
+            let mutable k = 0
+
+            while k < haN do
+                let rb = hwOff + halfAdd.[haOff + k] * L1 + t
+                a0 <- a0 + Vector512.LoadUnsafe(&hwBase, unativeint rb)
+                a1 <- a1 + Vector512.LoadUnsafe(&hwBase, unativeint (rb + 32))
+                a2 <- a2 + Vector512.LoadUnsafe(&hwBase, unativeint (rb + 64))
+                a3 <- a3 + Vector512.LoadUnsafe(&hwBase, unativeint (rb + 96))
+                k <- k + 1
+
+            k <- 0
+
+            while k < hsN do
+                let rb = hwOff + halfSub.[hsOff + k] * L1 + t
+                a0 <- a0 - Vector512.LoadUnsafe(&hwBase, unativeint rb)
+                a1 <- a1 - Vector512.LoadUnsafe(&hwBase, unativeint (rb + 32))
+                a2 <- a2 - Vector512.LoadUnsafe(&hwBase, unativeint (rb + 64))
+                a3 <- a3 - Vector512.LoadUnsafe(&hwBase, unativeint (rb + 96))
+                k <- k + 1
+
+            k <- 0
+
+            while k < taN do
+                let rb = twOff + thrAdd.[taOff + k] * L1 + t
+                a0 <- a0 + Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&twBase, unativeint rb))
+                a1 <- a1 + Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&twBase, unativeint (rb + 32)))
+                a2 <- a2 + Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&twBase, unativeint (rb + 64)))
+                a3 <- a3 + Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&twBase, unativeint (rb + 96)))
+                k <- k + 1
+
+            k <- 0
+
+            while k < tsN do
+                let rb = twOff + thrSub.[tsOff + k] * L1 + t
+                a0 <- a0 - Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&twBase, unativeint rb))
+                a1 <- a1 - Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&twBase, unativeint (rb + 32)))
+                a2 <- a2 - Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&twBase, unativeint (rb + 64)))
+                a3 <- a3 - Avx512BW.ConvertToVector512Int16(Vector256.LoadUnsafe(&twBase, unativeint (rb + 96)))
+                k <- k + 1
+
+            Vector512.StoreUnsafe(a0, &dstBase, unativeint (dstOff + t))
+            Vector512.StoreUnsafe(a1, &dstBase, unativeint (dstOff + t + 32))
+            Vector512.StoreUnsafe(a2, &dstBase, unativeint (dstOff + t + 64))
+            Vector512.StoreUnsafe(a3, &dstBase, unativeint (dstOff + t + 96))
+            t <- t + 128
+    elif useAvx2 then
         // 4-ymm tile (64 int16) x 16 tiles; the tile lives in registers while every row's chunk streams
         // through (proven-safe register budget — mirrors the fc0 GEMV 4-accumulator blocking in NNUE.fs).
         // Base-ref + element-offset loads/stores skip the bounds checks the JIT can't elide on runtime
@@ -535,6 +758,7 @@ let applyFused
     (nThrAdd: int)
     (thrSub: int[])
     (nThrSub: int)
+    (useAvx512: bool)
     (useAvx2: bool)
     =
     System.Diagnostics.Debug.Assert(
@@ -551,6 +775,7 @@ let applyFused
             srcAcc srcOff dstAcc dstOff srcPsq srcPsqOff dstPsq dstPsqOff
             halfW hwOff halfPsqt thrW twOff thrPsqt
             halfAdd 0 nHalfAdd halfSub 0 nHalfSub thrAdd 0 nThrAdd thrSub 0 nThrSub
+            useAvx512
             useAvx2
     else
         // Slice the virtual concatenation (halfAdd ++ halfSub ++ thrAdd ++ thrSub) into passes.
@@ -576,12 +801,14 @@ let applyFused
                     srcAcc srcOff dstAcc dstOff srcPsq srcPsqOff dstPsq dstPsqOff
                     halfW hwOff halfPsqt thrW twOff thrPsqt
                     halfAdd haO haN halfSub hsO hsN thrAdd taO taN thrSub tsO tsN
+                    useAvx512
                     useAvx2
             else
                 applyFusedPass
                     dstAcc dstOff dstAcc dstOff dstPsq dstPsqOff dstPsq dstPsqOff
                     halfW hwOff halfPsqt thrW twOff thrPsqt
                     halfAdd haO haN halfSub hsO hsN thrAdd taO taN thrSub tsO tsN
+                    useAvx512
                     useAvx2
 
             first <- false
