@@ -74,11 +74,17 @@
 
   <!-- Embed the NNUE evaluator into the binary so the exe is self-contained. The canonical net is
        nets/main.nnue (a name-stable slot — drop in any compatible FullThreats-architecture net and
-       rebuild). Conditional on the net existing: nets/ is gitignored (the trained weights are large),
-       so a fresh checkout (CI, a new contributor) builds without it — the exe then has no embedded net
-       and tests that need one soft-skip. -->
+       rebuild). Conditional on the file existing so a sparse checkout still builds; tests that need
+       eval soft-skip when the net is absent. main.nnue is tracked via Git LFS (~106 MB). -->
   <ItemGroup Condition="Exists('..\nets\main.nnue')">
     <EmbeddedResource Include="..\nets\main.nnue" LogicalName="eval.nnue" />
+  </ItemGroup>
+
+  <!-- Policy/WDL sidecar (EONPOL02, trained on Syzygy 3-4-5 labels). Embedding does NOT enable it:
+       the policy path stays inert unless EONEGO_POLICY is set (=1 reads this resource, =path reads a
+       file) — the nodesweep byte-identity contract is untouched. Conditional like the eval net. -->
+  <ItemGroup Condition="Exists('..\nets\main.policy')">
+    <EmbeddedResource Include="..\nets\main.policy" LogicalName="policy.dat" />
   </ItemGroup>
 
 </Project>

@@ -419,8 +419,8 @@ let runDumpPolicy (args: string[]) : int =
                 1
             | Policy.PolicyLoaded pnet ->
                 use writer = new StreamWriter(File.Create outPath)
-                let fromL = Array.zeroCreate<int> 64
-                let toL = Array.zeroCreate<int> 64
+                let fromL = Array.zeroCreate<int> Policy.HeadOut
+                let toL = Array.zeroCreate<int> Policy.HeadOut
                 let mutable count = 0
 
                 for line in File.ReadLines inPath do
@@ -433,12 +433,12 @@ let runDumpPolicy (args: string[]) : int =
                         let sb = Text.StringBuilder(1024)
                         sb.Append(fen).Append('\t') |> ignore
 
-                        for i in 0 .. 63 do
+                        for i in 0 .. Policy.HeadOut - 1 do
                             (if i > 0 then sb.Append(' ') else sb).Append(fromL.[i]) |> ignore
 
                         sb.Append('\t') |> ignore
 
-                        for i in 0 .. 63 do
+                        for i in 0 .. Policy.HeadOut - 1 do
                             (if i > 0 then sb.Append(' ') else sb).Append(toL.[i]) |> ignore
 
                         if pnet.HasWdl then

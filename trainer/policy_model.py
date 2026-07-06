@@ -1,5 +1,6 @@
-"""Torch modules for the EONPOL heads — quantization-aware (STE int8 grid, engine-exact hidden
-activation): pfc0 1024->128 CReLU(>>shift0) -> pfrom/pto 128->64 raw logits; WDL 32->3 per bucket.
+"""Torch modules for the EONPOL02 heads — quantization-aware (STE int8 grid, engine-exact hidden
+activation): pfc0 1024->hidden CReLU(>>shift0) -> piece-aware pfrom/pto hidden->384 raw logits
+(6 piece types x 64 STM-relative squares); WDL 32->3 per bucket.
 
 The hidden activation uses an STE FLOOR on acc/2^shift0 so the float forward sits exactly on the
 engine's integer grid (F#'s arithmetic >>> floors); weights/biases are STE-rounded and clamped to
@@ -8,7 +9,7 @@ the int8/int32 ranges the exporter writes. Same recipe as kga_stack_tune.cmd_tra
 
 import torch
 
-HIDDEN = 128
+HEAD_OUT = 384  # 6 piece types x 64 squares
 SHIFT0 = 6
 WDL_SHIFT = 6
 L1 = 1024
@@ -23,19 +24,20 @@ def ste_floor(x):
 
 
 class PolicyHead(torch.nn.Module):
-    def __init__(self, seed: int = 0):
+    def __init__(self, hidden: int = 128, seed: int = 0):
         super().__init__()
+        self.hidden = hidden
         g = torch.Generator().manual_seed(seed)
         # Small int-grid init: weights a few quanta wide, biases zero.
-        self.w0 = torch.nn.Parameter(torch.randn(HIDDEN, L1, generator=g) * 3.0)
-        self.b0 = torch.nn.Parameter(torch.zeros(HIDDEN))
-        self.wf = torch.nn.Parameter(torch.randn(64, HIDDEN, generator=g) * 3.0)
-        self.bf = torch.nn.Parameter(torch.zeros(64))
-        self.wt = torch.nn.Parameter(torch.randn(64, HIDDEN, generator=g) * 3.0)
-        self.bt = torch.nn.Parameter(torch.zeros(64))
+        self.w0 = torch.nn.Parameter(torch.randn(hidden, L1, generator=g) * 3.0)
+        self.b0 = torch.nn.Parameter(torch.zeros(hidden))
+        self.wf = torch.nn.Parameter(torch.randn(HEAD_OUT, hidden, generator=g) * 3.0)
+        self.bf = torch.nn.Parameter(torch.zeros(HEAD_OUT))
+        self.wt = torch.nn.Parameter(torch.randn(HEAD_OUT, hidden, generator=g) * 3.0)
+        self.bt = torch.nn.Parameter(torch.zeros(HEAD_OUT))
 
     def forward(self, ft):
-        """ft: (B, 1024) float in [0,127] -> (from_logits, to_logits), each (B, 64)."""
+        """ft: (B, 1024) float in [0,127] -> (from_logits, to_logits), each (B, 384)."""
         w0 = torch.clamp(ste_round(self.w0), -127, 127)
         acc = ft @ w0.T + ste_round(self.b0)
         hid = torch.clamp(ste_floor(acc / (1 << SHIFT0)), 0, 127)

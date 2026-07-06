@@ -206,7 +206,7 @@ do initTables ()
 // ---------------------------------------------------------------------------
 // PieceValue — the single SEE / MVV-LVA / capture-history value table (centipawns), indexed by
 // PieceType (Pawn..King). King = 0 is the SEE sentinel: a king is never an SEE victim and its value is
-// never subtracted (the KING branch of see_ge returns/terminates first). This is a literal-initialized
+// never subtracted (the KING branch of SEE returns/terminates first). This is a literal-initialized
 // immutable array that reads ONLY integer literals, so it joins the same already-once static init as the
 // castling tables above — no Zobrist/MoveGen reference, no new cross-module cctor edge, no lock (shared
 // immutable). MovePick / History reuse it via `pieceValueOf` so SEE and ordering can never disagree.
@@ -2304,7 +2304,7 @@ type Position() =
 
     // --- in-check resolution shared by IsPseudoLegal's NORMAL/Promotion arms -----------------------
     // king=true  -> destination must be safe with the king REMOVED from occ (X-ray through the vacated
-    //               square) — this is the one piece of legality IsPseudoLegal does (matching pseudo_legal).
+    //               square) — this is the one piece of legality IsPseudoLegal does (king-into-check test).
     // king=false -> under single check the move must land on between(ksq,checker)|checkers (capture/interpose);
     //               under double check a non-king move is illegal. Pin legality for non-king pieces is left
     //               to isLegal (exactly as the reference). PRE: the move already passed its shape check.

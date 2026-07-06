@@ -20,7 +20,7 @@ try:
 except ImportError:  # pragma: no cover
     chess = None
 
-from move_encoder import encode_uci, fen_black_to_move
+from move_encoder import board_of_fen, encode_uci_piece, fen_black_to_move
 
 L1 = 1024
 QMAX = 72  # padded quiet-list width
@@ -65,7 +65,7 @@ def quiet_moves(board) -> list[str]:
 
 def build_policy_arrays(records, qmax: int = QMAX):
     """-> (keep_idx, arrays):
-    qf/qt (N,qmax) i8   STM-relative from/to squares of the legal quiets (0-padded)
+    qf/qt (N,qmax) i16  EONPOL02 piece-aware logit indices (pt*64 + rel square, 0-padded)
     qn    (N,)     i16  quiet count
     good  (N,qmax) bool WDL-preserving quiet mask (one-hot of best for gen-v2 rows)
     tgt   (N,)     i32  index of best_uci within the quiet list (reporting)
@@ -87,7 +87,8 @@ def build_policy_arrays(records, qmax: int = QMAX):
         if len(quiets) < 2 or len(quiets) > qmax or not goods or len(goods) >= len(quiets):
             continue
         black = fen_black_to_move(fen)
-        pairs = [encode_uci(u, black) for u in quiets]
+        board = board_of_fen(fen)
+        pairs = [encode_uci_piece(u, black, board) for u in quiets]
         keep.append(i)
         qf.append([p[0] for p in pairs] + [0] * (qmax - len(pairs)))
         qt.append([p[1] for p in pairs] + [0] * (qmax - len(pairs)))
@@ -97,8 +98,8 @@ def build_policy_arrays(records, qmax: int = QMAX):
         r_stm = result if not black else 1.0 - result
         wdl.append(0 if r_stm > 0.75 else (1 if r_stm > 0.25 else 2))
     arrays = {
-        "qf": np.array(qf, dtype=np.int8),
-        "qt": np.array(qt, dtype=np.int8),
+        "qf": np.array(qf, dtype=np.int16),
+        "qt": np.array(qt, dtype=np.int16),
         "qn": np.array(qn, dtype=np.int16),
         "good": np.array(good, dtype=bool),
         "tgt": np.array(tgt, dtype=np.int32),

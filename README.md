@@ -24,6 +24,18 @@ node-count sweeps and SPRT self-play matches.
   full advantage until the 50-move draw hits the search horizon
 - The net is embedded into the executable at build time when present (see *Building*)
 
+### Policy sidecar (optional)
+- **EONPOL02 sidecar** sharing the NNUE trunk's 1024-wide FT pairwise-product buffer — the
+  expensive accumulator work is already paid for at eval nodes
+- Piece-aware from/to heads (6 piece types × 64 STM-relative squares → 384 logits each);
+  per-move score = `from[pt*64 + relSq(from)] + to[pt*64 + relSq(to)]`
+- Optional **WDL head** (3 outputs per bucket off the value stack's a1 activation), evaluated
+  on demand at root/PV only
+- **Default OFF** (`EONEGO_POLICY` gate in UCI): when loaded, lazy per-node logits are filled at
+  `StgQuietInit` and consumed by search as an **LMR term** (quiets below `PolLmrThresh` get one
+  extra reduction step); an inert ordering blend (`PolOrdMul` default 0) is also wired
+- `ftHash`-bound to the loaded `.nnue` trunk — refuses a head trained on a foreign net
+
 ### Search
 - Negamax / PVS with quiescence, **LazySMP** parallelism, and **thread voting**
   over the workers' root results
@@ -54,17 +66,17 @@ node-count sweeps and SPRT self-play matches.
 Requirements:
 - .NET SDK with `net10.0` support
 - Visual Studio **"Desktop development with C++"** workload (NativeAOT links with MSVC)
-- The trained net is **not in git** (~106 MB). Clone builds need it once before publish:
+- **Git LFS** for `nets/main.nnue` (~106 MB): `git lfs install` then clone (or `git lfs pull`)
 
 ```powershell
-pwsh ./scripts/fetch-net.ps1   # -> nets/main.nnue from GitHub Releases
-pwsh ./publish.ps1             # auto-fetches if missing; embeds as eval.nnue
+pwsh ./publish.ps1             # embeds nets/main.nnue + nets/main.policy when present
 # -> Eonego/bin/Release/net10.0/win-x64/publish/Eonego.exe  (~110 MB with net embedded)
 ```
 
-A build without `nets/main.nnue` still succeeds, but the exe cannot search until you embed a net
+If `main.nnue` is missing (LFS not pulled), `publish.ps1` falls back to `scripts/fetch-net.ps1`.
+A build without `nets/main.nnue` still succeeds, but the exe cannot search until you have the net
 or set `EONEGO_NET=<path>` at runtime. Pre-built zips on [Releases](https://github.com/Houijasu/Eonego/releases)
-already include the embedded net.
+also include the embedded net.
 
 Equivalent: `dotnet publish Eonego/Eonego.fsproj -c Release -r win-x64` (the script also puts the VS
 Installer on `PATH` so the MSVC link step does not fail with exit code 123).
@@ -78,7 +90,7 @@ For development, a JIT build works anywhere the SDK does:
 
 ```powershell
 dotnet build Eonego/Eonego.fsproj -c Release
-dotnet test  Eonego.Tests/Eonego.Tests.fsproj -c Release   # 348 tests
+dotnet test  Eonego.Tests/Eonego.Tests.fsproj -c Release   # 361 tests
 ```
 
 ## UCI options
@@ -99,7 +111,13 @@ environment variables so matches never need a rebuild:
 | Env var | Effect |
 |---|---|
 | `EONEGO_NET=<path>` | Load a compatible net from disk instead of the embedded resource |
+| `EONEGO_POLICY=<path>` | Load a `.policy` sidecar (`=1` requests embedded `policy.dat` when present) |
 | `EONEGO_T_*` | Override tuned margins and resource budgets (see `Tunables.fs`) |
+| `EONEGO_T_POL_MINDEPTH` | No policy inference below this picker depth (default 3) |
+| `EONEGO_T_POL_LMR` | Quiets with from+to logit below this get one extra LMR step (default 0 = off) |
+| `EONEGO_T_POL_ORDMUL` | scoreQuiets ordering blend multiplier (default 0 = inert) |
+| `EONEGO_T_POL_ORDSHIFT` / `EONEGO_T_POL_CLAMP` | Ordering-blend shift and clamp |
+| `EONEGO_CUTDUMP=<path>` | Append matched-state cut records (policy rank-evaluation baseline) |
 | `EONEGO_POOL=0` | Disable the default persistent worker pool and return to fresh workers per move |
 | `EONEGO_RETRO=0` | Disable background retrograde solving and exact 3-man probes |
 | `EONEGO_R50DAMP=0` | Disable rule-50 draw-proximity eval damping |
@@ -117,14 +135,19 @@ environment variables so matches never need a rebuild:
 | `EONEGO_CHECKEXT=1` / `EONEGO_QSEVCAP=1` | Legacy check extension / qsearch evasion cap |
 | `EONEGO_FINNY=0` | Disable finny bucket-refresh tables and use from-scratch accumulator refresh |
 | `EONEGO_FORCE_SCALAR=1` / `EONEGO_FORCE_NOVNNI=1` / `EONEGO_FORCE_DENSE=1` | NNUE kernel fallbacks for bit-exactness and performance debugging |
-| `EONEGO_PROF=1` | Per-search phase profile line (1-thread semantics) |
+| `EONEGO_PROF=1` | Per-search phase profile line (1-thread semantics); tree-shape counters `prof4`–`prof6` |
 
 ## Development harness
 
 - `Eonego.exe gen --start <fen> --games N --out <file> --net <path>` — self-play
   label generation (`--depth D` or `--nodes K`, temperature/random-prefix controls).
+  Records are **v2**: `fen;cp_white;result_white;best_uci` (4th field = search best move).
 - `Eonego.exe dumpft --net <path> --in <fens> --out <bin>` — trainer feature dump:
   1034-byte records containing bucket, side-to-move, PSQT/eval internals and the 1024-byte FT vector.
+- `Eonego.exe dumppolicy --net <nnue> --policy <sidecar> --in <fens> --out <txt>` — policy
+  parity dump: `fen TAB 64 from-logits TAB 64 to-logits [TAB w d l]`.
+- `Eonego.exe tbgen --tb <dir[;dir2]> --out <file> --signatures <list>` — native Syzygy-labeled
+  endgame records with WDL-preserving move sets (for policy training).
 - `Eonego.exe retro <fen> [--verify]` — solve the position's reachable low-material
   retrograde signatures, print stats, and optionally run the self-consistency proof.
 - `scripts/nodesweep.ps1` — deterministic 1T node-count sweep over a 6-FEN suite; the
@@ -141,17 +164,26 @@ environment variables so matches never need a rebuild:
   schedules, resumable per-wave state, `--fake-objective` self-test).
 - `trainer/train.py` / `trainer/export.py` — train and quantize one EONGNNUE generation
   from generated labels; parity/blending helpers live beside them.
+- `trainer/policy_train.py` / `trainer/policy_export.py` — train and export the EONPOL02
+  policy sidecar (masked quiet-CE + optional WDL-CE on gen/tbgen + dumpft records).
+- `trainer/policy_parity.py` / `trainer/policy_intref.py` — bit-exact engine vs integer
+  oracle parity for the policy head.
+- `trainer/policy_rankeval.py` — matched-state rank gate: policy vs live history on
+  `EONEGO_CUTDUMP` states (go/no-go before SPRT promotion).
+- `trainer/policy_loop.py` — resumable end-to-end policy pipeline orchestrator.
 
 The working discipline: **nothing ships without a measurement.** Fixed-depth node counts
-adjudicate tree mechanics; SPRT matches adjudicate everything else.
+adjudicate tree mechanics; SPRT matches adjudicate everything else. See
+[`docs/policy-net-phase0.md`](docs/policy-net-phase0.md) for the policy-net campaign
+measurement log.
 
 ## Testing
 
-334 xunit tests cover perft, make/unmake round-trips (full state + all three incremental
+361 xunit tests cover perft, make/unmake round-trips (full state + all three incremental
 keys), SEE, the staged move picker, TT torn-read behavior, NNUE bit-exactness against
 golden evals (AVX2 == scalar), draw detection, LazySMP determinism at 1 thread, thread
-voting, retrograde solving, worker-pool reuse, and oracle equivalence of the pruned search
-against plain full-window alpha-beta.
+voting, retrograde solving, worker-pool reuse, policy kernel parity and LMR consumption,
+and oracle equivalence of the pruned search against plain full-window alpha-beta.
 
 ## License
 
@@ -161,5 +193,7 @@ this repository are original to the project.
 ## Status
 
 Actively developed. Strength is tracked against the engine's own history via SPRT
-(hundreds of Elo gained through 2026 search/eval campaigns). Further search efficiency
-gains and continued net training are the roadmap.
+(hundreds of Elo gained through 2026 search/eval campaigns). The **policy-net campaign**
+(optional EONPOL02 sidecar, LMR consumption, offline training pipeline) is scaffolded
+default-OFF; promotion awaits rankeval + SPRT. Further search efficiency gains and
+continued net training are the roadmap.

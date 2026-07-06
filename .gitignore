@@ -13,6 +13,9 @@ publish/
 # BenchmarkDotNet artifacts
 BenchmarkDotNet.Artifacts/
 
+# Local JIT scratch publishes (nodesweep/prof/policy campaign; not the AOT publish path)
+scratch-build/
+
 # Golden-eval capture artifact (written to repo root by GoldenEvalTests in capture mode)
 eonego-golden-eval.txt
 
@@ -108,12 +111,12 @@ venv/
 .ipynb_checkpoints/
 *.npz
 *.pt
+*.ckpt
+*_ft.bin
 trainer/*_state*.json
 
-# Trained NNUE weights (large — not committed; fetch with scripts/fetch-net.ps1)
-nets/*
-!nets/README.md
-*.nnue
+# Trainer / loop net exports (regenerable; canonical weights live in nets/)
+*.eongnnue
 
 # Downloaded UCI teacher binary used only as a local parity oracle (never commit)
 tmp_teacher/

@@ -193,6 +193,18 @@ type SearchConfig =
       // picker's StgQuietInit, consumed by the LMR term (v1, Phase-0 re-scope) and the inert ordering
       // blend. True only when UCI actually loaded a sidecar; false = byte-identical legacy search.
       UsePolicy: bool
+      // --- Dynamic time management (the TM campaign; all default OFF pre-SPRT). Game clocks only —
+      // movetime/depth/nodes searches have soft = 0, which makes every component inert. ---
+      // movestogo hardening: clamp user mtg, widen the hard cap when few moves remain, soft <= hard.
+      UseTmMtgHarden: bool
+      // Shrink the soft budget as the best move stays stable across completed iterations.
+      UseTmStability: bool
+      // Grow the soft budget while the root score is falling (asymmetric — see Tunables).
+      UseTmTrend: bool
+      // One-shot soft-budget extension after a root fail-low at depth >= TmFailLowDepth.
+      UseTmFailLow: bool
+      // Scale the soft budget by the best move's share of this iteration's root nodes.
+      UseTmEffort: bool
       MoveOverhead: int
       // Phase 1: NNUE accumulator checkpoint cache. Set to 0 to disable; ~4 MiB is the recommended default
       // (1024 slots, ~4.1 KiB/slot). Cleared per search by `SearchControl.NewSearch` (alongside the TT gen
@@ -257,6 +269,11 @@ let defaultConfig =
       UseSyzygy = true
       UseDFPN = false
       UsePolicy = false
+      UseTmMtgHarden = false
+      UseTmStability = false
+      UseTmTrend = false
+      UseTmFailLow = false
+      UseTmEffort = false
       MoveOverhead = 10
       AccCheckpointMb = 0
       MultiPv = 1 }
@@ -409,9 +426,16 @@ type SearchControl
     ) =
     let mutable stopFlag = 0
     let mutable startTick = System.Diagnostics.Stopwatch.GetTimestamp()
-    let mutable softMs = 0L
     let mutable hardMs = 0L
-    let mutable baseSoftMs = 0L // the un-scaled optimum; the per-iteration manager rescales softMs from it
+    let mutable baseSoftMs = 0L // the un-scaled optimum; softScalePct rescales it at READ time
+    // Dynamic TM: soft budget = baseSoftMs * softScalePct / 100, composed each iteration by the main
+    // worker (the only writer); 100 = neutral = integer-identical to the unscaled budget. Storing the
+    // SCALE (not a scaled value) makes the ponderhit handoff race-free by construction: during ponder
+    // baseSoftMs = 0 so the budget reads 0 whatever the scale; StartClock at ponderhit publishes
+    // baseSoftMs and the already-accumulated scale applies from the very next read.
+    let mutable softScalePct = 100L
+    // Telemetry (EONEGO_TMLOG): whether the HARD time clause fired (vs soft stop / node limit / user stop).
+    let mutable hardHitFlag = 0
     let mutable ponderSoft = 0L // real budget remembered during a ponder search; armed by PonderHit
     let mutable ponderHard = 0L
     let mutable ponderState = PonderIdle
@@ -458,17 +482,28 @@ type SearchControl
     member _.ElapsedMs: int64 = elapsedMs ()
 
     member _.SoftTimeUp: bool =
-        let soft = Volatile.Read(&softMs)
+        let soft = Volatile.Read(&baseSoftMs) * Volatile.Read(&softScalePct) / 100L
         soft > 0L && elapsedMs () >= soft
 
     member _.BaseSoftMs: int64 = Volatile.Read(&baseSoftMs)
-    member _.SetSoft(v: int64) = Volatile.Write(&softMs, v)
+    member _.HardMs: int64 = Volatile.Read(&hardMs)
+    /// The scaled soft budget the next SoftTimeUp read will compare against (telemetry/tests).
+    member _.SoftBudgetMs: int64 = Volatile.Read(&baseSoftMs) * Volatile.Read(&softScalePct) / 100L
+    member _.SoftScalePct: int64 = Volatile.Read(&softScalePct)
+
+    /// Main worker only: publish the composed dynamic-TM scale (percent; clamped to Tunables bounds).
+    member _.SetSoftScale(pct: int64) =
+        let lo = int64 Tunables.TmScaleMin
+        let hi = int64 Tunables.TmScaleMax
+        Volatile.Write(&softScalePct, max lo (min hi pct))
+
+    /// Telemetry: the hard time limit (not the node limit / a user stop) ended this search.
+    member _.HardHit: bool = Volatile.Read(&hardHitFlag) <> 0
 
     member _.StartClock (soft: int64) (hard: int64) =
         Volatile.Write(&startTick, System.Diagnostics.Stopwatch.GetTimestamp())
         Volatile.Write(&baseSoftMs, soft)
         Volatile.Write(&hardMs, hard)
-        Volatile.Write(&softMs, soft)
 
     /// Ponder: search unbounded now and remember the real budget; PonderHit arms it (the clock starts then,
     /// so the time used while pondering on the opponent's clock is free). If a ponderhit already raced ahead
@@ -513,7 +548,10 @@ type SearchControl
     member _.CheckTime(nodes: int64) =
         let hard = Volatile.Read(&hardMs)
 
-        if (hard > 0L && elapsedMs () >= hard) || (limits.Nodes > 0L && nodes >= limits.Nodes) then
+        if hard > 0L && elapsedMs () >= hard then
+            Volatile.Write(&hardHitFlag, 1)
+            Volatile.Write(&stopFlag, 1)
+        elif limits.Nodes > 0L && nodes >= limits.Nodes then
             Volatile.Write(&stopFlag, 1)
 
 // ---------------------------------------------------------------------------
@@ -547,8 +585,8 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     // Policy sidecar: per-ply from/to logit arrays (64 each) + the Zobrist staleness guard. Filled
     // lazily by MovePick's StgQuietInit; read by the LMR term. A slot is valid for the node at `ply`
     // iff policyKey[ply] equals that node's Zobrist key (slots are reused across siblings).
-    let policyFrom: int[] = Array.zeroCreate ((MaxSearchPly + 2) * 64)
-    let policyTo: int[] = Array.zeroCreate ((MaxSearchPly + 2) * 64)
+    let policyFrom: int[] = Array.zeroCreate ((MaxSearchPly + 2) * Policy.HeadOut)
+    let policyTo: int[] = Array.zeroCreate ((MaxSearchPly + 2) * Policy.HeadOut)
     let policyKey: uint64[] = Array.zeroCreate (MaxSearchPly + 2)
     let mutable nodes = 0L
     let mutable tbHits = 0L
@@ -630,6 +668,16 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     /// of clock). Written at ply 0 only, never during an exclusion re-search or a MultiPV side line.
     member val IterBest = MoveNone with get, set
     member val IterScore = 0 with get, set
+
+    /// Dynamic TM telemetry (EONEGO_TMLOG; main worker only): stability streak, best-move change
+    /// count, and the last composed scale. Written by iterativeDeepening, read by goCore after joins.
+    member val TmStability = 0 with get, set
+    member val TmBestChanges = 0 with get, set
+    member val TmLastScalePct = 100L with get, set
+
+    /// Node-effort accounting active (decoupled from RootListActive: UseTmEffort wants the per-move
+    /// subtree node counts WITHOUT switching the ply-0 move source to the persistent list).
+    member val RootEffortActive = false with get, set
 
     member _.RootMv = rootMv
     member _.RootNodes = rootNodes
@@ -721,11 +769,19 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
         rootCnt <- 0
         rootListActive <- false
         this.RootVerifyMove <- MoveNone
+        this.RootEffortActive <- false
+        this.TmStability <- 0
+        this.TmBestChanges <- 0
+        this.TmLastScalePct <- 100L
+
+// Clock/node-limit poll cadence: every 2^TmPollShift nodes (default 13 = mask 8191, the legacy
+// value — also the stop granularity of `go nodes`, so the default only moves behind an SPRT).
+let private tmPollMask = (1L <<< Tunables.TmPollShift) - 1L
 
 let inline private pollStop (w: Worker) : bool =
     if w.StopSeen then
         true
-    elif (w.Nodes &&& 8191L) = 0L then
+    elif (w.Nodes &&& tmPollMask) = 0L then
         if w.IsMain then
             w.Control.CheckTime w.Nodes
 
@@ -753,6 +809,11 @@ let private cutDumpPath =
     | s -> s
 
 let private cutDumpEnabled = cutDumpPath <> ""
+
+// EONEGO_TMLOG=1: one `info string tm ...` line per completed search (emitted in goCore) — the TM
+// campaign's anti-blind-tuning telemetry (budget vs spend, hard-stop flag, stability/scale state).
+let private tmLogEnabled =
+    System.Environment.GetEnvironmentVariable "EONEGO_TMLOG" = "1"
 
 let private cutDumpWriter =
     lazy
@@ -1526,8 +1587,8 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
             if cfg.UsePolicy && w.Control.Policy.IsSome then
                 mp.PolNet <- w.Control.Policy.Value
                 mp.ValNet <- w.Control.Net.Value
-                mp.PolFrom <- w.PolicyFrom.AsSpan(ply * 64, 64)
-                mp.PolTo <- w.PolicyTo.AsSpan(ply * 64, 64)
+                mp.PolFrom <- w.PolicyFrom.AsSpan(ply * Policy.HeadOut, Policy.HeadOut)
+                mp.PolTo <- w.PolicyTo.AsSpan(ply * Policy.HeadOut, Policy.HeadOut)
                 mp.PolKey <- w.PolicyKey.AsSpan(ply, 1)
 
             if PosProf.Enabled then
@@ -1553,6 +1614,9 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
             // list instead of the staged picker (exclusion re-searches keep the picker — they must not
             // touch the effort accounting). `go searchmoves` restriction is read once here too.
             let useRootList = ply = 0 && w.RootListActive && excludedMove = MoveNone
+            // Effort ACCOUNTING is decoupled from list-driven iteration (UseTmEffort wants the node
+            // counts while the staged picker stays in charge); equals useRootList in legacy configs.
+            let useRootEffort = ply = 0 && w.RootEffortActive && excludedMove = MoveNone
             let rootAllowed = if ply = 0 then w.Control.Limits.SearchMoves else [||]
             let mutable rootIdx = 0
 
@@ -1738,7 +1802,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                         w.Stack.[ssCur].MovedPiece <- pos.PieceOn(fromSq m)
 
                         // Root effort: nodes consumed by this root move's subtree (read back after Unmake).
-                        let effortStart = if useRootList then w.Nodes else 0L
+                        let effortStart = if useRootEffort then w.Nodes else 0L
 
                         pos.Make m
                         w.Control.Tt.Prefetch pos.Key // child probes this exact key at entry
@@ -1816,9 +1880,15 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                                     // StgQuietInit see a stale slot and are left alone. Net-REDUCING only
                                     // (the house LMR finding: r-1 variants cascade re-searches).
                                     if cfg.UsePolicy && isQuiet && w.PolicyKey.[ply] = policyNodeKey then
+                                        // EONPOL02 logit index = moverPieceType*64 + relSq. pos.Make
+                                        // already ran here, so the mover comes from the search stack,
+                                        // not the (child) board.
+                                        let polBase =
+                                            ply * Policy.HeadOut + pieceType w.Stack.[ssCur].MovedPiece * 64
+
                                         let ps =
-                                            w.PolicyFrom.[ply * 64 + Policy.relSq us (fromSq m)]
-                                            + w.PolicyTo.[ply * 64 + Policy.relSq us (toSq m)]
+                                            w.PolicyFrom.[polBase + Policy.relSq us (fromSq m)]
+                                            + w.PolicyTo.[polBase + Policy.relSq us (toSq m)]
 
                                         if ps < Tunables.PolLmrThresh then
                                             rr <- rr + 1
@@ -1848,8 +1918,15 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
                         pos.Unmake m
 
-                        if useRootList then
-                            w.RootNodes.[rootIdx] <- w.RootNodes.[rootIdx] + (w.Nodes - effortStart)
+                        if useRootEffort then
+                            // List-driven roots know their index; picker-driven roots (UseTmEffort
+                            // without UseRootEffort) resolve it by scan — <=40 compares per root move.
+                            let ei =
+                                if useRootList then rootIdx
+                                else System.Array.IndexOf(w.RootMv, m, 0, w.RootCnt)
+
+                            if ei >= 0 then
+                                w.RootNodes.[ei] <- w.RootNodes.[ei] + (w.Nodes - effortStart)
 
                         if pollStop w then
                             cutoff <- true
@@ -2055,8 +2132,8 @@ let internal scoreString (score: int) : string =
         // Decayed mate scores: a mate deeper than MaxSearchPly plies is unrepresentable, and
         // repeated TT ply adjustment walks such scores below the mate band, where they circulate
         // as huge "centipawn" values (reproduced: cp -31752 on the trapped-queen position
-        // 8/qp6/p7/pk6/P1R5/3K4/8/8 b). ChessBase GUIs then decode big cp with their own
-        // 32768-based mate convention — a leaked -29262 displayed as "#1753". Everything between
+        // 8/qp6/p7/pk6/P1R5/3K4/8/8 b). Some GUIs reinterpret large cp with nonstandard mate
+        // conventions — a leaked -29262 can display as a fictitious deep mate. Everything between
         // the eval ceiling and the mate band is therefore clamped to +/-EvalMax for DISPLAY only;
         // internal search values are untouched (the clamp lives in the one score->text seam).
         "cp " + string (max -NNUE.EvalMax (min NNUE.EvalMax score))
@@ -2153,6 +2230,28 @@ let private reportInfo (w: Worker) (depth: int) (score: int) =
 // ---------------------------------------------------------------------------
 // Iterative deepening (aspiration). All workers run it; only the main reports + sets the time stop.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Dynamic TM components (pure — unit-tested in TimeManTests). Each returns a percent (100 =
+// neutral); iterativeDeepening composes the enabled ones into SearchControl.SetSoftScale. A
+// disabled component contributes exactly 100 at the call site.
+// ---------------------------------------------------------------------------
+/// Best-move stability: consecutive completed iterations with an unchanged best move shrink the
+/// budget linearly from Base (streak 0) to the Min floor.
+let tmStabilityPct (stability: int) : int =
+    max Tunables.TmStabMin (Tunables.TmStabBase - Tunables.TmStabSlope * stability)
+
+/// Score trend: `fallCp` = root score two completed iterations ago minus now (positive = falling).
+/// Asymmetric by design — a rising score saves at most (100 - TmTrendMin)%.
+let tmTrendPct (fallCp: int) : int =
+    max Tunables.TmTrendMin (min Tunables.TmTrendMax (100 + fallCp * Tunables.TmTrendSlope100 / 100))
+
+/// Node effort: `bestFracPct` = the best root move's share (%) of this iteration's root nodes.
+/// Neutral at 50%; a dominating best move shrinks the budget, a contested root grows it.
+let tmEffortPct (bestFracPct: int) : int =
+    max
+        Tunables.TmEffortMin
+        (min Tunables.TmEffortMax (Tunables.TmEffortOff + (100 - bestFracPct) * Tunables.TmEffortSlope / 100))
+
 let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
     let cfg = w.Control.Config
     // MultiPV: only the main worker searches extra lines (they exist purely for reporting); helpers stay
@@ -2170,12 +2269,17 @@ let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
     // Root re-verification (UseRootVerify) needs the same list (as a rotation pool) but NOT the
     // list-driven iteration — the picker stays in charge unless UseRootEffort is also on.
     let useRootVerify = cfg.UseRootVerify && multiPv = 1
+    // Node-effort TM (UseTmEffort): needs the root list + per-move node accounting but NOT the
+    // list-driven iteration — accounting is decoupled via Worker.RootEffortActive. Main worker only
+    // (helpers' trees diverge and never read the clock anyway).
+    let useTmEffort = cfg.UseTmEffort && w.IsMain && multiPv = 1
 
-    if useRootList || useRootVerify then
+    if useRootList || useRootVerify || useTmEffort then
         w.RootCnt <- generateLegal w.Pos (Span<Move>(w.RootMv))
         Array.Clear(w.RootNodes, 0, w.RootNodes.Length)
 
     w.RootListActive <- useRootList
+    w.RootEffortActive <- useRootList || useTmEffort
 
     // Stagnation detector state: ring of the last 6 completed-iteration scores + rotation cursor.
     // Each candidate is verified for 3 CONSECUTIVE iterations before rotating on: one fresh PV look
@@ -2185,6 +2289,21 @@ let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
     let mutable verifyHistN = 0
     let mutable verifyIdx = 0
     let mutable verifyStreak = 0
+
+    // Dynamic TM state (main worker, single-PV). Tracked even while pondering — baseSoftMs is 0 so
+    // the scale is inert, but it is warm the instant ponderhit arms the real budget. Components
+    // default to 100 (neutral) when their flag is off; composition happens at each iteration end.
+    let tmActive =
+        w.IsMain
+        && multiPv = 1
+        && (cfg.UseTmStability || cfg.UseTmTrend || cfg.UseTmFailLow || cfg.UseTmEffort)
+
+    let mutable tmStability = 0
+    let mutable tmPrevBest = MoveNone
+    let tmScoreRing = Array.create 4 0
+    let mutable tmScoreN = 0
+    let mutable tmFailLowPct = 100
+    let mutable tmEffortComp = 100
 
     // Per-line state: previous score (aspiration centre), and this iteration's score/move/PV per line.
     let prevScores = Array.create multiPv (evalPos w w.Pos)
@@ -2263,6 +2382,13 @@ let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
                     if w.IsMain && w.Control.ElapsedMs > 3000L then
                         reportLine w depth (pvIdx + 1) score " upperbound" w.Pv 0 w.RootBest
 
+                    // Dynamic TM: a root fail-low at sufficient depth means the standing best move is
+                    // in trouble — arm the one-shot budget extension for the REST of this move. It
+                    // applies at the next iteration-end soft check; mid-iteration the hard limit
+                    // governs (correct: a fail-low re-search must not die at the old soft point).
+                    if tmActive && cfg.UseTmFailLow && depth >= Tunables.TmFailLowDepth then
+                        tmFailLowPct <- Tunables.TmFailLowPct
+
                     beta <- (alpha + beta) / 2
                     alpha <- max (-INF) (score - delta)
                     delta <- delta * 2
@@ -2331,6 +2457,39 @@ let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
             w.RootScore <- lineScores.[0]
             w.RootBest <- lineMoves.[0]
             w.CompletedDepth <- depth
+
+            // Dynamic TM: fold this completed iteration into the component state. Effort must read
+            // RootNodes BEFORE the effort sort below clears them.
+            if tmActive then
+                if cfg.UseTmStability then
+                    if lineMoves.[0] = tmPrevBest then
+                        tmStability <- min (tmStability + 1) Tunables.TmStabCap
+                    else
+                        tmStability <- 0
+                        w.TmBestChanges <- w.TmBestChanges + 1
+
+                    tmPrevBest <- lineMoves.[0]
+                    w.TmStability <- tmStability
+
+                if cfg.UseTmTrend then
+                    tmScoreRing.[tmScoreN % 4] <- lineScores.[0]
+                    tmScoreN <- tmScoreN + 1
+
+                if useTmEffort && w.RootCnt > 0 then
+                    let mutable total = 0L
+
+                    for i in 0 .. w.RootCnt - 1 do
+                        total <- total + w.RootNodes.[i]
+
+                    let bi = System.Array.IndexOf(w.RootMv, lineMoves.[0], 0, w.RootCnt)
+
+                    if total > 0L && bi >= 0 then
+                        tmEffortComp <- tmEffortPct (int (w.RootNodes.[bi] * 100L / total))
+
+                    // Fresh accounting per iteration; the effort sort's own clear handles the
+                    // useRootList path (don't double-clear before it reads the counts).
+                    if not useRootList then
+                        Array.Clear(w.RootNodes, 0, w.RootCnt)
 
             // Root effort ordering: best move to the front, the rest by the nodes their subtrees
             // consumed this iteration (descending — expensive near-misses get searched earlier and
@@ -2406,9 +2565,37 @@ let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
 
         depth <- depth + 1
 
+        // Dynamic TM: compose the enabled components into one scale and publish it BEFORE the soft
+        // check, so this iteration's evidence prices the decision to start the next one. Near-neutral
+        // defaults + the [ScaleMin, ScaleMax] clamp are the guardrails the two reverted attempts
+        // lacked (they over-conserved to ~1/3 spend); EONEGO_TMLOG makes the spend visible per move.
+        if tmActive then
+            let stabPct = if cfg.UseTmStability then tmStabilityPct tmStability else 100
+
+            let trendPct =
+                if cfg.UseTmTrend && tmScoreN >= 3 then
+                    let cur = tmScoreRing.[(tmScoreN - 1) % 4]
+                    let old = tmScoreRing.[(tmScoreN - 3) % 4]
+
+                    if abs cur < MATE_IN_MAX_PLY && abs old < MATE_IN_MAX_PLY then
+                        tmTrendPct (old - cur)
+                    else
+                        100
+                else
+                    100
+
+            let effortPct = if useTmEffort then tmEffortComp else 100
+
+            let scale =
+                int64 stabPct * int64 trendPct / 100L * int64 effortPct / 100L
+                * int64 tmFailLowPct / 100L
+
+            w.Control.SetSoftScale scale
+            w.TmLastScalePct <- w.Control.SoftScalePct
+
         // Between iterations the main worker stops once the soft (optimum) budget is spent; the hard budget
-        // stops a running iteration mid-flight via CheckTime. (Best-move-stability / predictive scaling was
-        // tried but over-conserved time without SPRT tuning — reverted; MoveOverhead is kept below.)
+        // stops a running iteration mid-flight via CheckTime. The scale above rescales the SOFT budget only —
+        // the hard cap is the loss-on-time safety net and stays fixed for the move (MoveOverhead kept below).
         if w.IsMain && w.Control.SoftTimeUp then
             w.Control.Stop()
 
@@ -2424,7 +2611,7 @@ let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
 // ---------------------------------------------------------------------------
 // Time budget (v1): movetime, or wtime/winc(+movestogo); depth/nodes/mate/infinite => no time stop.
 // ---------------------------------------------------------------------------
-let computeTimes (moveOverhead: int) (l: SearchLimits) (stm: Color) : int64 * int64 =
+let computeTimes (moveOverhead: int) (mtgHarden: bool) (l: SearchLimits) (stm: Color) : int64 * int64 =
     let overhead = int64 (max 0 moveOverhead)
 
     if l.MoveTime > 0 then
@@ -2445,10 +2632,28 @@ let computeTimes (moveOverhead: int) (l: SearchLimits) (stm: Color) : int64 * in
             // soft limit was reverted as an un-tuned regression (it spent only ~1/3 of the budget).
             // Constants live in Tunables (EONEGO_T_TM_*, defaults = the exact v1 values) so game-clock
             // matches can tune them without a rebuild.
-            let mtg = if l.MovesToGo > 0 then l.MovesToGo else Tunables.TmMtg
+            //
+            // mtgHarden (UseTmMtgHarden, EONEGO_TMMTG=1): clamp an absurd user movestogo, widen the
+            // per-move hard cap as the time control approaches (mtg<=5; mtg=1 may spend ~90% of the
+            // overhead-adjusted clock — that whole clock belongs to this move), and keep soft <= hard
+            // (legacy mtg=1 produced soft ~ avail ABOVE the 40% hard cap, a meaningless soft limit).
+            let mtg =
+                if l.MovesToGo > 0 then
+                    if mtgHarden then min l.MovesToGo Tunables.TmMtgClamp else l.MovesToGo
+                else
+                    Tunables.TmMtg
+
             let avail = max 1L (int64 time - overhead)
             let soft = avail / int64 mtg + int64 inc * int64 Tunables.TmIncFrac100 / 100L
-            let hard = min (int64 time * int64 Tunables.TmHardClockPct / 100L) (soft * int64 Tunables.TmHardSoftMult)
+
+            let hard =
+                if mtgHarden && l.MovesToGo > 0 && l.MovesToGo <= 5 then
+                    let hardPct = min 90 (Tunables.TmHardClockPct + (6 - l.MovesToGo) * Tunables.TmMtgLowStep)
+                    min (avail * int64 hardPct / 100L) (soft * int64 Tunables.TmHardSoftMult)
+                else
+                    min (int64 time * int64 Tunables.TmHardClockPct / 100L) (soft * int64 Tunables.TmHardSoftMult)
+
+            let soft = if mtgHarden then min soft hard else soft
             (max 1L soft, max 1L hard)
 
 // ---------------------------------------------------------------------------
@@ -2638,7 +2843,10 @@ let private goCore (control: SearchControl) (workers: Worker[]) : Move =
     let stm = workers.[0].Pos.SideToMove
 
     let struct (soft, hard) =
-        (let (a, b) = computeTimes control.Config.MoveOverhead control.Limits stm in struct (a, b))
+        (let (a, b) =
+            computeTimes control.Config.MoveOverhead control.Config.UseTmMtgHarden control.Limits stm in
+
+         struct (a, b))
 
     control.StartClockPonder soft hard control.Limits.Ponder
 
@@ -2815,6 +3023,42 @@ let private goCore (control: SearchControl) (workers: Worker[]) : Move =
             sb.Append(' ').Append(toUCI m) |> ignore
 
         writeLine (sb.ToString())
+
+    // EONEGO_TMLOG=1: per-move time-management telemetry — the TM campaign's anti-blind-tuning gate.
+    // softPct = spend as % of the SCALED soft budget (the two reverted TM attempts collapsed to ~33
+    // and nobody saw it until the match); base=0 marks an untimed/movetime search (line still emitted
+    // so harness parsers see every move).
+    if tmLogEnabled then
+        let usedMs = control.ElapsedMs
+        let softBudget = control.SoftBudgetMs
+
+        let softPct =
+            if softBudget > 0L then usedMs * 100L / softBudget else 0L
+
+        let tmSb = StringBuilder(160)
+
+        tmSb
+            .Append("info string tm base=")
+            .Append(control.BaseSoftMs)
+            .Append(" hard=")
+            .Append(control.HardMs)
+            .Append(" scale=")
+            .Append(control.SoftScalePct)
+            .Append(" used=")
+            .Append(usedMs)
+            .Append(" softPct=")
+            .Append(softPct)
+            .Append(" hardHit=")
+            .Append(if control.HardHit then 1 else 0)
+            .Append(" stab=")
+            .Append(workers.[0].TmStability)
+            .Append(" bestChg=")
+            .Append(workers.[0].TmBestChanges)
+            .Append(" depth=")
+            .Append(workers.[0].CompletedDepth)
+        |> ignore
+
+        writeLine (tmSb.ToString())
 
     // Final whole-search totals right before bestmove (the standard UCI closing summary line);
     // GUIs read this as the authoritative node/time accounting for the move.

@@ -256,6 +256,14 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
               UseDFPN = (Environment.GetEnvironmentVariable("EONEGO_DFPN") = "1")
               // Policy sidecar: ON iff startup actually loaded one (EONEGO_POLICY gate; see run()).
               UsePolicy = st.Policy.IsSome
+              // Dynamic time management (the TM campaign; default OFF pre-SPRT): each component is
+              // independently A/B-able per player without a rebuild. Game clocks only — movetime
+              // matches make all of these inert (soft = 0). EONEGO_TMLOG=1 adds per-move telemetry.
+              UseTmMtgHarden = (Environment.GetEnvironmentVariable("EONEGO_TMMTG") = "1")
+              UseTmStability = (Environment.GetEnvironmentVariable("EONEGO_TMSTAB") = "1")
+              UseTmTrend = (Environment.GetEnvironmentVariable("EONEGO_TMTREND") = "1")
+              UseTmFailLow = (Environment.GetEnvironmentVariable("EONEGO_TMFAILLOW") = "1")
+              UseTmEffort = (Environment.GetEnvironmentVariable("EONEGO_TMEFFORT") = "1")
               MoveOverhead = st.MoveOverhead
               AccCheckpointMb = 0
               MultiPv = st.MultiPv }

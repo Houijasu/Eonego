@@ -199,7 +199,7 @@ let private pickBest (mp: byref<MovePick>) (s: int) (e: int) : int =
 
     s
 
-/// partial_insertion_sort: move every element with score >= limit to the front in score-descending
+/// Partial insertion sort: move every element with score >= limit to the front in score-descending
 /// order; the rest stay unordered behind. Operates on BOTH parallel buffers (held-element form, NOT swaps).
 let private partialInsertionSort (mp: byref<MovePick>) (s: int) (e: int) (limit: int) : unit =
     let mutable sortedEnd = s
@@ -437,16 +437,18 @@ let nextMove (mp: byref<MovePick>) (skipQuiets: bool) : Move =
                         mp.PolKey.[0] <- mp.Pos.Key
 
                     // Ordering blend — INERT at the default PolOrdMul = 0 (Phase-0 re-scope: the LMR
-                    // term is the v1 consumption; this term buys its own SPRT later).
+                    // term is the v1 consumption; this term buys its own SPRT later). EONPOL02 logit
+                    // index = moverPieceType*64 + STM-relative square.
                     if Tunables.PolOrdMul <> 0 then
                         let stm = mp.Pos.SideToMove
 
                         for i in qStart .. mp.EndMoves - 1 do
                             let m = mp.Moves.[i]
+                            let pt = pieceType (mp.Pos.PieceOn(fromSq m))
 
                             let ps =
-                                mp.PolFrom.[Policy.relSq stm (fromSq m)]
-                                + mp.PolTo.[Policy.relSq stm (toSq m)]
+                                mp.PolFrom.[pt * 64 + Policy.relSq stm (fromSq m)]
+                                + mp.PolTo.[pt * 64 + Policy.relSq stm (toSq m)]
 
                             let t = (Tunables.PolOrdMul * ps) >>> Tunables.PolOrdShift
                             let t = max (-Tunables.PolClamp) (min Tunables.PolClamp t)

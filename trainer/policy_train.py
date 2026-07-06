@@ -16,7 +16,7 @@ import argparse
 import numpy as np
 
 import policy_dataset as pd
-from policy_model import HIDDEN, SHIFT0, WDL_SHIFT
+from policy_model import SHIFT0, WDL_SHIFT
 
 
 def main():
@@ -25,6 +25,7 @@ def main():
     ap.add_argument("--dump", required=True, help="dumpft binary aligned with --data")
     ap.add_argument("--out", required=True, help="output .npz")
     ap.add_argument("--net", default=None, help=".nnue (enables WDL head training via frozen-stack a1)")
+    ap.add_argument("--hidden", type=int, default=256, help="pfc0 width (EONPOL02: 32..1024, mult of 32)")
     ap.add_argument("--epochs", type=int, default=12)
     ap.add_argument("--batch", type=int, default=8192)
     ap.add_argument("--lr", type=float, default=0.03)
@@ -64,7 +65,7 @@ def main():
     n_val = max(64, int(n * args.val_frac))
     val_i, tr_i = perm[:n_val], perm[n_val:]
 
-    model = PolicyHead(seed=args.seed).to(dev)
+    model = PolicyHead(hidden=args.hidden, seed=args.seed).to(dev)
     heads = list(model.parameters())
     wdl_head = None
     if use_wdl:
@@ -136,7 +137,7 @@ def main():
         "bt": np.round(model.bt.detach().cpu().numpy()).astype(np.int32),
         "shift0": np.int32(SHIFT0),
         "wdl_shift": np.int32(WDL_SHIFT),
-        "hidden": np.int32(HIDDEN),
+        "hidden": np.int32(args.hidden),
     }
     if use_wdl:
         out["wdl_w"] = np.clip(np.round(wdl_head.w.detach().cpu().numpy()), -127, 127).astype(np.int8)

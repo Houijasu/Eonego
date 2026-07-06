@@ -419,9 +419,9 @@ type MovePickBench() =
 
         acc
 
-    /// SEE throughput: see_ge over every capture of the (capture-rich) positions (0 B/op expected).
+    /// SEE throughput: SeeGe over every capture of the (capture-rich) positions (0 B/op expected).
     [<Benchmark>]
-    member _.SeeGeDrain() =
+    member _.SeeThresholdDrain() =
         let pm = NativePtr.stackalloc<Move> 256
         let buf = Span<Move>(NativePtr.toVoidPtr pm, 256)
         let mutable acc = 0

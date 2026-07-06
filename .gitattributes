@@ -1,0 +1,2 @@
+# main.nnue is ~106 MB — Git LFS keeps it out of the object database (GitHub's 100 MB blob cap).
+nets/main.nnue filter=lfs diff=lfs merge=lfs -text

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Download nets/main.nnue from GitHub releases (see fetch-net.ps1).
+# Fallback: download nets/main.nnue from GitHub releases when missing (e.g. LFS not pulled).
+# Canonical weights are tracked in git under nets/ (see fetch-net.ps1).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 NET="$ROOT/nets/main.nnue"
@@ -23,8 +24,10 @@ echo "Downloading main.nnue from $URL ..."
 if ! curl -fsSL -o "$NET" "$URL"; then
   rm -f "$NET"
   cat >&2 <<'EOF'
-Failed to download main.nnue. The weights are not in git — use a release asset,
-copy a compatible FullThreats net (0x6A448AFA) to nets/main.nnue, or set EONEGO_NET at runtime.
+Failed to download main.nnue. Either:
+  git lfs pull   (canonical copy is in nets/main.nnue via Git LFS), or
+  use a release asset, copy a compatible FullThreats net (0x6A448AFA) to nets/main.nnue,
+  or set EONEGO_NET at runtime.
 EOF
   exit 1
 fi

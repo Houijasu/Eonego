@@ -1,10 +1,9 @@
-# Download the FullThreats NNUE net into nets/main.nnue (gitignored, ~106 MB).
-# Required before publish if you want the net embedded in Eonego.exe.
+# Fallback: download nets/main.nnue from GitHub Releases when the file is missing
+# (e.g. LFS not pulled). Canonical weights are tracked in git under nets/.
 #
 #   pwsh ./scripts/fetch-net.ps1
 #   pwsh ./scripts/fetch-net.ps1 -Version v0.0.4
 #
-# The net is attached to GitHub releases as main.nnue (not in git — too large).
 # Runtime override without rebuild: EONEGO_NET=/path/to/net.nnue
 
 param(
@@ -40,10 +39,11 @@ try {
     Write-Error @"
 Failed to download main.nnue ($($_.Exception.Message)).
 
-The trained weights are not stored in git. Either:
-  1. Run this script again after a release with a main.nnue asset is published, or
-  2. Copy any compatible FullThreats net (version 0x6A448AFA) to nets/main.nnue, or
-  3. Set EONEGO_NET=<path> at runtime (no embed; search still works).
+The trained weights are not present locally. Either:
+  1. Run: git lfs pull   (canonical copy is in nets/main.nnue via Git LFS), or
+  2. Run this script again after a release with a main.nnue asset is published, or
+  3. Copy any compatible FullThreats net (version 0x6A448AFA) to nets/main.nnue, or
+  4. Set EONEGO_NET=<path> at runtime (no embed; search still works).
 "@
 }
 

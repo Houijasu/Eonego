@@ -1,4 +1,4 @@
-"""Serialize a policy_train.py .npz into the EONPOL01 sidecar the engine loads (Eonego/Policy.fs).
+"""Serialize a policy_train.py .npz into the EONPOL02 sidecar the engine loads (Eonego/Policy.fs).
 
     uv run --with numpy python policy_export.py --npz data/policy_head.npz \
         --net ../nets/main.nnue --out ../nets/main.policy
@@ -12,7 +12,7 @@ import struct
 
 import numpy as np
 
-HIDDEN = 128
+HEAD_OUT = 384
 L1 = 1024
 STACKS = 8
 FC2IN = 32
@@ -28,12 +28,13 @@ def nnue_ft_hash(path: str) -> int:
 
 def export(npz_path: str, ft_hash: int, out_path: str) -> int:
     d = np.load(npz_path)
-    assert int(d["hidden"]) == HIDDEN, f"unsupported hidden {int(d['hidden'])}"
+    hidden = int(d["hidden"])
+    assert 32 <= hidden <= 1024 and hidden % 32 == 0, f"unsupported hidden {hidden}"
     has_wdl = "wdl_w" in d
     out = bytearray()
-    out += b"EONPOL01"
+    out += b"EONPOL02"
     out += struct.pack(
-        "<iIiiii", 1, ft_hash, HIDDEN, int(d["shift0"]), int(d["wdl_shift"]), 1 if has_wdl else 0
+        "<iIiiii", 2, ft_hash, hidden, int(d["shift0"]), int(d["wdl_shift"]), 1 if has_wdl else 0
     )
 
     def arr(name, dtype, shape):
@@ -41,12 +42,12 @@ def export(npz_path: str, ft_hash: int, out_path: str) -> int:
         assert a.shape == shape, f"{name}: {a.shape} != {shape}"
         return a.tobytes()
 
-    out += arr("b0", "<i4", (HIDDEN,))
-    out += arr("w0", "i1", (HIDDEN, L1))
-    out += arr("bf", "<i4", (64,))
-    out += arr("wf", "i1", (64, HIDDEN))
-    out += arr("bt", "<i4", (64,))
-    out += arr("wt", "i1", (64, HIDDEN))
+    out += arr("b0", "<i4", (hidden,))
+    out += arr("w0", "i1", (hidden, L1))
+    out += arr("bf", "<i4", (HEAD_OUT,))
+    out += arr("wf", "i1", (HEAD_OUT, hidden))
+    out += arr("bt", "<i4", (HEAD_OUT,))
+    out += arr("wt", "i1", (HEAD_OUT, hidden))
     if has_wdl:
         out += arr("wdl_b", "<i4", (STACKS, 3))
         out += arr("wdl_w", "i1", (STACKS, 3, FC2IN))

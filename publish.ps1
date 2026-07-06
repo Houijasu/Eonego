@@ -6,8 +6,8 @@
 #   pwsh ./publish.ps1
 #
 # Output: Eonego/bin/Release/net10.0/win-x64/publish/Eonego.exe  (~110 MB with embedded net).
-# Auto-runs scripts/fetch-net.ps1 when nets/main.nnue is absent. Requires the "Desktop development with C++"
-# VS workload (link.exe + libs).
+# Auto-runs scripts/fetch-net.ps1 when nets/main.nnue is absent (e.g. LFS not pulled).
+# Requires the "Desktop development with C++" VS workload (link.exe + libs).
 
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot

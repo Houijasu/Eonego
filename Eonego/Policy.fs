@@ -1,24 +1,27 @@
 /// Eonego — policy + WDL sidecar heads sharing the FullThreats NNUE trunk (plan: policy-net campaign).
 ///
 /// The policy head consumes the SAME 1024-wide u8 FT pairwise-product buffer the value stack feeds fc_0
-/// (`NNUE.ftInto`), so the expensive part — the incremental accumulator — is already paid for. Head v1 is
-/// hidden-decomposed from->to: pfc0 (1024 -> 128, int8, CReLU) -> pfrom/pto (128 -> 64 each) -> per-position
-/// logit arrays; per-move score = from[relSq stm (fromSq m)] + to[relSq stm (toSq m)] — an O(1) lookup.
+/// (`NNUE.ftInto`), so the expensive part — the incremental accumulator — is already paid for. Head v2 is
+/// PIECE-AWARE hidden-decomposed from->to: pfc0 (1024 -> hidden, int8, CReLU) -> pfrom/pto (hidden -> 384
+/// each, 6 piece types x 64 squares) -> per-position logit arrays; per-move score =
+/// from[pt*64 + relSq stm (fromSq m)] + to[pt*64 + relSq stm (toSq m)] where pt = the MOVER's piece type —
+/// still an O(1) lookup. Piece-awareness removes the v1 additive contradiction (two pieces wanting opposite
+/// square orderings was inexpressible with shared from/to arrays; the 2026-07-07 preserve-rate plateau).
 /// Squares are STM-relative (Black vertically flipped, s ^^^ 56 — the accumulator perspective convention;
 /// MUST match trainer/move_encoder.py). The WDL head (3 outputs per bucket off the value stack's a1
 /// activation) lives in the same sidecar and is evaluated on demand only (root/PV), never per node.
 ///
-/// EONPOL01 sidecar format (little-endian; separate file — NNUE.loadBytes hard-fails on trailing bytes):
-///   magic    "EONPOL01" (8 bytes)
-///   version  u32 = 1
+/// EONPOL02 sidecar format (little-endian; separate file — NNUE.loadBytes hard-fails on trailing bytes):
+///   magic    "EONPOL02" (8 bytes)
+///   version  u32 = 2
 ///   ftHash   u32   (must equal the .nnue Network.FtHash — refuses a head trained on a foreign trunk)
-///   hidden   u32   (must be 128 in v1)
+///   hidden   u32   (pfc0 output width: 32..MaxHidden, multiple of 32)
 ///   shift0   u32   (pfc0 CReLU shift)
 ///   wdlShift u32   (WDL softmax temperature shift)
 ///   flags    u32   (bit 0: WDL section present)
-///   pfc0B    i32[128]        pfc0W  i8[128*1024]   (row-major [out][in])
-///   pfromB   i32[64]         pfromW i8[64*128]
-///   ptoB     i32[64]         ptoW   i8[64*128]
+///   pfc0B    i32[hidden]      pfc0W  i8[hidden*1024]   (row-major [out][in])
+///   pfromB   i32[384]         pfromW i8[384*hidden]
+///   ptoB     i32[384]         ptoW   i8[384*hidden]
 ///   [flags&1] wdlB i32[LayerStacks*3]; wdlW i8[LayerStacks*3*Fc2In]
 ///   (must end exactly at EOF)
 ///
@@ -40,15 +43,16 @@ open Eonego.Bitboard
 open Eonego.Position
 
 [<Literal>]
-let Hidden = 128 // pfc0 output width (v1 fixed; the loader rejects anything else)
+let MaxHidden = 1024 // stackalloc bound; the loader rejects anything above
 
 [<Literal>]
-let SqOut = 64 // pfrom/pto output width (one logit per STM-relative square)
+let HeadOut = 384 // 6 piece types x 64 STM-relative squares (EONPOL02 piece-aware from/to heads)
 
 [<AllowNullLiteral; Sealed>]
 type PolicyNetwork
     (
         ftHash: uint32,
+        hidden: int,
         shift0: int,
         wdlShift: int,
         pfc0B: int[],
@@ -61,6 +65,7 @@ type PolicyNetwork
         wdlW: sbyte[]
     ) =
     member _.FtHash = ftHash
+    member _.Hidden = hidden
     member _.Shift0 = shift0
     member _.WdlShift = wdlShift
     member _.Pfc0B = pfc0B
@@ -92,12 +97,12 @@ let private readI32At (buf: byte[]) (pos: int) : int =
     ||| (int buf.[pos + 3] <<< 24)
 
 let loadBytes (buf: byte[]) (expectedFtHash: uint32) : PolicyLoadResult =
-    let magic = "EONPOL01"B
+    let magic = "EONPOL02"B
 
     if buf.Length < 32 then
         PolicyFailed "truncated header"
     elif Array.sub buf 0 8 <> magic then
-        PolicyFailed "bad magic (want EONPOL01)"
+        PolicyFailed "bad magic (want EONPOL02)"
     else
         let version = readI32At buf 8
         let ftHash = uint32 (readI32At buf 12)
@@ -106,11 +111,11 @@ let loadBytes (buf: byte[]) (expectedFtHash: uint32) : PolicyLoadResult =
         let wdlShift = readI32At buf 24
         let flags = readI32At buf 28
 
-        if version <> 1 then
+        if version <> 2 then
             PolicyFailed ("unsupported version " + string version)
         elif ftHash <> expectedFtHash then
             PolicyFailed "ftHash mismatch (policy head trained on a different trunk)"
-        elif hidden <> Hidden then
+        elif hidden < 32 || hidden > MaxHidden || hidden % 32 <> 0 then
             PolicyFailed ("unsupported hidden width " + string hidden)
         elif shift0 < 0 || shift0 > 31 || wdlShift < 0 || wdlShift > 31 then
             PolicyFailed "shift out of range"
@@ -120,9 +125,9 @@ let loadBytes (buf: byte[]) (expectedFtHash: uint32) : PolicyLoadResult =
 
             let expectedLen =
                 32
-                + Hidden * 4 + Hidden * NNUE.L1
-                + SqOut * 4 + SqOut * Hidden
-                + SqOut * 4 + SqOut * Hidden
+                + hidden * 4 + hidden * NNUE.L1
+                + HeadOut * 4 + HeadOut * hidden
+                + HeadOut * 4 + HeadOut * hidden
                 + (if hasWdl then wdlN * 4 + wdlN * NNUE.Fc2In else 0)
 
             if buf.Length <> expectedLen then
@@ -141,15 +146,18 @@ let loadBytes (buf: byte[]) (expectedFtHash: uint32) : PolicyLoadResult =
                     p <- p + n
                     out
 
-                let pfc0B = readI32Arr Hidden
-                let pfc0W = readI8Arr (Hidden * NNUE.L1)
-                let pfromB = readI32Arr SqOut
-                let pfromW = readI8Arr (SqOut * Hidden)
-                let ptoB = readI32Arr SqOut
-                let ptoW = readI8Arr (SqOut * Hidden)
+                let pfc0B = readI32Arr hidden
+                let pfc0W = readI8Arr (hidden * NNUE.L1)
+                let pfromB = readI32Arr HeadOut
+                let pfromW = readI8Arr (HeadOut * hidden)
+                let ptoB = readI32Arr HeadOut
+                let ptoW = readI8Arr (HeadOut * hidden)
                 let wdlB = if hasWdl then readI32Arr wdlN else Array.empty
                 let wdlW = if hasWdl then readI8Arr (wdlN * NNUE.Fc2In) else Array.empty
-                PolicyLoaded(PolicyNetwork(ftHash, shift0, wdlShift, pfc0B, pfc0W, pfromB, pfromW, ptoB, ptoW, wdlB, wdlW))
+
+                PolicyLoaded(
+                    PolicyNetwork(ftHash, hidden, shift0, wdlShift, pfc0B, pfc0W, pfromB, pfromW, ptoB, ptoW, wdlB, wdlW)
+                )
 
 let load (path: string) (expectedFtHash: uint32) : PolicyLoadResult =
     try
@@ -216,7 +224,7 @@ let private gemvU8I8
             out.[o] <- s
 
 /// Head forward from a caller-provided ft buffer (the parity/test surface — kernel paths explicit).
-/// Writes the 64 from-logits and 64 to-logits (raw i32, STM-relative square index).
+/// Writes the 384 from-logits and 384 to-logits (raw i32; index = pieceType*64 + STM-relative square).
 [<System.Runtime.CompilerServices.SkipLocalsInit>]
 let forwardFromFt
     (pnet: PolicyNetwork)
@@ -226,20 +234,21 @@ let forwardFromFt
     (useAvx2: bool)
     (useVnni: bool)
     : unit =
-    let accPtr = NativePtr.stackalloc<int> Hidden
-    let acc = Span<int>(NativePtr.toVoidPtr accPtr, Hidden)
-    let hidPtr = NativePtr.stackalloc<byte> Hidden
-    let hid = Span<byte>(NativePtr.toVoidPtr hidPtr, Hidden)
+    let hidden = pnet.Hidden
+    let accPtr = NativePtr.stackalloc<int> hidden
+    let acc = Span<int>(NativePtr.toVoidPtr accPtr, hidden)
+    let hidPtr = NativePtr.stackalloc<byte> hidden
+    let hid = Span<byte>(NativePtr.toVoidPtr hidPtr, hidden)
 
-    gemvU8I8 ft pnet.Pfc0W pnet.Pfc0B acc Hidden NNUE.L1 useAvx2 useVnni
+    gemvU8I8 ft pnet.Pfc0W pnet.Pfc0B acc hidden NNUE.L1 useAvx2 useVnni
 
     let shift0 = pnet.Shift0
 
-    for o in 0 .. Hidden - 1 do
+    for o in 0 .. hidden - 1 do
         hid.[o] <- byte (max 0 (min 127 (acc.[o] >>> shift0)))
 
-    gemvU8I8 hid pnet.PfromW pnet.PfromB fromOut SqOut Hidden useAvx2 useVnni
-    gemvU8I8 hid pnet.PtoW pnet.PtoB toOut SqOut Hidden useAvx2 useVnni
+    gemvU8I8 hid pnet.PfromW pnet.PfromB fromOut HeadOut hidden useAvx2 useVnni
+    gemvU8I8 hid pnet.PtoW pnet.PtoB toOut HeadOut hidden useAvx2 useVnni
 
 /// Production fill: materialize the FT product for the CURRENT position and run the head. Called
 /// lazily from MovePick's StgQuietInit (once per node, Zobrist-guarded by the caller).

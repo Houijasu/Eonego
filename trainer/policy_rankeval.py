@@ -19,7 +19,7 @@ import os
 import subprocess
 import sys
 
-from move_encoder import encode_uci, fen_black_to_move
+from move_encoder import board_of_fen, encode_uci_piece, fen_black_to_move
 
 
 def rank_of(scores: list[int], target_idx: int) -> int:
@@ -79,11 +79,12 @@ def main():
     h_mrr = p_mrr = 0.0
     for (fen, cutter, pairs), (fl, tl) in zip(states, logits):
         black = fen_black_to_move(fen)
+        board = board_of_fen(fen)
         ucis = [u for u, _ in pairs]
         hist = [s for _, s in pairs]
         pol = []
         for u in ucis:
-            fr, to = encode_uci(u, black)
+            fr, to = encode_uci_piece(u, black, board)
             pol.append(fl[fr] + tl[to])
         ti = ucis.index(cutter)
         hr = rank_of(hist, ti)

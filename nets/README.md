@@ -1,22 +1,49 @@
-# NNUE network (`main.nnue`)
+# Trained weights (`main.nnue`, `main.policy`)
 
-The trained FullThreats net (~106 MB) is **not committed to git** (see root `.gitignore`).
+Canonical engine weights for this repo:
 
-## Before building a playable engine
+| File | Role | Size (approx.) |
+|---|---|---|
+| `main.nnue` | FullThreats NNUE eval trunk | ~106 MB (Git LFS) |
+| `main.policy` | EONPOL02 policy + WDL sidecar (`ftHash`-bound to `main.nnue`) | ~450 KB |
+
+Both are **tracked in git**. `main.nnue` is stored via **Git LFS** — clone with LFS enabled:
+
+```powershell
+git lfs install   # once per machine
+git clone <repo>  # or: git lfs pull  on an existing clone
+```
+
+## Build embed
+
+`Eonego.fsproj` embeds the files when present:
+
+- `main.nnue` → manifest resource `eval.nnue`
+- `main.policy` → manifest resource `policy.dat` (loaded only when `EONEGO_POLICY=1` or `=<path>`)
+
+```powershell
+pwsh ../publish.ps1
+# -> Eonego/bin/Release/net10.0/win-x64/publish/Eonego.exe
+```
+
+## Without the files
+
+- `dotnet build` / `dotnet publish` **still succeed** (conditional `<EmbeddedResource>`).
+- Missing `main.nnue`: exe prints `info string no NNUE net embedded; cannot search` on `go`.
+- Missing `main.policy`: policy stays off (default); search is unchanged.
+- Tests that need eval **soft-skip** when `main.nnue` is absent.
+
+## Runtime overrides (no rebuild)
+
+- `EONEGO_NET=<path>` — load a compatible `.nnue` trunk from disk
+- `EONEGO_POLICY=<path>` — load a `.policy` sidecar (`=1` reads the embedded `policy.dat`)
+
+## Fallback download
+
+If LFS was not pulled and `main.nnue` is missing:
 
 ```powershell
 pwsh ../scripts/fetch-net.ps1
 ```
 
-Then publish or build — `Eonego.fsproj` embeds `nets/main.nnue` as manifest resource `eval.nnue` when the file exists.
-
-## Without the file
-
-- `dotnet build` / `dotnet publish` **still succeed** (conditional `<EmbeddedResource>`).
-- The exe is ~4 MB and prints `info string no NNUE net embedded; cannot search` on `go`.
-- Tests that need eval **soft-skip** when the file is absent.
-
-## Alternatives
-
-- **Pre-built binary:** [GitHub Releases](https://github.com/Houijasu/Eonego/releases) zip already includes the embedded net.
-- **Runtime override:** `EONEGO_NET=C:\path\to\net.nnue` (same architecture, version `0x6A448AFA`).
+Release zips on [GitHub Releases](https://github.com/Houijasu/Eonego/releases) also ship a pre-embedded binary.
