@@ -88,8 +88,8 @@ project.lock.json
 project.fragment.lock.json
 artifacts/
 
-# Planning documents (local superpowers plans)
-docs/superpowers/plans/
+# Local documentation (not versioned)
+docs/
 
 # MCP / agent tooling caches
 .aidex/
