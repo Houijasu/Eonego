@@ -690,6 +690,11 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     /// MultiPV: 0-based index of the line currently being searched (reporting: currmovenumber offset).
     member val RootPvIdx = 0 with get, set
 
+    /// Current iterative-deepening iteration depth — the `depth` printed on info lines. currmove reads
+    /// it so its depth matches the PV line for the same iteration; negamax itself only sees `depthIn`,
+    /// which an aspiration fail-high may have reduced below the iteration depth.
+    member val RootDepth = 0 with get, set
+
     /// Partial-iteration commit (EONEGO_PARTIAL=1): the best root move that raised alpha during the
     /// CURRENT (possibly interrupted) iteration, with its score. Reset to MoveNone at each iteration
     /// start; a hard-stopped iteration's progress is otherwise discarded wholesale (up to hard≈3×soft
@@ -1463,7 +1468,12 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                 let r =
                     Tunables.NmpBase
                     + depthIn / Tunables.NmpDepthDiv
-                    + (if workingEval - beta > Tunables.NmpEvalMargin then 1 else 0)
+                    + (if Tunables.NmpEvalDiv > 0 then
+                           // SF-style continuous eval-excess reduction (workingEval >= beta here, so >= 0).
+                           min ((workingEval - beta) / Tunables.NmpEvalDiv) Tunables.NmpEvalMax
+                       else
+                           // Legacy binary term (default; byte-identical tree).
+                           (if workingEval - beta > Tunables.NmpEvalMargin then 1 else 0))
                     + (if improving then 1 else 0)
                     + (if cfg.UseTtCapture && not ttCapture then 1 else 0)
                 w.Stack.[ssCur].CurrentMove <- MoveNull
@@ -1711,7 +1721,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                     if ply = 0 && w.IsMain && excludedMove = MoveNone && w.Control.ElapsedMs > 3000L then
                         writeLine (
                             "info depth "
-                            + string depthIn
+                            + string w.RootDepth
                             + " currmove "
                             + toUCI m
                             + " currmovenumber "
@@ -2070,6 +2080,9 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
                                 if usePruning then
                                     let bonus = statBonus depth
+                                    // Asymmetric penalty: default statMalus == statBonus (byte-identical);
+                                    // raise EONEGO_T_STATM_MUL for a steeper SF-style malus (roadmap B2).
+                                    let malus = statMalus depth
 
                                     if isQuiet then
                                         let mPc = pos.PieceOn(fromSq m)
@@ -2083,12 +2096,12 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                                         for qi in 0 .. nQuiets - 2 do
                                             let q = quietsBuf.[quietsBase + qi]
                                             let qPc = pos.PieceOn(fromSq q)
-                                            w.Tables.UpdateMain us q (-bonus)
-                                            w.Tables.UpdateCont1 prev1Pc prev1To qPc (toSq q) (-bonus)
-                                            w.Tables.UpdateCont2 prev2Pc prev2To qPc (toSq q) (-bonus)
+                                            w.Tables.UpdateMain us q (-malus)
+                                            w.Tables.UpdateCont1 prev1Pc prev1To qPc (toSq q) (-malus)
+                                            w.Tables.UpdateCont2 prev2Pc prev2To qPc (toSq q) (-malus)
 
                                             if cfg.UseCont4 then
-                                                w.Tables.UpdateCont4 prev4Pc prev4To qPc (toSq q) (-bonus)
+                                                w.Tables.UpdateCont4 prev4Pc prev4To qPc (toSq q) (-malus)
 
                                         w.Tables.SetKiller ply m
 
@@ -2117,7 +2130,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                                                 else
                                                     pieceType (pos.PieceOn(toSq c))
 
-                                            w.Tables.UpdateCapture (pos.PieceOn(fromSq c)) (toSq c) cCapPt (-bonus)
+                                            w.Tables.UpdateCapture (pos.PieceOn(fromSq c)) (toSq c) cCapPt (-malus)
 
                 m <-
                     if cutoff then
@@ -2214,13 +2227,16 @@ let private reportLine (w: Worker) (depth: int) (pvNum: int) (score: int) (bound
     let nps = if ms > 0L then nodes * 1000L / ms else nodes
     let sb = StringBuilder(160)
 
+    let hashfull = w.Control.Tt.Hashfull()
+
+    // Field order mirrors Fritz: depth seldepth score [bound] nodes nps [hashfull] tbhits time
+    // multipv pv — multipv sits right before the PV, not up front. (UCI parsers are order-agnostic;
+    // this is purely to read like Fritz's console.)
     sb
         .Append("info depth ")
         .Append(depth)
         .Append(" seldepth ")
         .Append(w.SelDepth)
-        .Append(" multipv ")
-        .Append(pvNum)
         .Append(" score ")
         .Append(scoreString score)
         .Append(bound)
@@ -2228,12 +2244,19 @@ let private reportLine (w: Worker) (depth: int) (pvNum: int) (score: int) (bound
         .Append(nodes)
         .Append(" nps ")
         .Append(nps)
-        .Append(" hashfull ")
-        .Append(w.Control.Tt.Hashfull())
+    |> ignore
+
+    // Fritz emits `hashfull` only once the table is measurably filled, omitting it while still 0.
+    if hashfull > 0 then
+        sb.Append(" hashfull ").Append(hashfull) |> ignore
+
+    sb
         .Append(" tbhits ")
         .Append(w.Control.TbHitSum())
         .Append(" time ")
         .Append(ms)
+        .Append(" multipv ")
+        .Append(pvNum)
         .Append(" pv")
     |> ignore
 
@@ -2404,6 +2427,7 @@ let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
     let mutable depth = 1
 
     while depth <= maxDepth && not w.Control.Stopped do
+        w.RootDepth <- depth
         w.ClearRootExclusions()
         // Partial-iteration commit: forget the previous iteration's root progress marker — only a
         // move fully searched WITHIN the iteration a hard stop interrupts may be adopted below.
@@ -3003,9 +3027,11 @@ let private goCore (control: SearchControl) (workers: Worker[]) : Move =
             "info string prof2 applyMs=" + ms PosProf.tApply
             + " gatherMs=" + ms PosProf.tGather
             + " enumMs=" + ms PosProf.tEnumThreats
+            + " updThrMs=" + ms PosProf.tUpdThreats
             + " nApply=" + string PosProf.nApply
             + " nGather=" + string PosProf.nGather
             + " nEnum=" + string PosProf.nEnumThreats
+            + " nUpdThr=" + string PosProf.nUpdThreats
             + " rowsHalf=" + string PosProf.nRowsHalf
             + " rowsThr=" + string PosProf.nRowsThr
         )
@@ -3271,6 +3297,77 @@ let searchToNodesNet (fen: string) (rootMoves: Move[]) (nodes: int64) (cfg: Sear
         if isLegalRoot w.Pos w.RootBest then w.RootBest else firstLegalMove w.Pos
 
     struct (w.RootScore, w.Nodes, best)
+
+/// UCI `bench` position set: a fixed, known-legal sample across game phases (opening / tactical
+/// middlegame / the canonical perft positions / endgames). The summed node count at a fixed depth is
+/// a deterministic build fingerprint at Threads = 1 (like SF's bench signature).
+let benchFens: string[] =
+    [| "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+       "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"
+       "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1"
+       "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1"
+       "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8"
+       "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10"
+       "8/k7/3p4/p2P1p2/P2P1P2/8/8/K7 w - - 0 1"
+       "8/8/8/4k3/8/8/4KQ2/8 w - - 0 1"
+       "8/8/1P6/5pr1/8/4R3/7k/2K5 w - - 0 1"
+       "6k1/5ppp/8/8/8/8/5PPP/6K1 w - - 0 1" |]
+
+/// UCI `bench [depth]`: single-thread, fixed-depth iterative-deepening search over `benchFens` on ONE
+/// shared TT (SF-style — a fresh generation per position, not cleared between them), summing nodes.
+/// The node total is deterministic at Threads = 1 (a build fingerprint); nps = nodes / wall-time.
+/// Returns struct (totalNodes, elapsedTicks). Emits the search's normal per-iteration info lines.
+let bench (depth: int) (cfg: SearchConfig) (net: Network option) : struct (int64 * int64) =
+    // Force single-thread: LazySMP node counts are non-deterministic (TT-race dependent), which would
+    // destroy the fingerprint. Everything else (pruning/eval/net) comes from the live config.
+    let cfg1 = { cfg with Threads = 1 }
+    let tt = TranspositionTable(max 1 cfg1.HashMb)
+    let mutable total = 0L
+
+    // EONEGO_PROF=1: accumulate the phase counters across the WHOLE bench run (iterativeDeepening
+    // never resets them — only goCore does — so reset once here and report at the end). This is how
+    // the H1 headline (UpdatePieceThreats share of Make) gets settled: updThrMs / makeMs.
+    if PosProf.Enabled then
+        PosProf.reset ()
+
+    let t0 = System.Diagnostics.Stopwatch.GetTimestamp()
+
+    for fen in benchFens do
+        let control =
+            SearchControl(cfg1, { defaultLimits with Depth = depth }, tt, fen, [||], ?net = net)
+
+        control.Reset()
+        control.NewSearch()
+        let w = Worker(0, true, control)
+        w.SetupRoot()
+        control.NodeSum <- (fun () -> w.Nodes)
+        control.TbHitSum <- (fun () -> w.TbHits)
+        control.StartClock 0L 0L
+        iterativeDeepening w depth
+        control.Stop()
+        total <- total + w.Nodes
+
+    let elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - t0
+
+    if PosProf.Enabled then
+        let ms (t: int64) =
+            (double t * 1000.0 / double System.Diagnostics.Stopwatch.Frequency).ToString("F0")
+
+        let pct (part: int64) (whole: int64) =
+            if whole = 0L then "0"
+            else (double part * 100.0 / double whole).ToString("F1")
+
+        writeLine (
+            "info string bench prof makeMs=" + ms PosProf.tMake
+            + " updThrMs=" + ms PosProf.tUpdThreats
+            + " (updThr=" + pct PosProf.tUpdThreats PosProf.tMake + "% of make)"
+            + " ensureMs=" + ms PosProf.tEnsure
+            + " evalMs=" + ms PosProf.tEval
+            + " nMake=" + string PosProf.nMake
+            + " nUpdThr=" + string PosProf.nUpdThreats
+        )
+
+    struct (total, elapsed)
 
 let searchToDepth (fen: string) (rootMoves: Move[]) (depth: int) (cfg: SearchConfig) : struct (int * int64 * Move) =
     searchToDepthNet fen rootMoves depth cfg None

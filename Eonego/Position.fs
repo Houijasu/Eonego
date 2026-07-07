@@ -77,6 +77,12 @@ module PosProf =
     let mutable nEnumThreats = 0L
     let mutable nGather = 0L // calls that did WORK (missed the per-frame changed cache)
     let mutable nApply = 0L // perspective-frames materialized by walks
+    // H1 headline (2026-07-07 "why is SF faster" audit): total time in UpdatePieceThreats — the
+    // FullThreats make-path threat-edge maintenance SF's do_move has NO analogue for (do_move records
+    // only a DirtyPiece list). tUpdThreats ⊂ tMake, sits OUTSIDE the eval/ensure buckets. This is the
+    // single number that sizes whether the make-path threat scan is worth attacking (roadmap H1/H2).
+    let mutable tUpdThreats = 0L
+    let mutable nUpdThreats = 0L // UpdatePieceThreats calls (≈2-3 per active Make)
     // Row-volume counters (2026-07-07 "why is SF faster" session): the apply kernel is bandwidth-
     // bound, so rows folded per apply is THE number to compare against SF-master's FullThreats
     // delta scheme. HalfKA rows are 2 KB (int16), threat rows 1 KB (int8, widened at apply).
@@ -115,6 +121,8 @@ module PosProf =
         nEnumThreats <- 0L
         nGather <- 0L
         nApply <- 0L
+        tUpdThreats <- 0L
+        nUpdThreats <- 0L
         nRowsHalf <- 0L
         nRowsThr <- 0L
         nNodesMain <- 0L
@@ -426,6 +434,8 @@ type Position() =
                 this.AppendDirtyThreat(putPiece, slider, pc, sliderSq, sq)
 
     member private this.UpdatePieceThreats(pc: Piece, putPiece: bool, sq: Square, computeRay: bool, noRaysContaining: Bitboard) =
+        let profT0 = if PosProf.Enabled then System.Diagnostics.Stopwatch.GetTimestamp() else 0L
+
         if pc <> NoPiece then
             let occupied = byTypeBB.[AllPieces]
             let rookQueens = byTypeBB.[Rook] ||| byTypeBB.[Queen]
@@ -482,6 +492,10 @@ type Position() =
 
                     if src <> NoPiece && pieceType src <> King then
                         this.AppendDirtyThreat(putPiece, src, pc, from, sq)
+
+        if PosProf.Enabled then
+            PosProf.tUpdThreats <- PosProf.tUpdThreats + (System.Diagnostics.Stopwatch.GetTimestamp() - profT0)
+            PosProf.nUpdThreats <- PosProf.nUpdThreats + 1L
 
     // --- mutation choke points (the ONLY board writers) ---------------------
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]

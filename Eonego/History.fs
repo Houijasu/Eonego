@@ -17,6 +17,7 @@ module Eonego.History
 
 open System
 open System.Runtime.CompilerServices
+open System.Runtime.InteropServices
 open Eonego.Bitboard
 open Eonego.Move
 open Eonego.Position
@@ -32,6 +33,21 @@ let CorrHistD = Tunables.CorrHistD // correction-history divisor
 /// Stat bonus as a function of depth (shape tunable via EONEGO_T_STATB_*).
 let inline statBonus (depth: int) : int =
     min (Tunables.StatBonusMul * depth - 100) Tunables.StatBonusCap
+
+/// Stat MALUS (penalty) as a function of depth (shape tunable via EONEGO_T_STATM_*). DEFAULT is
+/// numerically identical to statBonus, so `-statMalus` reproduces the legacy symmetric `-statBonus`
+/// (byte-identical tree); raise StatMalusMul for an SF-style steeper, asymmetric penalty.
+let inline statMalus (depth: int) : int =
+    min (Tunables.StatMalusMul * depth - 100) Tunables.StatMalusCap
+
+/// Unchecked int16-array read: base-ref + element offset skips the bounds-check compare the AOT can't
+/// elide on the wide computed history indices (mirrors the LoadUnsafe kernels). ONLY for the always-
+/// allocated hot tables (main/capture/cont1/cont2/corr); the lazily-allocated tables (cont4, corr*)
+/// keep the checked read — an unchecked access to their Array.empty placeholder would corrupt memory.
+/// Callers own the invariant that the index is in range (the table dims are fixed constants).
+[<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+let inline private ruh (a: int16[]) (i: int) : int =
+    int (Unsafe.Add(&MemoryMarshal.GetArrayDataReference a, i))
 
 [<Sealed>]
 type Tables() =
@@ -105,11 +121,11 @@ type Tables() =
 
     // --- reads (AggressiveInlining ATTRIBUTE: they touch the private arrays yet inline in-assembly) ---
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-    member _.MainHistory (c: Color) (fromToKey: int) : int = int main.[(c <<< 12) ||| fromToKey]
+    member _.MainHistory (c: Color) (fromToKey: int) : int = ruh main ((c <<< 12) ||| fromToKey)
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member _.CaptureHistory (pc: Piece) (dst: Square) (capturedPT: PieceType) : int =
-        int capture.[((pc * 64 + dst) <<< 3) + capturedPT]
+        ruh capture (((pc * 64 + dst) <<< 3) + capturedPT)
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member _.CounterMove (prevPc: Piece) (prevTo: Square) : Move = counter.[prevPc * 64 + prevTo]
@@ -123,14 +139,14 @@ type Tables() =
         if prevPc < 0 then
             0
         else
-            int cont1.[(prevPc * 64 + prevTo) * 768 + (pc * 64 + dst)]
+            ruh cont1 ((prevPc * 64 + prevTo) * 768 + (pc * 64 + dst))
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member _.ContHistory2 (prevPc: int) (prevTo: int) (pc: Piece) (dst: Square) : int =
         if prevPc < 0 then
             0
         else
-            int cont2.[(prevPc * 64 + prevTo) * 768 + (pc * 64 + dst)]
+            ruh cont2 ((prevPc * 64 + prevTo) * 768 + (pc * 64 + dst))
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member _.ContHistory4 (prevPc: int) (prevTo: int) (pc: Piece) (dst: Square) : int =
@@ -142,7 +158,7 @@ type Tables() =
     /// Raw correction-history entry for (side to move, pawn structure); callers scale (/16) into eval units.
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member _.CorrHist (c: Color) (pawnKey: uint64) : int =
-        int corr.[(c <<< 14) ||| int (pawnKey &&& 16383UL)]
+        ruh corr ((c <<< 14) ||| int (pawnKey &&& 16383UL))
 
     /// Raw minor-piece correction-history entry for (side to move, minor structure); same scaling contract.
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]

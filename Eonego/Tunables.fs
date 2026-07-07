@@ -38,6 +38,12 @@ let RazorSlope = envInt "EONEGO_T_RAZOR_SLOPE" 202 1 1000 // was 200
 let NmpBase = envInt "EONEGO_T_NMP_BASE" 3 1 8
 let NmpDepthDiv = envInt "EONEGO_T_NMP_DDIV" 4 1 16
 let NmpEvalMargin = envInt "EONEGO_T_NMP_EVALMARGIN" 212 1 2000 // was 200
+// Continuous eval-excess reduction (SF-style): when > 0, the binary "eval-over-beta => +1 ply" term
+// becomes min((workingEval - beta) / NmpEvalDiv, NmpEvalMax). DEFAULT 0 = the legacy binary term, so
+// the tree is byte-identical until this is set — SPRT the enabled value (roadmap B1). ~200 is the SF
+// scale, but Eonego's NNUE eval scale differs, so SPSA NmpEvalDiv (and co-tune NmpBase/NmpDepthDiv).
+let NmpEvalDiv = envInt "EONEGO_T_NMP_EVALDIV" 0 0 2000
+let NmpEvalMax = envInt "EONEGO_T_NMP_EVALMAX" 6 1 10
 
 // --- ProbCut ---
 let ProbCutMargin = envInt "EONEGO_T_PROBCUT_MARGIN" 200 1 1000
@@ -183,6 +189,12 @@ let RootLmrCap = envInt "EONEGO_T_ROOT_LMR_CAP" 99 0 99
 // --- History stat bonus: min(Mul*depth - 100, Cap) ---
 let StatBonusMul = envInt "EONEGO_T_STATB_MUL" 167 16 1000 // was 160
 let StatBonusCap = envInt "EONEGO_T_STATB_CAP" 1735 100 7000 // was 1700
+// Stat MALUS (penalty) shape — DEFAULTS IDENTICAL to statBonus (167/1735) so `-statMalus` equals the
+// legacy `-statBonus` and the tree stays byte-identical until tuned. SF's malus grows several× faster
+// with depth than its bonus; SPRT a steeper StatMalusMul (~350-700) so the butterfly/continuation
+// tables stay discriminative (roadmap B2). Own EONEGO_T_STATM_* channels for independent SPSA.
+let StatMalusMul = envInt "EONEGO_T_STATM_MUL" 167 16 1500
+let StatMalusCap = envInt "EONEGO_T_STATM_CAP" 1735 100 7000
 
 // --- Capture ordering: MVV multiplier in MovePick capture scoring (score = Mul*pieceValue + captHist) ---
 let CaptScoreMul = envInt "EONEGO_T_CAPSCORE_MUL" 7 1 20

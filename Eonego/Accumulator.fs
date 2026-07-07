@@ -32,23 +32,8 @@ let UseAvx512 =
     && System.Environment.GetEnvironmentVariable("EONEGO_FORCE_SCALAR") <> "1"
     && System.Environment.GetEnvironmentVariable("EONEGO_FORCE_NOAVX512") <> "1"
 
-/// Weight-row software prefetch mode (EONEGO_ROWPREFETCH): 0 = off (DEFAULT), 1 = each row's
-/// leading 256 B into L1, 2 = mode 1 plus the row tail into L2. SF-master prefetches each threat
-/// row as its index is produced (nnue/features/full_threats.cpp), and the fused-apply rows here
-/// looked latency-bound (~52 ns amortized per random row, 2026-07-07 session 6) — but MEASURED
-/// (counterbalanced fixed-depth A/B, byte-identical 1.42M-node trees, d17+d19, 6 warm rounds):
-/// mode 1 = NEUTRAL (within ±1%), mode 2 = ~3.5% REGRESSION (the L2 tail queue delays demand
-/// loads). The OOO window already overlaps the tile-0 misses and the L2 streamer follows the
-/// 16-tile row strides, so explicit prefetch has nothing left to hide. THIRD neutral prefetch
-/// verdict in this codebase (sessions 2, 4, 6b) — do not re-propose without new evidence; the
-/// knob stays for A/B on other hardware. Semantics-free: node counts byte-identical in all modes.
-/// MUTABLE: also exposed as the UCI spin option `RowPrefetch` (0..2) — setoption stops+joins any
-/// live search first (the UCI invariant), so writes never race the kernel's reads.
-let mutable RowPrefetchMode =
-    match System.Environment.GetEnvironmentVariable "EONEGO_ROWPREFETCH" with
-    | "1" -> 1
-    | "2" -> 2
-    | _ -> 0
+/// Weight-row software prefetch: each row's leading 256 B into L1 before the tile sweep (mode 1 from
+/// the old A/B knob). Semantics-free — node counts byte-identical with prefetch off.
 
 /// Pinned (POH) allocation whose usable region starts 64-byte aligned: returns the array plus the element
 /// offset of the aligned region. Managed array bases land at arbitrary 8B residues (measured 16/24/32/40/56
@@ -789,23 +774,15 @@ let applyFused
         "applyFused: partially overlapping src/dst ranges"
     )
 
-    // Weight-row prefetch (see RowPrefetchMode): fire every row's leading lines before the tile
-    // sweep. Weight arrays are POH-pinned (allocAligned64), so raw addresses are stable; prefetch
-    // never faults. HalfKA rows are 2 KB int16, threat rows 1 KB int8 — leading 256 B covers the
-    // first 2 (half) / 4 (threat) tiles; mode 2 queues the tail into L2 behind the demand stream.
-    if RowPrefetchMode > 0 && useAvx2 && Sse.IsSupported then
-        let inline rowPf (basePtr: nativeint) (rowBytes: int) =
+    // Weight-row prefetch: fire every row's leading lines before the tile sweep. Weight arrays are
+    // POH-pinned (allocAligned64), so raw addresses are stable; prefetch never faults. HalfKA rows
+    // are 2 KB int16, threat rows 1 KB int8 — leading 256 B covers the first 2 (half) / 4 (threat) tiles.
+    if useAvx2 && Sse.IsSupported then
+        let inline rowPf (basePtr: nativeint) (_rowBytes: int) =
             Sse.Prefetch0(NativePtr.toVoidPtr (NativePtr.ofNativeInt<byte> basePtr))
             Sse.Prefetch0(NativePtr.toVoidPtr (NativePtr.ofNativeInt<byte> (basePtr + 64n)))
             Sse.Prefetch0(NativePtr.toVoidPtr (NativePtr.ofNativeInt<byte> (basePtr + 128n)))
             Sse.Prefetch0(NativePtr.toVoidPtr (NativePtr.ofNativeInt<byte> (basePtr + 192n)))
-
-            if RowPrefetchMode = 2 then
-                let mutable o = 256
-
-                while o < rowBytes do
-                    Sse.Prefetch1(NativePtr.toVoidPtr (NativePtr.ofNativeInt<byte> (basePtr + nativeint o)))
-                    o <- o + 64
 
         if nHalfAdd + nHalfSub > 0 then
             let hwRef = &MemoryMarshal.GetArrayDataReference halfW

@@ -207,6 +207,74 @@ let private parseGo (tokens: string[]) : SearchLimits * string[] =
 
     (lim, searchMoves.ToArray())
 
+/// Build the search config from UCI state + the EONEGO_* A/B env flags. Shared by `startSearch` and
+/// the `bench` command so both exercise the exact same toggles (a `bench` NPS number is only useful if
+/// it runs the release configuration).
+let private buildConfig (st: UCIState) : SearchConfig =
+    { Threads = st.Threads
+      HashMb = st.HashMb
+      UseTt = true
+      UsePruning = true
+      UseProbCut = true
+      UseIir = true
+      UseRazoring = true
+      UseHistoryPruning = true
+      UseHistPruneCombined = (Environment.GetEnvironmentVariable("EONEGO_HISTCOMBINED") = "1")
+      UseDeltaPruning = true
+      UseQsDeltaCorrected = (Environment.GetEnvironmentVariable("EONEGO_QSDELTACORR") = "1")
+      UseContHist = true
+      UseSingular = true
+      UseNmpVerify = true
+      UseLmrTweaks = true
+      UseAspTweaks = true
+      // A/B env knobs for match.py per-player overrides (campaign step B4): defaults preserve
+      // release behaviour; each flag flips for one player without a rebuild.
+      UseQsTt = (Environment.GetEnvironmentVariable("EONEGO_QSTT") <> "1")
+      UseTtEvalAdjust = (Environment.GetEnvironmentVariable("EONEGO_TTEVADJ") <> "1")
+      UseCheckExt = (Environment.GetEnvironmentVariable("EONEGO_CHECKEXT") = "1")
+      UseOneReplyExt = (Environment.GetEnvironmentVariable("EONEGO_ONEREPLY") = "1")
+      UseQsEvasionCap = (Environment.GetEnvironmentVariable("EONEGO_QSEVCAP") = "1")
+      UseTtCapture = (Environment.GetEnvironmentVariable("EONEGO_TTCAPTURE") = "1")
+      UseCorrHist = (Environment.GetEnvironmentVariable("EONEGO_CORRHIST") <> "1")
+      UseCorrMinor = (Environment.GetEnvironmentVariable("EONEGO_CORRMINOR") = "1")
+      UseCorrMajor = (Environment.GetEnvironmentVariable("EONEGO_CORRMAJOR") = "1")
+      UseCorrNonPawn = (Environment.GetEnvironmentVariable("EONEGO_CORRNONPAWN") = "1")
+      UseCorrCont = (Environment.GetEnvironmentVariable("EONEGO_CORRCONT") = "1")
+      UseCaptFut = (Environment.GetEnvironmentVariable("EONEGO_CAPFUT") = "1")
+      UsePartialCommit = (Environment.GetEnvironmentVariable("EONEGO_PARTIAL") = "1")
+      UseCont4 = (Environment.GetEnvironmentVariable("EONEGO_CONT4") <> "1")
+      UseR50Damp = (Environment.GetEnvironmentVariable("EONEGO_R50DAMP") <> "1")
+      UseQsChecks = (Environment.GetEnvironmentVariable("EONEGO_QSCHECKS") = "1")
+      UseRootEffort = (Environment.GetEnvironmentVariable("EONEGO_ROOTEFFORT") = "1")
+      UseRootVerify = (Environment.GetEnvironmentVariable("EONEGO_ROOTVERIFY") = "1")
+      UseRetro = (Environment.GetEnvironmentVariable("EONEGO_RETRO") <> "0")
+      // Syzygy WDL probe: inert until `setoption name SyzygyPath` loads tables
+      // (Syzygy.Largest = 0 gates every probe); EONEGO_SYZYGY=0 is the kill switch.
+      // (Was `<> "1"` — that inverted the documented kill switch: =1 disabled, =0 didn't.)
+      UseSyzygy = (Environment.GetEnvironmentVariable("EONEGO_SYZYGY") <> "0")
+      // df-pn mate oracle: default OFF pre-SPRT (the CHECKEXT/CAPFUT class); flip to
+      // <> "0" only after a passing match verdict.
+      UseDFPN = (Environment.GetEnvironmentVariable("EONEGO_DFPN") = "1")
+      // Policy sidecar: ON iff startup actually loaded one (EONEGO_POLICY gate; see run()).
+      UsePolicy = st.Policy.IsSome || st.OwnPolicy.IsSome
+      // Dynamic time management (the TM campaign; default OFF pre-SPRT): each component is
+      // independently A/B-able per player without a rebuild. Game clocks only — movetime
+      // matches make all of these inert (soft = 0). EONEGO_TMLOG=1 adds per-move telemetry.
+      UseTmMtgHarden = (Environment.GetEnvironmentVariable("EONEGO_TMMTG") = "1")
+      UseTmStability = (Environment.GetEnvironmentVariable("EONEGO_TMSTAB") = "1")
+      UseTmTrend = (Environment.GetEnvironmentVariable("EONEGO_TMTREND") = "1")
+      UseTmFailLow = (Environment.GetEnvironmentVariable("EONEGO_TMFAILLOW") = "1")
+      UseTmEffort = (Environment.GetEnvironmentVariable("EONEGO_TMEFFORT") = "1")
+      MoveOverhead = st.MoveOverhead
+      // NNUE accumulator checkpoint cache (AccumulatorCache.fs): fully built but inert at
+      // 0 MiB. EONEGO_ACCMB=<MiB> arms it for SPRT (per-search table shared across the
+      // LazySMP workers); unset keeps the byte-identical default.
+      AccCheckpointMb =
+        (match Int32.TryParse(Environment.GetEnvironmentVariable("EONEGO_ACCMB")) with
+         | true, v -> max 0 (min 1024 v)
+         | _ -> 0)
+      MultiPv = st.MultiPv }
+
 let private startSearch (st: UCIState) (lim: SearchLimits) =
     stopAndJoin st
 
@@ -219,70 +287,7 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
         writeLine ("bestmove " + toUCI (Search.firstLegalMove p))
     | Some _ ->
         // All search toggles are hardwired ON; Threads/Hash/MultiPV/MoveOverhead come from state.
-        let cfg =
-            { Threads = st.Threads
-              HashMb = st.HashMb
-              UseTt = true
-              UsePruning = true
-              UseProbCut = true
-              UseIir = true
-              UseRazoring = true
-              UseHistoryPruning = true
-              UseHistPruneCombined = (Environment.GetEnvironmentVariable("EONEGO_HISTCOMBINED") = "1")
-              UseDeltaPruning = true
-              UseQsDeltaCorrected = (Environment.GetEnvironmentVariable("EONEGO_QSDELTACORR") = "1")
-              UseContHist = true
-              UseSingular = true
-              UseNmpVerify = true
-              UseLmrTweaks = true
-              UseAspTweaks = true
-              // A/B env knobs for match.py per-player overrides (campaign step B4): defaults preserve
-              // release behaviour; each flag flips for one player without a rebuild.
-              UseQsTt = (Environment.GetEnvironmentVariable("EONEGO_QSTT") <> "1")
-              UseTtEvalAdjust = (Environment.GetEnvironmentVariable("EONEGO_TTEVADJ") <> "1")
-              UseCheckExt = (Environment.GetEnvironmentVariable("EONEGO_CHECKEXT") = "1")
-              UseOneReplyExt = (Environment.GetEnvironmentVariable("EONEGO_ONEREPLY") = "1")
-              UseQsEvasionCap = (Environment.GetEnvironmentVariable("EONEGO_QSEVCAP") = "1")
-              UseTtCapture = (Environment.GetEnvironmentVariable("EONEGO_TTCAPTURE") = "1")
-              UseCorrHist = (Environment.GetEnvironmentVariable("EONEGO_CORRHIST") <> "1")
-              UseCorrMinor = (Environment.GetEnvironmentVariable("EONEGO_CORRMINOR") = "1")
-              UseCorrMajor = (Environment.GetEnvironmentVariable("EONEGO_CORRMAJOR") = "1")
-              UseCorrNonPawn = (Environment.GetEnvironmentVariable("EONEGO_CORRNONPAWN") = "1")
-              UseCorrCont = (Environment.GetEnvironmentVariable("EONEGO_CORRCONT") = "1")
-              UseCaptFut = (Environment.GetEnvironmentVariable("EONEGO_CAPFUT") = "1")
-              UsePartialCommit = (Environment.GetEnvironmentVariable("EONEGO_PARTIAL") = "1")
-              UseCont4 = (Environment.GetEnvironmentVariable("EONEGO_CONT4") <> "1")
-              UseR50Damp = (Environment.GetEnvironmentVariable("EONEGO_R50DAMP") <> "1")
-              UseQsChecks = (Environment.GetEnvironmentVariable("EONEGO_QSCHECKS") = "1")
-              UseRootEffort = (Environment.GetEnvironmentVariable("EONEGO_ROOTEFFORT") = "1")
-              UseRootVerify = (Environment.GetEnvironmentVariable("EONEGO_ROOTVERIFY") = "1")
-              UseRetro = (Environment.GetEnvironmentVariable("EONEGO_RETRO") <> "0")
-              // Syzygy WDL probe: inert until `setoption name SyzygyPath` loads tables
-              // (Syzygy.Largest = 0 gates every probe); EONEGO_SYZYGY=0 is the kill switch.
-              // (Was `<> "1"` — that inverted the documented kill switch: =1 disabled, =0 didn't.)
-              UseSyzygy = (Environment.GetEnvironmentVariable("EONEGO_SYZYGY") <> "0")
-              // df-pn mate oracle: default OFF pre-SPRT (the CHECKEXT/CAPFUT class); flip to
-              // <> "0" only after a passing match verdict.
-              UseDFPN = (Environment.GetEnvironmentVariable("EONEGO_DFPN") = "1")
-              // Policy sidecar: ON iff startup actually loaded one (EONEGO_POLICY gate; see run()).
-              UsePolicy = st.Policy.IsSome || st.OwnPolicy.IsSome
-              // Dynamic time management (the TM campaign; default OFF pre-SPRT): each component is
-              // independently A/B-able per player without a rebuild. Game clocks only — movetime
-              // matches make all of these inert (soft = 0). EONEGO_TMLOG=1 adds per-move telemetry.
-              UseTmMtgHarden = (Environment.GetEnvironmentVariable("EONEGO_TMMTG") = "1")
-              UseTmStability = (Environment.GetEnvironmentVariable("EONEGO_TMSTAB") = "1")
-              UseTmTrend = (Environment.GetEnvironmentVariable("EONEGO_TMTREND") = "1")
-              UseTmFailLow = (Environment.GetEnvironmentVariable("EONEGO_TMFAILLOW") = "1")
-              UseTmEffort = (Environment.GetEnvironmentVariable("EONEGO_TMEFFORT") = "1")
-              MoveOverhead = st.MoveOverhead
-              // NNUE accumulator checkpoint cache (AccumulatorCache.fs): fully built but inert at
-              // 0 MiB. EONEGO_ACCMB=<MiB> arms it for SPRT (per-search table shared across the
-              // LazySMP workers); unset keeps the byte-identical default.
-              AccCheckpointMb =
-                (match Int32.TryParse(Environment.GetEnvironmentVariable("EONEGO_ACCMB")) with
-                 | true, v -> max 0 (min 1024 v)
-                 | _ -> 0)
-              MultiPv = st.MultiPv }
+        let cfg = buildConfig st
 
         // Syzygy DTZ root filter: restrict the root to the TB-best-preserving move set (rides the
         // SearchMoves mechanism, so the search itself is untouched). Skipped when the user supplied
@@ -390,10 +395,6 @@ let private handleSetOption (st: UCIState) (tokens: string[]) =
             st.MultiPv <- max 1 (min 256 v)
         elif String.Equals(name, "Move Overhead", StringComparison.OrdinalIgnoreCase) then
             st.MoveOverhead <- max 0 (min 5000 v)
-        elif String.Equals(name, "RowPrefetch", StringComparison.OrdinalIgnoreCase) then
-            // Weight-row prefetch mode (0 = off, 1 = leading lines, 2 = +L2 tail). Semantics-free —
-            // node counts are byte-identical in all modes; a pure speed A/B knob (see Accumulator.fs).
-            Eonego.Accumulator.RowPrefetchMode <- max 0 (min 2 v)
         elif String.Equals(name, "SyzygyPath", StringComparison.OrdinalIgnoreCase) then
             let pathVal = String.Join(" ", tokens.[vi + 1 ..])
             if Syzygy.init pathVal then
@@ -529,7 +530,6 @@ let run () =
                     writeLine "option name Clear Hash type button"
                     writeLine "option name MultiPV type spin default 1 min 1 max 256"
                     writeLine "option name Move Overhead type spin default 10 min 0 max 5000"
-                    writeLine "option name RowPrefetch type spin default 0 min 0 max 2"
                     // Pondering is fully wired (`go ponder`/`ponderhit`); GUIs gate their ponder
                     // checkbox on this declaration, so without it the feature is unreachable.
                     writeLine "option name Ponder type check default false"
@@ -585,6 +585,31 @@ let run () =
                             { lim with SearchMoves = stamped }
 
                     startSearch st lim
+                | "bench" ->
+                    // Single-thread fixed-depth NPS + node fingerprint over a fixed FEN set. `bench [depth]`
+                    // (default 13). Reproducible at Threads=1; EONEGO_PROF=1 adds the make-path threat-scan
+                    // breakdown (the H1 measurement). Not part of the UCI protocol — a manual/CLI tool.
+                    stopAndJoin st
+
+                    match st.Net with
+                    | None -> writeLine "info string no NNUE net embedded; cannot bench"
+                    | Some _ ->
+                        let depth =
+                            if tokens.Length > 1 then max 1 (min 40 (tryInt tokens.[1])) else 13
+
+                        let struct (nodes, ticks) = Search.bench depth (buildConfig st) st.Net
+
+                        let ms =
+                            double ticks * 1000.0 / double System.Diagnostics.Stopwatch.Frequency
+
+                        let nps = if ms > 0.0 then int64 (double nodes * 1000.0 / ms) else 0L
+
+                        writeLine (
+                            "bench depth " + string depth
+                            + " nodes " + string nodes
+                            + " time " + ms.ToString("F0") + "ms"
+                            + " nps " + string nps
+                        )
                 | "stop" ->
                     (match st.Control with
                      | Some c -> c.Stop()
