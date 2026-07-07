@@ -122,6 +122,9 @@ type MovePick =
     val mutable PolFrom: Span<int>
     val mutable PolTo: Span<int>
     val mutable PolKey: Span<uint64>
+    // Own-trunk policy net (EONPOL03, null = off). Mutually exclusive with PolNet in practice; when
+    // set it fills the SAME per-ply logit arrays, but only at ≤6-piece positions (Policy.ownApplies).
+    val mutable OwnNet: Policy.OwnNetwork
 
     // Explicit constructor: a by-ref-like struct cannot be zero-init'd (`MovePick()` /
     // `Unchecked.defaultof` both fail — Span fields + the byref-as-generic-arg rule). The four cursors
@@ -167,7 +170,8 @@ type MovePick =
           ValNet = Unchecked.defaultof<NNUE.Network>
           PolFrom = Span<int>()
           PolTo = Span<int>()
-          PolKey = Span<uint64>() }
+          PolKey = Span<uint64>()
+          OwnNet = null }
 
 // ---------------------------------------------------------------------------
 // Helpers (module functions over byref<MovePick> so swaps/scoring persist). A move is a "capture" for
@@ -430,29 +434,45 @@ let nextMove (mp: byref<MovePick>) (skipQuiets: bool) : Move =
 
                 // Policy fill (lazy — only nodes that actually reach quiet scoring pay the inference,
                 // and only above PolMinDepth). The Zobrist guard makes the fill once-per-node and the
-                // arrays readable downstream (LMR term in Search.fs) for exactly this position.
-                if not (isNull mp.PolNet) && mp.Depth >= Tunables.PolMinDepth then
-                    if mp.PolKey.[0] <> mp.Pos.Key then
-                        Policy.fillLogits mp.ValNet mp.PolNet mp.Pos mp.PolFrom mp.PolTo
-                        mp.PolKey.[0] <- mp.Pos.Key
+                // arrays readable downstream (LMR term in Search.fs) for exactly this position. Two
+                // sources fill the SAME 384-wide arrays: the EONPOL02 sidecar (any position) or the
+                // EONPOL03 own-trunk net (only at ≤6 pieces — Policy.ownApplies). When the own net is
+                // loaded but doesn't apply, no fill happens and the stale-key guard leaves ordering/LMR
+                // untouched, exactly as if policy were off for this node.
+                let mutable polFilled = false
 
-                    // Ordering blend — INERT at the default PolOrdMul = 0 (Phase-0 re-scope: the LMR
-                    // term is the v1 consumption; this term buys its own SPRT later). EONPOL02 logit
-                    // index = moverPieceType*64 + STM-relative square.
-                    if Tunables.PolOrdMul <> 0 then
-                        let stm = mp.Pos.SideToMove
+                if mp.Depth >= Tunables.PolMinDepth then
+                    if not (isNull mp.OwnNet) then
+                        if Policy.ownApplies mp.Pos then
+                            if mp.PolKey.[0] <> mp.Pos.Key then
+                                Policy.fillLogitsOwn mp.OwnNet mp.Pos mp.PolFrom mp.PolTo
+                                mp.PolKey.[0] <- mp.Pos.Key
 
-                        for i in qStart .. mp.EndMoves - 1 do
-                            let m = mp.Moves.[i]
-                            let pt = pieceType (mp.Pos.PieceOn(fromSq m))
+                            polFilled <- true
+                    elif not (isNull mp.PolNet) then
+                        if mp.PolKey.[0] <> mp.Pos.Key then
+                            Policy.fillLogits mp.ValNet mp.PolNet mp.Pos mp.PolFrom mp.PolTo
+                            mp.PolKey.[0] <- mp.Pos.Key
 
-                            let ps =
-                                mp.PolFrom.[pt * 64 + Policy.relSq stm (fromSq m)]
-                                + mp.PolTo.[pt * 64 + Policy.relSq stm (toSq m)]
+                        polFilled <- true
 
-                            let t = (Tunables.PolOrdMul * ps) >>> Tunables.PolOrdShift
-                            let t = max (-Tunables.PolClamp) (min Tunables.PolClamp t)
-                            mp.Scores.[i] <- mp.Scores.[i] + t
+                // Ordering blend — INERT at the default PolOrdMul = 0 (Phase-0 re-scope: the LMR term
+                // is the v1 consumption; this term buys its own SPRT later). Logit index =
+                // moverPieceType*64 + STM-relative square (both EONPOL02 and EONPOL03).
+                if polFilled && Tunables.PolOrdMul <> 0 then
+                    let stm = mp.Pos.SideToMove
+
+                    for i in qStart .. mp.EndMoves - 1 do
+                        let m = mp.Moves.[i]
+                        let pt = pieceType (mp.Pos.PieceOn(fromSq m))
+
+                        let ps =
+                            mp.PolFrom.[pt * 64 + Policy.relSq stm (fromSq m)]
+                            + mp.PolTo.[pt * 64 + Policy.relSq stm (toSq m)]
+
+                        let t = (Tunables.PolOrdMul * ps) >>> Tunables.PolOrdShift
+                        let t = max (-Tunables.PolClamp) (min Tunables.PolClamp t)
+                        mp.Scores.[i] <- mp.Scores.[i] + t
                 partialInsertionSort &mp qStart mp.EndMoves (Tunables.QuietSortLimit * mp.Depth)
                 mp.Cur <- qStart
                 mp.Stage <- StgQuiet

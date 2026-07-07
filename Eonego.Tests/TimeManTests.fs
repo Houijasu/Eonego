@@ -159,3 +159,32 @@ let ``scale accumulated during ponder applies at ponderhit`` () =
     c.PonderHit()
     Assert.Equal(1000L, c.BaseSoftMs)
     Assert.Equal(1500L, c.SoftBudgetMs)
+
+// ---------------------------------------------------------------------------
+// SearchControl read-time HARD scale (UseTmFailLow rider: TmFailLowHard extends the hard cap
+// during a fail-low recovery, same race-free store-the-scale design as the soft mechanism).
+// ---------------------------------------------------------------------------
+[<Fact>]
+let ``hard budget is base times hard scale over one hundred`` () =
+    let c = makeControl defaultLimits
+    c.StartClock 1000L 4000L
+    Assert.Equal(4000L, c.HardBudgetMs)
+    c.SetHardScale 150L
+    Assert.Equal(6000L, c.HardBudgetMs)
+
+[<Fact>]
+let ``hard scale is clamped to the TmFailLowHard range`` () =
+    // TmFailLowHard range: 100..200 — the hard cap may only grow, and at most double.
+    let c = makeControl defaultLimits
+    c.StartClock 1000L 4000L
+    c.SetHardScale 50L
+    Assert.Equal(4000L, c.HardBudgetMs) // clamped up to neutral: never shrink the safety net
+    c.SetHardScale 500L
+    Assert.Equal(8000L, c.HardBudgetMs) // clamped to 200
+
+[<Fact>]
+let ``neutral hard scale is integer-identical to the unscaled budget`` () =
+    let c = makeControl defaultLimits
+    for hard in [ 1L; 3L; 7L; 999L; 10996L ] do
+        c.StartClock 0L hard
+        Assert.Equal(hard, c.HardBudgetMs)

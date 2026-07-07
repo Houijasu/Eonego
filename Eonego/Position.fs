@@ -77,6 +77,11 @@ module PosProf =
     let mutable nEnumThreats = 0L
     let mutable nGather = 0L // calls that did WORK (missed the per-frame changed cache)
     let mutable nApply = 0L // perspective-frames materialized by walks
+    // Row-volume counters (2026-07-07 "why is SF faster" session): the apply kernel is bandwidth-
+    // bound, so rows folded per apply is THE number to compare against SF-master's FullThreats
+    // delta scheme. HalfKA rows are 2 KB (int16), threat rows 1 KB (int8, widened at apply).
+    let mutable nRowsHalf = 0L // HalfKA add+sub rows folded across all ApplyFrameFusedTo calls
+    let mutable nRowsThr = 0L // threat add+sub rows folded across all ApplyFrameFusedTo calls
     // Tree-shape counters (2026-07-06, policy-net campaign Phase 0): how often does the picker actually
     // reach quiet scoring, and which move class causes beta cutoffs? These size the slice a policy-net
     // ordering prior could even address (a cutoff by TT move/capture/killer/countermove is emitted by
@@ -110,6 +115,8 @@ module PosProf =
         nEnumThreats <- 0L
         nGather <- 0L
         nApply <- 0L
+        nRowsHalf <- 0L
+        nRowsThr <- 0L
         nNodesMain <- 0L
         nNodesQs <- 0L
         nQuietInit <- 0L
@@ -1016,6 +1023,8 @@ type Position() =
         if PosProf.Enabled then
             PosProf.tApply <- PosProf.tApply + (System.Diagnostics.Stopwatch.GetTimestamp() - profT0)
             PosProf.nApply <- PosProf.nApply + 1L
+            PosProf.nRowsHalf <- PosProf.nRowsHalf + int64 (nHalfAdd + nHalfSub)
+            PosProf.nRowsThr <- PosProf.nRowsThr + int64 (nThrAdd + nThrSub)
 
     /// Re-seed every finny entry to the empty-board state (acc = biases, board = NoPiece). Called by
     /// EnableNNUE only — entries are otherwise self-correcting via the board diff and survive unmakes and

@@ -27,14 +27,17 @@ node-count sweeps and SPRT self-play matches.
 ### Policy sidecar (optional)
 - **EONPOL02 sidecar** sharing the NNUE trunk's 1024-wide FT pairwise-product buffer — the
   expensive accumulator work is already paid for at eval nodes
+- **EONPOL03 own-trunk net** (`trainer/policy_own.py`): a separate float32 MLP on ≤6-piece board
+  features (no NNUE trunk); only active at endgames (`popCount ≤ 6`). Loads via
+  `EONEGO_POLICY=own1` (embedded `ownpolicy.dat`) or `=<path>` when the file magic is `EONPOL03`
 - Piece-aware from/to heads (6 piece types × 64 STM-relative squares → 384 logits each);
-  per-move score = `from[pt*64 + relSq(from)] + to[pt*64 + relSq(to)]`
-- Optional **WDL head** (3 outputs per bucket off the value stack's a1 activation), evaluated
-  on demand at root/PV only
+  per-move score = `from[pt*64 + relSq(from)] + to[pt*64 + relSq(to)]` (both EONPOL02 and EONPOL03)
+- Optional **WDL head** on EONPOL02 (3 outputs per bucket off the value stack's a1 activation):
+  evaluated on demand at the root of each `go` and emitted as `info wdl W D L` (per-mille, STM-relative)
 - **Default OFF** (`EONEGO_POLICY` gate in UCI): when loaded, lazy per-node logits are filled at
   `StgQuietInit` and consumed by search as an **LMR term** (quiets below `PolLmrThresh` get one
   extra reduction step); an inert ordering blend (`PolOrdMul` default 0) is also wired
-- `ftHash`-bound to the loaded `.nnue` trunk — refuses a head trained on a foreign net
+- EONPOL02 is `ftHash`-bound to the loaded `.nnue` trunk — refuses a head trained on a foreign net
 
 ### Search
 - Negamax / PVS with quiescence, **LazySMP** parallelism, and **thread voting**
@@ -57,6 +60,9 @@ node-count sweeps and SPRT self-play matches.
 - DFPN mate oracle (`EONEGO_DFPN=1`): a df-pn proof-number solver runs beside the search,
   proving checks-only forced mates; every proof is re-verified by a table-free replay before
   it can override the bestmove, and `go mate N` returns as soon as a certified mate ≤ N exists
+- **Syzygy table probing** (`setoption name SyzygyPath`): WDL probes in search; optional
+  **DTZ-aware root move filter** (`probeRoot`) restricts the root to TB-best-preserving moves
+  (skipped when `go searchmoves` is set; `EONEGO_SYZYGY=0` / `EONEGO_SYZYGYDTZ=0` kill switches)
 - Search margins, time-management constants, and resource budgets live in `Tunables.fs`
   as `EONEGO_T_*` environment overrides; the tuned defaults are SPSA/SPRT-measured
   where strength-sensitive.
@@ -69,7 +75,7 @@ Requirements:
 - **Git LFS** for `nets/main.nnue` (~106 MB): `git lfs install` then clone (or `git lfs pull`)
 
 ```powershell
-pwsh ./publish.ps1             # embeds nets/main.nnue + nets/main.policy when present
+pwsh ./publish.ps1             # embeds nets/main.nnue, main.policy, main.ownpolicy when present
 # -> Eonego/bin/Release/net10.0/win-x64/publish/Eonego.exe  (~110 MB with net embedded)
 ```
 
@@ -90,7 +96,7 @@ For development, a JIT build works anywhere the SDK does:
 
 ```powershell
 dotnet build Eonego/Eonego.fsproj -c Release
-dotnet test  Eonego.Tests/Eonego.Tests.fsproj -c Release   # 361 tests
+dotnet test  Eonego.Tests/Eonego.Tests.fsproj -c Release   # 393 tests
 ```
 
 ## UCI options
@@ -101,6 +107,9 @@ dotnet test  Eonego.Tests/Eonego.Tests.fsproj -c Release   # 361 tests
 | `Hash` | 256 | Transposition table MB (1–65536) |
 | `MultiPV` | 1 | Extra reported lines (main worker only) |
 | `Move Overhead` | 10 | ms safety margin per move |
+| `Ponder` | false | Declares pondering support (`go ponder` / `ponderhit`) |
+| `SyzygyPath` | *(empty)* | Semicolon-separated Syzygy table directories (WDL + DTZ) |
+| `RowPrefetch` | 0 | NNUE weight-row prefetch mode (0=off, 1=L1, 2=L1+L2); default off after A/B |
 
 `go searchmoves <m1> <m2> ...` is supported — restrict the root to specific candidate moves
 (the way to force a deep verdict on one move a normal search keeps reducing away).
@@ -111,8 +120,12 @@ environment variables so matches never need a rebuild:
 | Env var | Effect |
 |---|---|
 | `EONEGO_NET=<path>` | Load a compatible net from disk instead of the embedded resource |
-| `EONEGO_POLICY=<path>` | Load a `.policy` sidecar (`=1` requests embedded `policy.dat` when present) |
+| `EONEGO_POLICY=<path>` | Load policy: `=1` → embedded EONPOL02; `=own1` → embedded EONPOL03; else path (magic picks format) |
+| `EONEGO_SYZYGY=0` | Disable Syzygy WDL probes and the DTZ root filter |
+| `EONEGO_SYZYGYDTZ=0` | Disable DTZ-aware root move filtering only |
+| `EONEGO_ROWPREFETCH=0/1/2` | NNUE weight-row prefetch (same as UCI `RowPrefetch`; default 0) |
 | `EONEGO_T_*` | Override tuned margins and resource budgets (see `Tunables.fs`) |
+| `EONEGO_T_TM_FAILLOW_HARD` | Extend the hard time cap during fail-low recovery (100–200, default 100 = neutral) |
 | `EONEGO_T_POL_MINDEPTH` | No policy inference below this picker depth (default 3) |
 | `EONEGO_T_POL_LMR` | Quiets with from+to logit below this get one extra LMR step (default 0 = off) |
 | `EONEGO_T_POL_ORDMUL` | scoreQuiets ordering blend multiplier (default 0 = inert) |
@@ -135,7 +148,9 @@ environment variables so matches never need a rebuild:
 | `EONEGO_CHECKEXT=1` / `EONEGO_QSEVCAP=1` | Legacy check extension / qsearch evasion cap |
 | `EONEGO_FINNY=0` | Disable finny bucket-refresh tables and use from-scratch accumulator refresh |
 | `EONEGO_FORCE_SCALAR=1` / `EONEGO_FORCE_NOVNNI=1` / `EONEGO_FORCE_DENSE=1` | NNUE kernel fallbacks for bit-exactness and performance debugging |
-| `EONEGO_PROF=1` | Per-search phase profile line (1-thread semantics); tree-shape counters `prof4`–`prof6` |
+| `EONEGO_PROF=1` | Per-search phase profile line (1-thread semantics); tree-shape counters `prof4`–`prof6`, row-volume `rowsHalf`/`rowsThr` |
+| `EONEGO_QSDELTACORR=1` | Qsearch delta-pruning uses corrected stand-pat (default off pending SPRT) |
+| `EONEGO_ONEREPLY=1` | Extend the single forced evasion in check by one ply (default off pending SPRT) |
 
 ## Development harness
 
@@ -144,8 +159,10 @@ environment variables so matches never need a rebuild:
   Records are **v2**: `fen;cp_white;result_white;best_uci` (4th field = search best move).
 - `Eonego.exe dumpft --net <path> --in <fens> --out <bin>` — trainer feature dump:
   1034-byte records containing bucket, side-to-move, PSQT/eval internals and the 1024-byte FT vector.
-- `Eonego.exe dumppolicy --net <nnue> --policy <sidecar> --in <fens> --out <txt>` — policy
+- `Eonego.exe dumppolicy --net <nnue> --policy <sidecar> --in <fens> --out <txt>` — EONPOL02
   parity dump: `fen TAB 64 from-logits TAB 64 to-logits [TAB w d l]`.
+- `Eonego.exe dumppolicyown --policy <eonpol03> --in <fens> --out <txt>` — EONPOL03 own-trunk
+  parity dump (≤6-piece positions only).
 - `Eonego.exe tbgen --tb <dir[;dir2]> --out <file> --signatures <list>` — native Syzygy-labeled
   endgame records with WDL-preserving move sets (for policy training).
 - `Eonego.exe retro <fen> [--verify]` — solve the position's reachable low-material
@@ -166,8 +183,11 @@ environment variables so matches never need a rebuild:
   from generated labels; parity/blending helpers live beside them.
 - `trainer/policy_train.py` / `trainer/policy_export.py` — train and export the EONPOL02
   policy sidecar (masked quiet-CE + optional WDL-CE on gen/tbgen + dumpft records).
+- `trainer/policy_own.py` / `trainer/policy_own_export.py` — train and export the EONPOL03
+  own-trunk endgame policy net (≤6-piece board features, no NNUE trunk).
 - `trainer/policy_parity.py` / `trainer/policy_intref.py` — bit-exact engine vs integer
-  oracle parity for the policy head.
+  oracle parity for the EONPOL02 head.
+- `trainer/policy_own_parity.py` — bit-exact engine vs torch parity for EONPOL03.
 - `trainer/policy_rankeval.py` — matched-state rank gate: policy vs live history on
   `EONEGO_CUTDUMP` states (go/no-go before SPRT promotion).
 - `trainer/policy_loop.py` — resumable end-to-end policy pipeline orchestrator.
@@ -179,11 +199,13 @@ measurement log.
 
 ## Testing
 
-361 xunit tests cover perft, make/unmake round-trips (full state + all three incremental
+393 xunit tests cover perft, make/unmake round-trips (full state + all three incremental
 keys), SEE, the staged move picker, TT torn-read behavior, NNUE bit-exactness against
 golden evals (AVX2 == scalar), draw detection, LazySMP determinism at 1 thread, thread
-voting, retrograde solving, worker-pool reuse, policy kernel parity and LMR consumption,
-and oracle equivalence of the pruned search against plain full-window alpha-beta.
+voting, retrograde solving, Syzygy gate/probe arithmetic and DTZ root filtering (real-table
+tests opt-in via `EONEGO_TEST_TB=1`), worker-pool reuse, policy kernel parity and LMR
+consumption, time-management hard-cap scaling, and oracle equivalence of the pruned search
+against plain full-window alpha-beta.
 
 ## License
 
@@ -193,7 +215,8 @@ this repository are original to the project.
 ## Status
 
 Actively developed. Strength is tracked against the engine's own history via SPRT
-(hundreds of Elo gained through 2026 search/eval campaigns). The **policy-net campaign**
-(optional EONPOL02 sidecar, LMR consumption, offline training pipeline) is scaffolded
-default-OFF; promotion awaits rankeval + SPRT. Further search efficiency gains and
-continued net training are the roadmap.
+(hundreds of Elo gained through 2026 search/eval campaigns). Syzygy table probing and
+DTZ-aware root filtering, the Ponder UCI option, fail-low hard-cap extension, and the
+EONPOL03 own-trunk endgame policy path are wired default-OFF or table-gated; the EONPOL02
+sidecar campaign still awaits rankeval + SPRT before promotion. Further search efficiency
+gains and continued net training are the roadmap.

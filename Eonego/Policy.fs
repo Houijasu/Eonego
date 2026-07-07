@@ -261,6 +261,171 @@ let fillLogits (net: NNUE.Network) (pnet: PolicyNetwork) (pos: Position) (fromOu
     NNUE.ftInto net pos ft nnz
     forwardFromFt pnet ft fromOut toOut NNUE.UseAvx2 NNUE.UseVnni
 
+// ===========================================================================
+// EONPOL03 — the OWN-TRUNK policy net (trainer/policy_own.py). Unlike EONPOL02 it does NOT read the
+// NNUE trunk: its input is ≤6 board features (12 STM-relative piece planes x 64 STM-relative squares)
+// summed into its own 2048-wide embedding, then a 3-layer float32 MLP -> two 384-wide piece-aware
+// heads (index = absoluteMoverPieceType*64 + relSq — the SAME index the MovePick/Search consumers
+// use). Float32 (not quantized): faithful to the torch net; only ever run at popCount<=6 (its 6-feature
+// encoding can't represent more, and it only knows endgames), so the middlegame hot path is untouched.
+// Feature convention MUST match policy_own.stream_build exactly.
+// ===========================================================================
+[<AllowNullLiteral; Sealed>]
+type OwnNetwork
+    (
+        trunk: int,
+        mid: int,
+        mid2: int,
+        scale: int,
+        ftW: float32[], // nfeat*trunk (row-major [feature][trunk]); row 768 = padding (unused)
+        ftB: float32[], // trunk
+        midW: float32[], // mid*trunk  ([out][in])
+        midB: float32[], // mid
+        mid2W: float32[], // mid2*mid
+        mid2B: float32[], // mid2
+        hfW: float32[], // 384*mid2
+        hfB: float32[],
+        htW: float32[], // 384*mid2
+        htB: float32[]
+    ) =
+    member _.Trunk = trunk
+    member _.Mid = mid
+    member _.Mid2 = mid2
+    member _.Scale = scale
+    member _.FtW = ftW
+    member _.FtB = ftB
+    member _.MidW = midW
+    member _.MidB = midB
+    member _.Mid2W = mid2W
+    member _.Mid2B = mid2B
+    member _.HfW = hfW
+    member _.HfB = hfB
+    member _.HtW = htW
+    member _.HtB = htB
+
+type OwnLoadResult =
+    | OwnLoaded of OwnNetwork
+    | OwnFailed of string
+
+/// EONPOL03 magic probe (UCI routes an EONEGO_POLICY file to the own-trunk loader when this matches).
+let isOwnMagic (buf: byte[]) : bool = buf.Length >= 8 && Array.sub buf 0 8 = "EONPOL03"B
+
+let loadOwnBytes (buf: byte[]) : OwnLoadResult =
+    if not (isOwnMagic buf) then
+        OwnFailed "bad magic (want EONPOL03)"
+    elif buf.Length < 32 then
+        OwnFailed "truncated header"
+    else
+        let version = readI32At buf 8
+        let trunk = readI32At buf 12
+        let mid = readI32At buf 16
+        let mid2 = readI32At buf 20
+        let nfeat = readI32At buf 24
+        let scale = readI32At buf 28
+
+        if version <> 3 then
+            OwnFailed ("unsupported version " + string version)
+        elif nfeat <> 769 || trunk < 32 || mid < 32 || mid2 < 32 then
+            OwnFailed "unsupported dims"
+        else
+            let mutable p = 36 // 8 magic + 7 u32 (incl flags at 32)
+
+            let readF32 (n: int) =
+                let out = Array.zeroCreate<float32> n
+                Buffer.BlockCopy(buf, p, out, 0, n * 4)
+                p <- p + n * 4
+                out
+
+            let ftW = readF32 (nfeat * trunk)
+            let ftB = readF32 trunk
+            let midW = readF32 (mid * trunk)
+            let midB = readF32 mid
+            let mid2W = readF32 (mid2 * mid)
+            let mid2B = readF32 mid2
+            let hfW = readF32 (HeadOut * mid2)
+            let hfB = readF32 HeadOut
+            let htW = readF32 (HeadOut * mid2)
+            let htB = readF32 HeadOut
+
+            if p <> buf.Length then
+                OwnFailed ("bad length: " + string p + " consumed of " + string buf.Length)
+            else
+                OwnLoaded(OwnNetwork(trunk, mid, mid2, scale, ftW, ftB, midW, midB, mid2W, mid2B, hfW, hfB, htW, htB))
+
+let loadOwn (path: string) : OwnLoadResult =
+    try
+        loadOwnBytes (IO.File.ReadAllBytes path)
+    with ex ->
+        OwnFailed ex.Message
+
+/// True when the own-trunk net can represent this position (its 6-feature encoding + endgame scope).
+[<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+let ownApplies (pos: Position) : bool = popCount pos.Occupied <= 6
+
+/// float32 matvec: out[o] = b[o] + sum_k w[o*cols+k]*x[k], with ReLU when `relu`.
+let private denseF32 (x: float32[]) (w: float32[]) (b: float32[]) (out: float32[]) (rows: int) (cols: int) (relu: bool) =
+    for o in 0 .. rows - 1 do
+        let wb = o * cols
+        let mutable s = b.[o]
+
+        for k in 0 .. cols - 1 do
+            s <- s + w.[wb + k] * x.[k]
+
+        out.[o] <- if relu && s < 0.0f then 0.0f else s
+
+/// Own-trunk forward for the CURRENT position: extract ≤6 board features, run the MLP, write the
+/// two 384-wide logit arrays (scaled to int). PRE: ownApplies pos. Feature index/plane/relSq MUST
+/// mirror trainer/policy_own.stream_build.
+[<System.Runtime.CompilerServices.SkipLocalsInit>]
+let fillLogitsOwn (onet: OwnNetwork) (pos: Position) (fromOut: Span<int>) (toOut: Span<int>) : unit =
+    let trunk = onet.Trunk
+    let blackToMove = pos.SideToMove = Black
+
+    // Accumulator = ft bias + sum of active feature embedding rows, then ReLU.
+    let accPtr = NativePtr.stackalloc<float32> trunk
+    let acc = Span<float32>(NativePtr.toVoidPtr accPtr, trunk)
+    let ftB = onet.FtB
+    let ftW = onet.FtW
+
+    for i in 0 .. trunk - 1 do
+        acc.[i] <- ftB.[i]
+
+    let mutable occ = pos.Occupied
+
+    while occ <> 0UL do
+        let sq = popLsb &occ
+        let pc = pos.PieceOn sq
+        let isWhite = pc < 6
+        let pt = pc % 6
+        let own = isWhite <> blackToMove
+        let plane = (if own then 0 else 6) + pt
+        let rel = if blackToMove then sq ^^^ 56 else sq
+        let row = (plane * 64 + rel) * trunk
+
+        for i in 0 .. trunk - 1 do
+            acc.[i] <- acc.[i] + ftW.[row + i]
+
+    // x0 = ReLU(acc); reuse a plain array for the layer chain (heap, but this only fires at <=6 men).
+    let x0 = Array.zeroCreate<float32> trunk
+
+    for i in 0 .. trunk - 1 do
+        x0.[i] <- if acc.[i] < 0.0f then 0.0f else acc.[i]
+
+    let h1 = Array.zeroCreate<float32> onet.Mid
+    denseF32 x0 onet.MidW onet.MidB h1 onet.Mid trunk true
+    let h2 = Array.zeroCreate<float32> onet.Mid2
+    denseF32 h1 onet.Mid2W onet.Mid2B h2 onet.Mid2 onet.Mid true
+    let fromF = Array.zeroCreate<float32> HeadOut
+    let toF = Array.zeroCreate<float32> HeadOut
+    denseF32 h2 onet.HfW onet.HfB fromF HeadOut onet.Mid2 false
+    denseF32 h2 onet.HtW onet.HtB toF HeadOut onet.Mid2 false
+
+    let sc = float32 onet.Scale
+
+    for i in 0 .. HeadOut - 1 do
+        fromOut.[i] <- int (fromF.[i] * sc)
+        toOut.[i] <- int (toF.[i] * sc)
+
 /// WDL head: per-mille struct (win, draw, loss) for the CURRENT position, side-to-move relative.
 /// On-demand only (root/PV reporting, MCTS Q) — a 3x32 scalar dot off the value stack's a1 activation.
 /// PRE: pnet.HasWdl.

@@ -1621,3 +1621,107 @@ let probeDTZ (pos: Position.Position) : int =
     p.Turn <- pos.SideToMove = White
     let v, ok = probeDtzInternal &p
     if ok then v else Int32.MinValue
+
+// ---------------------------------------------------------------------------
+// Root probe: DTZ-aware root move filtering (Fathom tb_probe_root's shape on engine types).
+// ---------------------------------------------------------------------------
+
+/// Score the position AFTER a candidate root move, mover-relative, on Fathom's DTZ basis
+/// (positive = the mover wins; magnitude = plies-to-zeroing + 1; the ±101 band = cursed/blessed).
+/// `pos` has the opponent to move, so the raw probe is negated. Int32.MinValue = probe failure.
+let private rootMoveDtz (pos: Position.Position) : int =
+    if popCount pos.Occupied = 2 then
+        0 // bare kings: no table exists, trivially drawn
+    elif pos.Rule50 = 0 then
+        // The move zeroed the counter: the child WDL is rule-50-exact; map to the DTZ basis.
+        let w = probeWDL pos
+        if w = Int32.MinValue then Int32.MinValue else WdlToDtz.[(-w) + 2]
+    else
+        let d = probeDTZ pos
+
+        if d = Int32.MinValue then
+            Int32.MinValue
+        else
+            // The move consumed a ply toward the rule-50 horizon: push wins/losses out by one.
+            let v = -d
+            if v > 0 then v + 1
+            elif v < 0 then v - 1
+            else 0
+
+/// DTZ-aware root move filter (the standard TB root technique). Returns the subset of legal root
+/// moves preserving the best rule-50-aware outcome:
+///   - a rule-50-SAFE win exists  => only the minimal-DTZ safe wins (DTZ strictly falls or the
+///     move zeroes, so conversion provably progresses — no TB-win shuffling);
+///   - only cursed/unsafe wins    => every winning move (best effort; rule 50 may still save the
+///     defender, but a win-class move never becomes worse than the alternatives);
+///   - best is a draw             => every drawing move (blessed losses count as draws);
+///   - everything loses           => EMPTY: no restriction — max-resistance DTZ filtering throws
+///     away practical swindles, so the search's judgement stands.
+/// Empty on any gate miss (no tables, too many pieces, live castling rights) or probe failure —
+/// callers treat empty as "no restriction". `pos` is mutated via balanced Make/Unmake pairs.
+let probeRoot (pos: Position.Position) : Move.Move[] =
+    if Largest = 0 || popCount pos.Occupied > Largest || pos.CastlingRights <> 0 then
+        [||]
+    else
+        let buf = Array.zeroCreate<Move.Move> MoveGeneration.MaxMoves
+        let n = MoveGeneration.generateLegal pos (Span<Move.Move>(buf))
+        let childBuf = Array.zeroCreate<Move.Move> MoveGeneration.MaxMoves
+        let scores = Array.zeroCreate<int> (max 1 n)
+        let rule50 = pos.Rule50
+        let mutable ok = n > 0
+        let mutable i = 0
+
+        while ok && i < n do
+            pos.Make buf.[i]
+
+            let v =
+                if MoveGeneration.generateLegal pos (Span<Move.Move>(childBuf)) = 0 then
+                    // Terminal child: mate = a win at the minimal basis; stalemate = draw.
+                    (if pos.InCheck then 1 else 0)
+                elif pos.Rule50 >= 100 then
+                    0 // the move ran into the 50-move rule with legal replies left: draw
+                else
+                    rootMoveDtz pos
+
+            pos.Unmake buf.[i]
+
+            if v = Int32.MinValue then ok <- false else scores.[i] <- v
+            i <- i + 1
+
+        if not ok then
+            [||]
+        else
+            // Outcome class under the ROOT's rule-50 counter: 4 = safe win, 3 = cursed/unsafe win,
+            // 2 = draw (including a loss pushed past the rule-50 horizon), 1 = loss.
+            let classOf (v: int) =
+                if v > 0 && v + rule50 <= 100 then 4
+                elif v > 0 then 3
+                elif v = 0 || v < rule50 - 100 then 2
+                else 1
+
+            let mutable bestClass = 0
+
+            for k in 0 .. n - 1 do
+                bestClass <- max bestClass (classOf scores.[k])
+
+            if bestClass <= 1 then
+                [||]
+            else
+                let keep = ResizeArray<Move.Move>(n)
+
+                if bestClass = 4 then
+                    let mutable minV = Int32.MaxValue
+
+                    for k in 0 .. n - 1 do
+                        if classOf scores.[k] = 4 then
+                            minV <- min minV scores.[k]
+
+                    for k in 0 .. n - 1 do
+                        if classOf scores.[k] = 4 && scores.[k] = minV then
+                            keep.Add buf.[k]
+                else
+                    for k in 0 .. n - 1 do
+                        if classOf scores.[k] = bestClass then
+                            keep.Add buf.[k]
+
+                keep.ToArray()

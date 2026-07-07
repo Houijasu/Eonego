@@ -102,6 +102,12 @@ type SearchConfig =
       UseHistoryPruning: bool
       UseHistPruneCombined: bool
       UseDeltaPruning: bool
+      // Qsearch delta-pruning eval basis: compare against the CORRECTED stand-pat (the same value
+      // that raised alpha) instead of the raw eval. Whenever correction history is nonzero the two
+      // sides of the delta inequality otherwise come from different eval bases — negamax's pruning
+      // gates all use the corrected working eval; the raw-eval gate here is the one leftover.
+      // Default OFF pending SPRT (byte-identity contract).
+      UseQsDeltaCorrected: bool
       UseContHist: bool
       UseSingular: bool
       UseNmpVerify: bool
@@ -122,6 +128,10 @@ type SearchConfig =
       // unconditional +1 inflates every subtree containing a safe check. OFF by default (2026-07-02 A/B);
       // the flag preserves the legacy arm for SPRT.
       UseCheckExt: bool
+      // One-reply extension: in check with exactly ONE legal evasion the reply is forced (branching
+      // factor 1), so extending it a ply is nearly free and sharpens forced sequences. Costs one
+      // generateLegal per in-check node while on. Default OFF pending SPRT.
+      UseOneReplyExt: bool
       // In-check qsearch: once one evasion has produced a non-mated score, skip the remaining QUIET
       // evasions (captures still searched; the mate-detection path needs movesPlayed >= 1 and the cap
       // can only fire after a move was searched, so it never masks a mate). Default OFF: measured a
@@ -243,6 +253,7 @@ let defaultConfig =
       UseHistoryPruning = true
       UseHistPruneCombined = false
       UseDeltaPruning = true
+      UseQsDeltaCorrected = false
       UseContHist = true
       UseSingular = true
       UseNmpVerify = true
@@ -251,6 +262,7 @@ let defaultConfig =
       UseQsTt = true
       UseTtEvalAdjust = true
       UseCheckExt = false
+      UseOneReplyExt = false
       UseQsEvasionCap = false
       UseTtCapture = false
       UseCorrHist = true
@@ -422,7 +434,8 @@ type SearchControl
         rootFen: string,
         rootMoves: Move[],
         ?net: Network,
-        ?policy: Policy.PolicyNetwork
+        ?policy: Policy.PolicyNetwork,
+        ?ownPolicy: Policy.OwnNetwork
     ) =
     let mutable stopFlag = 0
     let mutable startTick = System.Diagnostics.Stopwatch.GetTimestamp()
@@ -434,6 +447,11 @@ type SearchControl
     // baseSoftMs = 0 so the budget reads 0 whatever the scale; StartClock at ponderhit publishes
     // baseSoftMs and the already-accumulated scale applies from the very next read.
     let mutable softScalePct = 100L
+    // Hard-cap rider (UseTmFailLow + TmFailLowHard): same read-time-scale design as softScalePct.
+    // Only ever >= 100 (the hard cap is the loss-on-time safety net — it may grow for a fail-low
+    // recovery, never shrink) and capped at 200 (the TmFailLowHard range). 100 = neutral =
+    // integer-identical to the unscaled cap.
+    let mutable hardScalePct = 100L
     // Telemetry (EONEGO_TMLOG): whether the HARD time clause fired (vs soft stop / node limit / user stop).
     let mutable hardHitFlag = 0
     let mutable ponderSoft = 0L // real budget remembered during a ponder search; armed by PonderHit
@@ -458,6 +476,8 @@ type SearchControl
     member _.Net: Network option = net
     /// Policy sidecar head (EONEGO_POLICY); None = classic search regardless of Config.UsePolicy.
     member _.Policy: Policy.PolicyNetwork option = policy
+    /// Own-trunk policy net (EONPOL03); None unless EONEGO_POLICY pointed at an own-trunk file.
+    member _.OwnPolicy: Policy.OwnNetwork option = ownPolicy
     /// Borrowed reference to the per-search accumulator checkpoint cache; `null` when disabled in config.
     member _.AccCheckpoint: AccCheckpointTable = accCheckpoint
     member val LastBest: Move = MoveNone with get, set // result of the most recent go()
@@ -490,12 +510,20 @@ type SearchControl
     /// The scaled soft budget the next SoftTimeUp read will compare against (telemetry/tests).
     member _.SoftBudgetMs: int64 = Volatile.Read(&baseSoftMs) * Volatile.Read(&softScalePct) / 100L
     member _.SoftScalePct: int64 = Volatile.Read(&softScalePct)
+    /// The scaled hard cap the next CheckTime read will compare against (telemetry/tests).
+    member _.HardBudgetMs: int64 = Volatile.Read(&hardMs) * Volatile.Read(&hardScalePct) / 100L
 
     /// Main worker only: publish the composed dynamic-TM scale (percent; clamped to Tunables bounds).
     member _.SetSoftScale(pct: int64) =
         let lo = int64 Tunables.TmScaleMin
         let hi = int64 Tunables.TmScaleMax
         Volatile.Write(&softScalePct, max lo (min hi pct))
+
+    /// Main worker only: extend the hard cap (percent, clamped to [100, 200] — grow-only). Armed by
+    /// the root fail-low clause when UseTmFailLow is on; TmFailLowHard's default of 100 keeps this
+    /// neutral (byte-identical) until the tunable is raised for an SPRT arm.
+    member _.SetHardScale(pct: int64) =
+        Volatile.Write(&hardScalePct, max 100L (min 200L pct))
 
     /// Telemetry: the hard time limit (not the node limit / a user stop) ended this search.
     member _.HardHit: bool = Volatile.Read(&hardHitFlag) <> 0
@@ -546,7 +574,7 @@ type SearchControl
 
     /// Main worker only: convert a time/node budget overrun into the shared stop flag.
     member _.CheckTime(nodes: int64) =
-        let hard = Volatile.Read(&hardMs)
+        let hard = Volatile.Read(&hardMs) * Volatile.Read(&hardScalePct) / 100L
 
         if hard > 0L && elapsedMs () >= hard then
             Volatile.Write(&hardHitFlag, 1)
@@ -674,6 +702,13 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     member val TmStability = 0 with get, set
     member val TmBestChanges = 0 with get, set
     member val TmLastScalePct = 100L with get, set
+    /// Per-component percentages behind the last composed scale (100 = neutral/flag off). Without
+    /// these a logged scale of e.g. 72 is undiagnosable — the staged per-flag SPRT needs to see
+    /// WHICH component drove a move's spend.
+    member val TmLastStabPct = 100 with get, set
+    member val TmLastTrendPct = 100 with get, set
+    member val TmLastEffortPct = 100 with get, set
+    member val TmLastFailLowPct = 100 with get, set
 
     /// Node-effort accounting active (decoupled from RootListActive: UseTmEffort wants the per-move
     /// subtree node counts WITHOUT switching the ply-0 move source to the persistent list).
@@ -773,6 +808,10 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
         this.TmStability <- 0
         this.TmBestChanges <- 0
         this.TmLastScalePct <- 100L
+        this.TmLastStabPct <- 100
+        this.TmLastTrendPct <- 100
+        this.TmLastEffortPct <- 100
+        this.TmLastFailLowPct <- 100
 
 // Clock/node-limit poll cadence: every 2^TmPollShift nodes (default 13 = mask 8191, the legacy
 // value — also the stop granularity of `go nodes`, so the default only moves behind an SPRT).
@@ -899,13 +938,17 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
 
     // Retrograde search: exact DTM score once the background solver has published this signature.
     // ply > 0 (the root needs a move, and one test drives qsearch at ply 0); path draws (repetition/
-    // rule-50, the arm above) outrank the retro value. qsearch has no excluded-move state to guard.
+    // rule-50, the arm above) outrank the retro value. ExcludedMove guard mirrors negamax's gate:
+    // today a singular-verification search (sDepth >= 3 whenever depth >= 8) can never fall through
+    // to qsearch at the guarded ply, but the guard costs one read and keeps a future singular-depth
+    // retune from silently reintroducing path-dependent score corruption here.
     let retroScore =
         if
             w.Control.Config.UseRetro
             && ply > 0
             && popCount pos.Occupied <= 3
             && pos.CastlingRights = 0
+            && w.Stack.[ply + StackOffset].ExcludedMove = MoveNone
         then
             retroScoreAt pos ply
         else
@@ -948,6 +991,10 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
         let mutable best = -INF
         let mutable bestMove = MoveNone
         let mutable rawEval = VALUE_NONE
+        // The corrected/TT-adjusted stand-pat (the value that raised alpha below). UseQsDeltaCorrected
+        // keys delta pruning off this instead of rawEval so both sides of the delta inequality share
+        // one eval basis; rawEval stays raw for the TT stores.
+        let mutable standPat = VALUE_NONE
         let mutable cutoff = false
 
         // TT cutoff (non-PV): every entry is depth-sufficient here (qsearch stores at depth 0, negamax
@@ -1012,6 +1059,7 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
                     rawSp
 
             best <- sp
+            standPat <- sp
 
             if sp >= beta then
                 cutoff <- true
@@ -1069,8 +1117,13 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
                                         && (let capturedValue =
                                                 if isEnPassant m then pieceValueOf Pawn
                                                 else pieceValueOf (pieceType dst)
+                                            // Alpha was raised from the corrected stand-pat; the
+                                            // corrected basis keeps both sides of the inequality
+                                            // consistent (flag-gated pending SPRT).
+                                            let evalBase =
+                                                if cfg.UseQsDeltaCorrected then standPat else rawEval
 
-                                            rawEval + Tunables.QsDeltaBase + capturedValue <= alpha)))))
+                                            evalBase + Tunables.QsDeltaBase + capturedValue <= alpha)))))
 
                 if legal && not prune then
                     movesPlayed <- movesPlayed + 1
@@ -1584,12 +1637,16 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
             // pos.Make has already run, so pos.Key there is the CHILD's key and would never match.
             let policyNodeKey = pos.Key
 
-            if cfg.UsePolicy && w.Control.Policy.IsSome then
-                mp.PolNet <- w.Control.Policy.Value
-                mp.ValNet <- w.Control.Net.Value
+            if cfg.UsePolicy && (w.Control.Policy.IsSome || w.Control.OwnPolicy.IsSome) then
                 mp.PolFrom <- w.PolicyFrom.AsSpan(ply * Policy.HeadOut, Policy.HeadOut)
                 mp.PolTo <- w.PolicyTo.AsSpan(ply * Policy.HeadOut, Policy.HeadOut)
                 mp.PolKey <- w.PolicyKey.AsSpan(ply, 1)
+
+                match w.Control.OwnPolicy with
+                | Some onet -> mp.OwnNet <- onet
+                | None ->
+                    mp.PolNet <- w.Control.Policy.Value
+                    mp.ValNet <- w.Control.Net.Value
 
             if PosProf.Enabled then
                 PosProf.nNodesMain <- PosProf.nNodesMain + 1L
@@ -1619,6 +1676,13 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
             let useRootEffort = ply = 0 && w.RootEffortActive && excludedMove = MoveNone
             let rootAllowed = if ply = 0 then w.Control.Limits.SearchMoves else [||]
             let mutable rootIdx = 0
+
+            // One-reply extension (UseOneReplyExt): in check with exactly one legal evasion the
+            // reply is forced — extend it a ply (bounded by the maxExt cap like every extension).
+            // One generateLegal per in-check node while the flag is on; in-check nodes are a small
+            // fraction of the tree. Default OFF pending SPRT.
+            let oneReply =
+                usePruning && cfg.UseOneReplyExt && inCheck && countLegalMoves pos = 1
 
             let mutable m =
                 if useRootList then
@@ -1749,6 +1813,10 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                         if usePruning && cfg.UseCheckExt && givesCheck then
                             let see0 = if see0Known then see0Val else pos.SeeGe m 0
                             ext <- if see0 then 1 else 0
+
+                        // Forced evasion: the node's single legal reply searches a ply deeper.
+                        if oneReply then
+                            ext <- max ext 1
 
                         // Singular / double extension: the TT move, at depth >= 8 with a depth-sufficient
                         // lower-bound TT score, is "singular" if every OTHER move fails low against a
@@ -2388,6 +2456,10 @@ let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
                     // governs (correct: a fail-low re-search must not die at the old soft point).
                     if tmActive && cfg.UseTmFailLow && depth >= Tunables.TmFailLowDepth then
                         tmFailLowPct <- Tunables.TmFailLowPct
+                        // Hard-cap rider: the recovery re-search must not die at a hard cap sized
+                        // for the calm case. TmFailLowHard defaults to 100 (neutral) — only an
+                        // explicitly raised tunable moves the cap, and only upward (see SetHardScale).
+                        w.Control.SetHardScale(int64 Tunables.TmFailLowHard)
 
                     beta <- (alpha + beta) / 2
                     alpha <- max (-INF) (score - delta)
@@ -2592,6 +2664,12 @@ let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
 
             w.Control.SetSoftScale scale
             w.TmLastScalePct <- w.Control.SoftScalePct
+            // Per-component telemetry (EONEGO_TMLOG): make each factor of the product visible so a
+            // logged scale is attributable to a specific component during the per-flag SPRT waves.
+            w.TmLastStabPct <- stabPct
+            w.TmLastTrendPct <- trendPct
+            w.TmLastEffortPct <- effortPct
+            w.TmLastFailLowPct <- tmFailLowPct
 
         // Between iterations the main worker stops once the soft (optimum) budget is spent; the hard budget
         // stops a running iteration mid-flight via CheckTime. The scale above rescales the SOFT budget only —
@@ -2928,6 +3006,8 @@ let private goCore (control: SearchControl) (workers: Worker[]) : Move =
             + " nApply=" + string PosProf.nApply
             + " nGather=" + string PosProf.nGather
             + " nEnum=" + string PosProf.nEnumThreats
+            + " rowsHalf=" + string PosProf.nRowsHalf
+            + " rowsThr=" + string PosProf.nRowsThr
         )
 
         writeLine ("info string prof3 align " + workers.[0].Pos.ProfAlignReport())
@@ -3056,9 +3136,28 @@ let private goCore (control: SearchControl) (workers: Worker[]) : Move =
             .Append(workers.[0].TmBestChanges)
             .Append(" depth=")
             .Append(workers.[0].CompletedDepth)
+            // Per-component factors of the composed scale (100 = neutral/off) — without these a
+            // scale of 72 is undiagnosable across the four independently-flagged components.
+            .Append(" stabPct=")
+            .Append(workers.[0].TmLastStabPct)
+            .Append(" trendPct=")
+            .Append(workers.[0].TmLastTrendPct)
+            .Append(" effortPct=")
+            .Append(workers.[0].TmLastEffortPct)
+            .Append(" failLowPct=")
+            .Append(workers.[0].TmLastFailLowPct)
         |> ignore
 
         writeLine (tmSb.ToString())
+
+    // Policy WDL head (root, on-demand): one 3x32 dot off the value stack per `go` — never in the
+    // per-node path. Emitted only when a WDL-carrying sidecar is loaded (EONEGO_POLICY), so classic
+    // runs keep byte-identical output. Per-mille, side-to-move relative (the UCI wdl convention).
+    (match control.Policy, control.Net with
+     | Some pnet, Some net when pnet.HasWdl ->
+         let struct (wdlW, wdlD, wdlL) = Policy.evalWDL net pnet workers.[0].Pos
+         writeLine ("info wdl " + string wdlW + " " + string wdlD + " " + string wdlL)
+     | _ -> ())
 
     // Final whole-search totals right before bestmove (the standard UCI closing summary line);
     // GUIs read this as the authoritative node/time accounting for the move.

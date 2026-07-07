@@ -23,7 +23,12 @@ import numpy as np
 from move_encoder import PIECE_TYPE, board_of_fen, encode_uci_piece, fen_black_to_move
 
 QMAX = 72
-MAXPC = 6  # tbgen corpora are <= 5 men; 6 leaves headroom
+MAXPC = 7  # <= 6 piece-square features (5-man corpora) + 1 joint king-pair feature
+# Feature space: 12 piece planes x 64 squares, then a JOINT king-pair table (ownK*64+oppK,
+# STM-relative). Opposition/key-square geometry is a lookup in the joint table but nearly
+# incomputable from independent king features — the round-3 lever after width AND depth saturated.
+NFEAT = 768 + 4096
+PAD = NFEAT  # EmbeddingBag padding index
 
 
 def stream_build(path, qmax: int = QMAX, chunk: int = 250_000, skip: int = 0, take: int = 0):
@@ -67,20 +72,28 @@ def stream_build(path, qmax: int = QMAX, chunk: int = 250_000, skip: int = 0, ta
             board = board_of_fen(fen)
             nf = 0
             ok = True
+            own_k = opp_k = -1
             for sq in range(64):
                 c = board[sq]
                 if c != " ":
-                    if nf >= MAXPC:
+                    if nf >= MAXPC - 1:
                         ok = False
                         break
                     own = c.isupper() != black
                     plane = (0 if own else 6) + PIECE_TYPE[c.lower()]
                     rel = sq ^ 56 if black else sq
+                    if c.lower() == "k":
+                        if own:
+                            own_k = rel
+                        else:
+                            opp_k = rel
                     buf["feat"][fill, nf] = plane * 64 + rel
                     nf += 1
-            if not ok:
+            if not ok or own_k < 0 or opp_k < 0:
                 buf["feat"][fill, :] = -1
                 continue
+            buf["feat"][fill, nf] = 768 + own_k * 64 + opp_k
+            nf += 1
             for j, u in enumerate(quiets):
                 fidx, tidx = encode_uci_piece(u, black, board)
                 buf["qf"][fill, j] = fidx
@@ -118,6 +131,12 @@ def main():
     ap.add_argument("--skip", type=int, default=0, help="prep: skip this many records first")
     ap.add_argument("--take", type=int, default=0, help="prep: process at most this many records")
     ap.add_argument("--from-npz", default=None, help="train from comma-separated prepped .npz shards")
+    ap.add_argument(
+        "--no-kp",
+        action="store_true",
+        help="mask the joint king-pair feature at batch time (round-3 finding: at sparse density the "
+        "4096-entry table memorizes instead of generalizing — this ablates it without re-prepping)",
+    )
     args = ap.parse_args()
 
     if args.prep:
@@ -150,7 +169,7 @@ def main():
     class OwnTrunk(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.ft = torch.nn.EmbeddingBag(769, args.trunk, mode="sum", padding_idx=768)
+            self.ft = torch.nn.EmbeddingBag(NFEAT + 1, args.trunk, mode="sum", padding_idx=PAD)
             self.ft_b = torch.nn.Parameter(torch.zeros(args.trunk))
             if args.layers >= 2:
                 self.mid = torch.nn.Linear(args.trunk, args.hidden2)
@@ -200,7 +219,9 @@ def main():
 
     def batch_tensors(idx):
         f = feat_np[idx].astype(np.int64)
-        f[f < 0] = 768  # padding_idx
+        f[f < 0] = PAD  # padding_idx
+        if args.no_kp:
+            f[f >= 768] = PAD  # ablate the joint king-pair feature
         feats = torch.from_numpy(f).to(dev)
         qf = torch.from_numpy(qf_np[idx].astype(np.int64)).to(dev)
         qt = torch.from_numpy(qt_np[idx].astype(np.int64)).to(dev)

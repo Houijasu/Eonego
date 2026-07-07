@@ -47,6 +47,7 @@ type private UCIState =
       mutable MoveOverhead: int
       Net: Network option
       Policy: Policy.PolicyNetwork option
+      OwnPolicy: Policy.OwnNetwork option
       Tt: TranspositionTable
       mutable RootFen: string
       mutable RootMoves: Move[]
@@ -90,6 +91,12 @@ let private matchMove (pos: Position) (uci: string) : Move =
                 found <- m
 
         found
+
+/// Legal-move count at the root (Syzygy root-filter reporting only).
+let private countLegalRoot (pos: Position) : int =
+    let p = NativePtr.stackalloc<Move> MaxMoves
+    let buf = Span<Move>(NativePtr.toVoidPtr p, MaxMoves)
+    generateLegal pos buf
 
 let private stopAndJoin (st: UCIState) =
     (match st.Control with
@@ -223,6 +230,7 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
               UseHistoryPruning = true
               UseHistPruneCombined = (Environment.GetEnvironmentVariable("EONEGO_HISTCOMBINED") = "1")
               UseDeltaPruning = true
+              UseQsDeltaCorrected = (Environment.GetEnvironmentVariable("EONEGO_QSDELTACORR") = "1")
               UseContHist = true
               UseSingular = true
               UseNmpVerify = true
@@ -233,6 +241,7 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
               UseQsTt = (Environment.GetEnvironmentVariable("EONEGO_QSTT") <> "1")
               UseTtEvalAdjust = (Environment.GetEnvironmentVariable("EONEGO_TTEVADJ") <> "1")
               UseCheckExt = (Environment.GetEnvironmentVariable("EONEGO_CHECKEXT") = "1")
+              UseOneReplyExt = (Environment.GetEnvironmentVariable("EONEGO_ONEREPLY") = "1")
               UseQsEvasionCap = (Environment.GetEnvironmentVariable("EONEGO_QSEVCAP") = "1")
               UseTtCapture = (Environment.GetEnvironmentVariable("EONEGO_TTCAPTURE") = "1")
               UseCorrHist = (Environment.GetEnvironmentVariable("EONEGO_CORRHIST") <> "1")
@@ -250,12 +259,13 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
               UseRetro = (Environment.GetEnvironmentVariable("EONEGO_RETRO") <> "0")
               // Syzygy WDL probe: inert until `setoption name SyzygyPath` loads tables
               // (Syzygy.Largest = 0 gates every probe); EONEGO_SYZYGY=0 is the kill switch.
-              UseSyzygy = (Environment.GetEnvironmentVariable("EONEGO_SYZYGY") <> "1")
+              // (Was `<> "1"` — that inverted the documented kill switch: =1 disabled, =0 didn't.)
+              UseSyzygy = (Environment.GetEnvironmentVariable("EONEGO_SYZYGY") <> "0")
               // df-pn mate oracle: default OFF pre-SPRT (the CHECKEXT/CAPFUT class); flip to
               // <> "0" only after a passing match verdict.
               UseDFPN = (Environment.GetEnvironmentVariable("EONEGO_DFPN") = "1")
               // Policy sidecar: ON iff startup actually loaded one (EONEGO_POLICY gate; see run()).
-              UsePolicy = st.Policy.IsSome
+              UsePolicy = st.Policy.IsSome || st.OwnPolicy.IsSome
               // Dynamic time management (the TM campaign; default OFF pre-SPRT): each component is
               // independently A/B-able per player without a rebuild. Game clocks only — movetime
               // matches make all of these inert (soft = 0). EONEGO_TMLOG=1 adds per-move telemetry.
@@ -265,11 +275,60 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
               UseTmFailLow = (Environment.GetEnvironmentVariable("EONEGO_TMFAILLOW") = "1")
               UseTmEffort = (Environment.GetEnvironmentVariable("EONEGO_TMEFFORT") = "1")
               MoveOverhead = st.MoveOverhead
-              AccCheckpointMb = 0
+              // NNUE accumulator checkpoint cache (AccumulatorCache.fs): fully built but inert at
+              // 0 MiB. EONEGO_ACCMB=<MiB> arms it for SPRT (per-search table shared across the
+              // LazySMP workers); unset keeps the byte-identical default.
+              AccCheckpointMb =
+                (match Int32.TryParse(Environment.GetEnvironmentVariable("EONEGO_ACCMB")) with
+                 | true, v -> max 0 (min 1024 v)
+                 | _ -> 0)
               MultiPv = st.MultiPv }
 
+        // Syzygy DTZ root filter: restrict the root to the TB-best-preserving move set (rides the
+        // SearchMoves mechanism, so the search itself is untouched). Skipped when the user supplied
+        // `go searchmoves` (their restriction wins) and inert without tables (Largest = 0).
+        // EONEGO_SYZYGYDTZ=0 is the kill switch. One probe pass per `go`, on the UCI thread.
+        let lim =
+            if
+                cfg.UseSyzygy
+                && Syzygy.Largest > 0
+                && lim.SearchMoves.Length = 0
+                && Environment.GetEnvironmentVariable("EONEGO_SYZYGYDTZ") <> "0"
+            then
+                let p = Position()
+                p.LoadFen st.RootFen
+
+                for mv in st.RootMoves do
+                    p.Make mv
+
+                let tbMoves = Syzygy.probeRoot p
+
+                if tbMoves.Length > 0 then
+                    writeLine (
+                        "info string Syzygy root filter: "
+                        + string tbMoves.Length
+                        + " of "
+                        + string (countLegalRoot p)
+                        + " moves kept"
+                    )
+
+                    { lim with SearchMoves = tbMoves }
+                else
+                    lim
+            else
+                lim
+
         let control =
-            SearchControl(cfg, lim, st.Tt, st.RootFen, st.RootMoves, ?net = st.Net, ?policy = st.Policy)
+            SearchControl(
+                cfg,
+                lim,
+                st.Tt,
+                st.RootFen,
+                st.RootMoves,
+                ?net = st.Net,
+                ?policy = st.Policy,
+                ?ownPolicy = st.OwnPolicy
+            )
 
         // Arm on the UCI thread BEFORE the search thread exists: a `stop`/`quit` arriving right
         // after t.Start() must find the stop flag armed-and-clear, not race the thread's own Reset
@@ -306,8 +365,13 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
         t.Start()
 
 let private handleSetOption (st: UCIState) (tokens: string[]) =
-    // setoption name <Name...> value <Value> — only Threads and Move Overhead are tunable (the latter is a
-    // two-word name, so the name is the tokens between `name` and `value`); every other option is ignored.
+    // setoption name <Name...> value <Value> (the name is the tokens between `name` and `value` —
+    // Move Overhead / Clear Hash are two-word names); button options arrive with no `value` at all.
+    // stop+join FIRST, unconditionally: every branch below mutates state a live search reads
+    // (helper slots, the TT, Syzygy tables) — the module header's documented invariant, previously
+    // upheld only by the Hash branch (Threads raced resizeHelpers' Shutdown/Join against a running
+    // dispatch; SyzygyPath re-pointed tables under live probes).
+    stopAndJoin st
     let nameIdx = Array.tryFindIndex ((=) "name") tokens
     let valIdx = Array.tryFindIndex ((=) "value") tokens
 
@@ -320,19 +384,30 @@ let private handleSetOption (st: UCIState) (tokens: string[]) =
             st.Threads <- max 1 (min 256 v)
             Search.resizeHelpers st.Threads
         elif String.Equals(name, "Hash", StringComparison.OrdinalIgnoreCase) then
-            stopAndJoin st
             st.HashMb <- max 1 (min MaxHashMb v)
             st.Tt.Resize st.HashMb
         elif String.Equals(name, "MultiPV", StringComparison.OrdinalIgnoreCase) then
             st.MultiPv <- max 1 (min 256 v)
         elif String.Equals(name, "Move Overhead", StringComparison.OrdinalIgnoreCase) then
             st.MoveOverhead <- max 0 (min 5000 v)
+        elif String.Equals(name, "RowPrefetch", StringComparison.OrdinalIgnoreCase) then
+            // Weight-row prefetch mode (0 = off, 1 = leading lines, 2 = +L2 tail). Semantics-free —
+            // node counts are byte-identical in all modes; a pure speed A/B knob (see Accumulator.fs).
+            Eonego.Accumulator.RowPrefetchMode <- max 0 (min 2 v)
         elif String.Equals(name, "SyzygyPath", StringComparison.OrdinalIgnoreCase) then
             let pathVal = String.Join(" ", tokens.[vi + 1 ..])
             if Syzygy.init pathVal then
                 writeLine ("info string Syzygy tables loaded, largest " + string Syzygy.Largest + " pieces")
             else
                 writeLine "info string Syzygy init failed"
+    // `Ponder value true/false` needs no state (the GUI drives pondering via `go ponder`) and
+    // falls through here by design — declaring the option is what unlocks the GUI checkbox.
+    | Some ni, None when ni + 1 < tokens.Length ->
+        // Button options: no `value` token.
+        let name = String.Join(" ", tokens.[ni + 1 ..])
+
+        if String.Equals(name, "Clear Hash", StringComparison.OrdinalIgnoreCase) then
+            st.Tt.Clear()
     | _ -> ()
 
 let run () =
@@ -361,33 +436,65 @@ let run () =
                 | Some bytes -> (match NNUE.loadBytes bytes with Loaded n -> Some n | Failed _ -> None)
                 | None -> None
 
-    // Policy sidecar (EONEGO_POLICY): =<path> loads a .policy file; =1 asks for the embedded
-    // `policy.dat` resource (absent until the Phase-3 SPRT pass embeds one). ftHash-bound to the
-    // loaded value net — a head trained on a foreign trunk is refused. Unset => classic search,
-    // byte-identical (the nodesweep contract).
-    let policy =
-        match Environment.GetEnvironmentVariable("EONEGO_POLICY"), net with
+    // Policy net (EONEGO_POLICY). Two formats share the one env var, dispatched by file magic:
+    //   EONPOL02 sidecar — reads the NNUE trunk; ftHash-bound; any position.
+    //   EONPOL03 own-trunk — its own board-feature net; only fires at ≤6 pieces (endgames).
+    // Values: unset => classic search (byte-identical); "1" => embedded sidecar `policy.dat`;
+    //   "own1" => embedded own-trunk `ownpolicy.dat`; <path> => the file (magic picks the format).
+    let policyEnv = Environment.GetEnvironmentVariable("EONEGO_POLICY")
+
+    let ownPolicy =
+        match policyEnv, net with
         | (null | ""), _ -> None
         | _, None -> None
-        | "1", Some n ->
-            match readEmbedded "policy.dat" with
+        | "own1", Some _ ->
+            match readEmbedded "ownpolicy.dat" with
             | Some bytes ->
-                match Policy.loadBytes bytes n.FtHash with
-                | Policy.PolicyLoaded p -> Some p
-                | Policy.PolicyFailed why ->
-                    writeLine ("info string embedded policy load FAILED (" + why + "); policy off")
+                match Policy.loadOwnBytes bytes with
+                | Policy.OwnLoaded o ->
+                    writeLine "info string own-trunk policy: embedded"
+                    Some o
+                | Policy.OwnFailed why ->
+                    writeLine ("info string embedded own policy FAILED (" + why + "); policy off")
                     None
             | None ->
-                writeLine "info string EONEGO_POLICY=1 but no policy.dat embedded; policy off"
+                writeLine "info string EONEGO_POLICY=own1 but no ownpolicy.dat embedded; policy off"
                 None
-        | path, Some n ->
-            match Policy.load path n.FtHash with
-            | Policy.PolicyLoaded p ->
-                writeLine ("info string policy sidecar: " + path)
-                Some p
-            | Policy.PolicyFailed why ->
-                writeLine ("info string EONEGO_POLICY load FAILED (" + why + "); policy off")
-                None
+        | path, Some _ when IO.File.Exists path ->
+            match Policy.loadOwn path with
+            | Policy.OwnLoaded o ->
+                writeLine ("info string own-trunk policy: " + path)
+                Some o
+            | Policy.OwnFailed _ -> None // not an own-trunk file; fall through to the sidecar loader
+        | _ -> None
+
+    let policy =
+        if ownPolicy.IsSome then
+            None
+        else
+            match policyEnv, net with
+            | (null | ""), _ -> None
+            | _, None -> None
+            | "own1", _ -> None
+            | "1", Some n ->
+                match readEmbedded "policy.dat" with
+                | Some bytes ->
+                    match Policy.loadBytes bytes n.FtHash with
+                    | Policy.PolicyLoaded p -> Some p
+                    | Policy.PolicyFailed why ->
+                        writeLine ("info string embedded policy load FAILED (" + why + "); policy off")
+                        None
+                | None ->
+                    writeLine "info string EONEGO_POLICY=1 but no policy.dat embedded; policy off"
+                    None
+            | path, Some n ->
+                match Policy.load path n.FtHash with
+                | Policy.PolicyLoaded p ->
+                    writeLine ("info string policy sidecar: " + path)
+                    Some p
+                | Policy.PolicyFailed why ->
+                    writeLine ("info string EONEGO_POLICY load FAILED (" + why + "); policy off")
+                    None
 
     let st =
         { Threads = 1
@@ -396,6 +503,7 @@ let run () =
           MoveOverhead = 10
           Net = net
           Policy = policy
+          OwnPolicy = ownPolicy
           Tt = TranspositionTable(DefaultHashMb)
           RootFen = StartPosFen
           RootMoves = [||]
@@ -418,8 +526,13 @@ let run () =
                     writeLine ("id author " + Engine.Author)
                     writeLine "option name Threads type spin default 1 min 1 max 256"
                     writeLine "option name Hash type spin default 256 min 1 max 65536"
+                    writeLine "option name Clear Hash type button"
                     writeLine "option name MultiPV type spin default 1 min 1 max 256"
                     writeLine "option name Move Overhead type spin default 10 min 0 max 5000"
+                    writeLine "option name RowPrefetch type spin default 0 min 0 max 2"
+                    // Pondering is fully wired (`go ponder`/`ponderhit`); GUIs gate their ponder
+                    // checkbox on this declaration, so without it the feature is unreachable.
+                    writeLine "option name Ponder type check default false"
                     writeLine "option name SyzygyPath type string default <empty>"
                     writeLine "uciok"
                 | "isready" ->

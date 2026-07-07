@@ -87,4 +87,10 @@
     <EmbeddedResource Include="..\nets\main.policy" LogicalName="policy.dat" />
   </ItemGroup>
 
+  <!-- Own-trunk policy net (EONPOL03, ~18 MB float32). EONEGO_POLICY=own1 loads it; inert otherwise.
+       Only fires at ≤6-piece positions (its endgame scope), so the middlegame path is untouched. -->
+  <ItemGroup Condition="Exists('..\nets\main.ownpolicy')">
+    <EmbeddedResource Include="..\nets\main.ownpolicy" LogicalName="ownpolicy.dat" />
+  </ItemGroup>
+
 </Project>

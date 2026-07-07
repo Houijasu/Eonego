@@ -31,6 +31,14 @@ let private usage () =
     writeLine "  tbgen --tb <dir[;dir2]> --out <file> --signatures <list> [--per-signature N] [--total N] [--seed S]   (native Syzygy-labeled records with WDL-preserving move sets)"
     writeLine "  retro <fen> [--verify]   (solve the position's retrograde signatures, print stats + its value; --verify runs the full self-consistency proof)"
 
+/// Unknown-subcommand entry (Program.fs wildcard): fail fast with usage instead of silently
+/// dropping into the interactive UCI read loop, which blocks forever on stdin with zero output —
+/// a typo'd subcommand in a script/CI otherwise just hangs.
+let runUnknown (cmd: string) : int =
+    errLine ("unknown subcommand: " + cmd)
+    usage ()
+    2
+
 /// Hand-rolled `--key value` parser; returns a map of flag -> optional value.
 let private parseFlags (args: string[]) : Map<string, string option> =
     let m = Dictionary<string, string option>(StringComparer.OrdinalIgnoreCase)
@@ -648,6 +656,54 @@ let runTbGen (args: string[]) : int =
             0
     | _ ->
         errLine "tbgen requires --tb <dir[;dir2]> --out <file> --signatures <list>"
+        1
+
+/// Own-trunk policy parity dump (`dumppolicyown`): for each input FEN emit `fen \t f0..f383 \t
+/// t0..t383` — the EONPOL03 net's scaled-int logits (only meaningful at ≤6 pieces). The Python
+/// reference (policy_own.forward) is compared against this to validate the F# feature extraction.
+let runDumpPolicyOwn (args: string[]) : int =
+    let m = parseFlags args
+
+    match flag m "policy", flag m "in", flag m "out" with
+    | Some polPath, Some inPath, Some outPath ->
+        match Policy.loadOwn polPath with
+        | Policy.OwnFailed r ->
+            errLine ("failed to load own policy: " + r)
+            1
+        | Policy.OwnLoaded onet ->
+            use writer = new StreamWriter(File.Create outPath)
+            let fromL = Array.zeroCreate<int> Policy.HeadOut
+            let toL = Array.zeroCreate<int> Policy.HeadOut
+            let mutable count = 0
+
+            for line in File.ReadLines inPath do
+                let t = line.Trim()
+
+                if t.Length > 0 && not (t.StartsWith "#") then
+                    let fen = t.Split(';').[0].Trim()
+                    let pos = Position.OfFen fen
+
+                    if Policy.ownApplies pos then
+                        Policy.fillLogitsOwn onet pos (fromL.AsSpan()) (toL.AsSpan())
+                        let sb = Text.StringBuilder(4096)
+                        sb.Append(fen).Append('\t') |> ignore
+
+                        for i in 0 .. Policy.HeadOut - 1 do
+                            (if i > 0 then sb.Append(' ') else sb).Append(fromL.[i]) |> ignore
+
+                        sb.Append('\t') |> ignore
+
+                        for i in 0 .. Policy.HeadOut - 1 do
+                            (if i > 0 then sb.Append(' ') else sb).Append(toL.[i]) |> ignore
+
+                        writer.WriteLine(sb.ToString())
+                        count <- count + 1
+
+            writer.Flush()
+            writeLine ("dumped " + string count + " own-policy records to " + outPath)
+            0
+    | _ ->
+        errLine "dumppolicyown requires --policy <eonpol03> --in <fens> --out <txt>"
         1
 
 /// `tbprobe --tb <dir> <fen>` — raw Syzygy.probeWDL of the position and every legal child
