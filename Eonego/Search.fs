@@ -1656,6 +1656,9 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
             let mutable mp =
                 mkMain pos w.Tables ttMove k1 k2 cm depth prev1Pc prev1To prev2Pc prev2To moves scores
 
+            // Pawn history read gate (the table itself is EnsureAux-allocated in SetupRoot).
+            mp.UsePawnHist <- cfg.UsePawnHist
+
             // Policy sidecar hookup (UsePolicy is true only when UCI loaded one, so Net is Some too):
             // hand the picker this ply's logit slices + the staleness slot; the fill itself stays lazy
             // inside StgQuietInit. Exclusion re-searches share the slot — same ply, same position, same key.
@@ -2109,6 +2112,9 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                                         if cfg.UseCont4 then
                                             w.Tables.UpdateCont4 prev4Pc prev4To mPc (toSq m) bonus
 
+                                        if cfg.UsePawnHist then
+                                            w.Tables.UpdatePawnHist pos.PawnKey mPc (toSq m) bonus
+
                                         for qi in 0 .. nQuiets - 2 do
                                             let q = quietsBuf.[quietsBase + qi]
                                             let qPc = pos.PieceOn(fromSq q)
@@ -2118,6 +2124,9 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
                                             if cfg.UseCont4 then
                                                 w.Tables.UpdateCont4 prev4Pc prev4To qPc (toSq q) (-malus)
+
+                                            if cfg.UsePawnHist then
+                                                w.Tables.UpdatePawnHist pos.PawnKey qPc (toSq q) (-malus)
 
                                         w.Tables.SetKiller ply m
 

@@ -27,6 +27,7 @@
     <Compile Include="IsPseudoLegalTests.fs" />
     <Compile Include="PromotionSplitTests.fs" />
     <Compile Include="HistoryTests.fs" />
+    <Compile Include="PawnHistTests.fs" />
     <Compile Include="MovePickTests.fs" />
     <Compile Include="MovePickProbeTests.fs" />
     <Compile Include="TranspositionTests.fs" />

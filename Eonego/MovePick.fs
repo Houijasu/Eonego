@@ -125,6 +125,9 @@ type MovePick =
     // Own-trunk policy net (EONPOL03, null = off). Mutually exclusive with PolNet in practice; when
     // set it fills the SAME per-ply logit arrays, but only at ≤6-piece positions (Policy.ownApplies).
     val mutable OwnNet: Policy.OwnNetwork
+    // Pawn history gate (Search sets it post-construction from cfg.UsePawnHist; every factory leaves
+    // it false so the lazily-allocated table is never touched by default — the cont4 lazy-table rule).
+    val mutable UsePawnHist: bool
 
     // Explicit constructor: a by-ref-like struct cannot be zero-init'd (`MovePick()` /
     // `Unchecked.defaultof` both fail — Span fields + the byref-as-generic-arg rule). The four cursors
@@ -171,7 +174,8 @@ type MovePick =
           PolFrom = Span<int>()
           PolTo = Span<int>()
           PolKey = Span<uint64>()
-          OwnNet = null }
+          OwnNet = null
+          UsePawnHist = false }
 
 // ---------------------------------------------------------------------------
 // Helpers (module functions over byref<MovePick> so swaps/scoring persist). A move is a "capture" for
@@ -245,16 +249,22 @@ let private scoreQuiets (mp: byref<MovePick>) (s: int) (e: int) : unit =
     let pos = mp.Pos
     let us = pos.SideToMove
     let tables = mp.Tables
+    let pawnKey = if mp.UsePawnHist then pos.PawnKey else 0UL // hoisted: constant for this node
 
     for i in s .. e - 1 do
         let m = mp.Moves.[i]
         let pc = pos.PieceOn(fromSq m)
         let dst = toSq m
 
-        mp.Scores.[i] <-
+        let mutable score =
             tables.MainHistory us (fromTo m)
             + tables.ContHistory1 mp.PrevPc1 mp.PrevTo1 pc dst
             + tables.ContHistory2 mp.PrevPc2 mp.PrevTo2 pc dst
+
+        if mp.UsePawnHist then
+            score <- score + tables.PawnHistory pawnKey pc dst
+
+        mp.Scores.[i] <- score
 
 let private scoreEvasions (mp: byref<MovePick>) (s: int) (e: int) : unit =
     let pos = mp.Pos
