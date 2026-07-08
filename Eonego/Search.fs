@@ -162,6 +162,9 @@ type SearchConfig =
       UseCorrMajor: bool
       UseCorrNonPawn: bool
       UseCorrCont: bool
+      // Pawn history: [pawnKey&511][pc][to] quiet-ordering table (History.fs), read in MovePick's
+      // scoreQuiets and taught at the quiet-cutoff sites. SF pawnHistory analogue.
+      UsePawnHist: bool
       // Capture futility: at shallow reduced depth, skip a non-checking capture when even banking the
       // captured piece's full value cannot lift the static eval to alpha (capture analogue of the
       // quiet futility gate; promotions excluded — their material swing isn't in capturedValue).
@@ -278,6 +281,7 @@ let defaultConfig =
       UseCorrMajor = false
       UseCorrNonPawn = false
       UseCorrCont = false
+      UsePawnHist = false
       UseCaptFut = false
       UsePartialCommit = false
       UseCont4 = false
@@ -794,7 +798,7 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
         pos.BindCheckpoint control.AccCheckpoint
         pos.SeedCheckpoint()
 
-        tables.EnsureAux control.Config.UseCont4 control.Config.UseCorrMinor control.Config.UseCorrMajor control.Config.UseCorrNonPawn
+        tables.EnsureAux control.Config.UseCont4 control.Config.UseCorrMinor control.Config.UseCorrMajor control.Config.UseCorrNonPawn control.Config.UsePawnHist
 
         if defaultArg keepHistory false then
             tables.NewSearch()

@@ -29,6 +29,7 @@ let MainHistD = Tunables.MainHistD // butterfly (main) history divisor
 let CaptureHistD = Tunables.CaptureHistD // capture history divisor
 let ContHistD = Tunables.ContHistD // continuation history divisor
 let CorrHistD = Tunables.CorrHistD // correction-history divisor
+let PawnHistD = Tunables.PawnHistD // pawn-structure quiet history divisor
 
 /// Stat bonus as a function of depth (shape tunable via EONEGO_T_STATB_*).
 let inline statBonus (depth: int) : int =
@@ -85,10 +86,21 @@ type Tables() =
     // c=1, after a King/Queen prev-move (prevPc>=8 -> payload>=512 -> index>=1536): the "black to move"
     // IndexOutOfRange crash, pinned by HistoryTests.)
     let corrCont: int16[] = Array.zeroCreate (2 * 1024)
+    // Pawn history: [pawnKey&511][pc][to] -> int16 quiet-ordering history keyed by pawn structure
+    // (SF pawnHistory adapted to the 12-piece encoding; 512*768 = 768 KiB). Lazily allocated
+    // (EnsureAux, cont4 pattern): UsePawnHist's kill switch must cost zero bytes. Checked reads only
+    // (the lazy-table rule above).
+    let mutable pawnHist: int16[] = Array.empty
 
     /// Allocate the config-gated tables this search will actually use (idempotent; called by
     /// Worker.SetupRoot with the active config flags before the search starts).
-    member _.EnsureAux (useCont4: bool) (useCorrMinor: bool) (useCorrMajor: bool) (useCorrNonPawn: bool) : unit =
+    member _.EnsureAux
+        (useCont4: bool)
+        (useCorrMinor: bool)
+        (useCorrMajor: bool)
+        (useCorrNonPawn: bool)
+        (usePawnHist: bool)
+        : unit =
         if useCont4 && cont4.Length = 0 then
             cont4 <- Array.zeroCreate (768 * 768)
 
@@ -100,6 +112,9 @@ type Tables() =
 
         if useCorrNonPawn && corrNonPawn.Length = 0 then
             corrNonPawn <- Array.zeroCreate (2 * 16384)
+
+        if usePawnHist && pawnHist.Length = 0 then
+            pawnHist <- Array.zeroCreate (512 * 768)
 
     /// Zero every table (new game / clear between searches).
     member _.Clear() : unit =
@@ -115,6 +130,7 @@ type Tables() =
         Array.Clear(corrMajor, 0, corrMajor.Length)
         Array.Clear(corrNonPawn, 0, corrNonPawn.Length)
         Array.Clear(corrCont, 0, corrCont.Length)
+        Array.Clear(pawnHist, 0, pawnHist.Length)
 
     /// Worker pool, between MOVES of one game: drop the per-search hint moves (killers are ply-indexed
     /// and ply meanings shift; counters conservatively too) but keep every gravity table — warm
@@ -184,6 +200,11 @@ type Tables() =
     member _.CorrHistCont (c: Color) (prevPc: int) (prevTo: int) : int =
         if prevPc < 0 then 0
         else int corrCont.[(c <<< 10) ||| (prevPc * 64 + prevTo)]
+
+    /// Pawn-structure quiet history for (pawn key, piece, destination); checked read (lazy table).
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+    member _.PawnHistory (pawnKey: uint64) (pc: Piece) (dst: Square) : int =
+        int pawnHist.[(int (pawnKey &&& 511UL)) * 768 + (pc * 64 + dst)]
 
     // --- writes -----------------------------------------------------------------------------------
     member _.SetCounter (prevPc: Piece) (prevTo: Square) (m: Move) : unit = counter.[prevPc * 64 + prevTo] <- m
@@ -269,3 +290,10 @@ type Tables() =
             let b = max -ContHistD (min ContHistD bonus)
             let v = int cont4.[i]
             cont4.[i] <- int16 (v + b - v * (abs b) / ContHistD)
+
+    /// Gravity update of pawn history (saturates within int16 toward +/-PawnHistD).
+    member _.UpdatePawnHist (pawnKey: uint64) (pc: Piece) (dst: Square) (bonus: int) : unit =
+        let i = (int (pawnKey &&& 511UL)) * 768 + (pc * 64 + dst)
+        let b = max -PawnHistD (min PawnHistD bonus)
+        let v = int pawnHist.[i]
+        pawnHist.[i] <- int16 (v + b - v * (abs b) / PawnHistD)

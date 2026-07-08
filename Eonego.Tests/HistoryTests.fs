@@ -124,3 +124,48 @@ let ``continuation correction history indexes every (side, piece, square) withou
 
     // the specific case that used to crash (Black to move, previous move by the White king)
     Assert.NotEqual(0, t.CorrHistCont Black (makePiece White King) 60)
+
+[<Fact>]
+let ``pawn history: EnsureAux allocates, update/read roundtrip, keys isolate`` () =
+    let t = Tables()
+    t.EnsureAux false false false false true
+    let key1 = 0x1234UL
+    let key2 = 0x1235UL // differs in the low 9 bits -> different slot
+    let pc = makePiece White Pawn
+    let dst = sq 4 3 // e4
+    Assert.Equal(0, t.PawnHistory key1 pc dst)
+    t.UpdatePawnHist key1 pc dst PawnHistD
+    Assert.Equal(PawnHistD, t.PawnHistory key1 pc dst)
+    Assert.True(t.PawnHistory key1 pc dst <= 32767) // fits int16
+    Assert.Equal(0, t.PawnHistory key2 pc dst) // different pawn key untouched
+    Assert.Equal(0, t.PawnHistory key1 (makePiece White Knight) dst) // different piece untouched
+    Assert.Equal(0, t.PawnHistory key1 pc (sq 4 4)) // different square untouched
+
+[<Fact>]
+let ``pawn history: gravity saturates within the divisor band`` () =
+    let t = Tables()
+    t.EnsureAux false false false false true
+    let key = 0xBEEFUL
+    let pc = makePiece Black Knight
+    let dst = sq 2 5
+
+    for _ in 1..64 do
+        t.UpdatePawnHist key pc dst 100000 // over-clamp bonus; must clamp then saturate
+
+    Assert.Equal(PawnHistD, t.PawnHistory key pc dst)
+
+    for _ in 1..128 do
+        t.UpdatePawnHist key pc dst (-100000)
+
+    Assert.Equal(-PawnHistD, t.PawnHistory key pc dst)
+
+[<Fact>]
+let ``pawn history: Clear zeroes; EnsureAux is idempotent`` () =
+    let t = Tables()
+    t.EnsureAux false false false false true
+    let pc = makePiece White Bishop
+    t.UpdatePawnHist 7UL pc (sq 3 1) 500
+    t.EnsureAux false false false false true // second call must not reallocate/lose data
+    Assert.NotEqual(0, t.PawnHistory 7UL pc (sq 3 1))
+    t.Clear()
+    Assert.Equal(0, t.PawnHistory 7UL pc (sq 3 1))

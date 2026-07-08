@@ -245,6 +245,9 @@ let private buildConfig (st: UCIState) : SearchConfig =
       UseCorrMajor = (Environment.GetEnvironmentVariable("EONEGO_CORRMAJOR") <> "0")
       UseCorrNonPawn = (Environment.GetEnvironmentVariable("EONEGO_CORRNONPAWN") <> "0")
       UseCorrCont = (Environment.GetEnvironmentVariable("EONEGO_CORRCONT") <> "0")
+      // Pawn history (SF pawnHistory analogue): DEFAULT ON per the kitchen-sink convention,
+      // EONEGO_PAWNHIST=0 is the kill switch. Pre-SPRT.
+      UsePawnHist = (Environment.GetEnvironmentVariable("EONEGO_PAWNHIST") <> "0")
       UseCaptFut = (Environment.GetEnvironmentVariable("EONEGO_CAPFUT") <> "0")
       UsePartialCommit = (Environment.GetEnvironmentVariable("EONEGO_PARTIAL") <> "0")
       UseCont4 = (Environment.GetEnvironmentVariable("EONEGO_CONT4") <> "1")
