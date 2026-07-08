@@ -118,12 +118,18 @@ let Cont4Div = envInt "EONEGO_T_CONT4_DIV" 2 1 8
 let Rule50DampDiv = envInt "EONEGO_T_R50_DAMP" 212 50 2048
 
 // --- Time management (game clocks only — fixed-depth/movetime paths never read these).
-//     soft = (clock-overhead)/Mtg + inc*IncFrac100/100; hard = min(clock*HardClockPct/100, soft*HardSoftMult).
-//     Defaults reproduce the v1 formula exactly (3/4 == 75/100, 0.4 == 40/100 at int precision). ---
+//     avail = clock - overhead - clock*SafetyPct/100;  soft = avail/Mtg + inc*IncFrac100/100;
+//     hard = min(avail, clock*HardClockPct/100, soft*HardSoftMult).
+//     TmSafetyPct reserves a SMALL extra slice of the clock beyond the fixed MoveOverhead — it
+//     absorbs OS-scheduling jitter / GUI-delivery latency (the stuff a fixed ms overhead can't cover,
+//     esp. under machine load) so the move lands before the flag falls. Set EONEGO_T_TM_SAFETYPCT=0
+//     to recover the exact v1 formula (byte-identical clock budgets). Other defaults reproduce v1
+//     exactly (3/4 == 75/100, 0.4 == 40/100 at int precision). ---
 let TmMtg = envInt "EONEGO_T_TM_MTG" 30 8 80
 let TmIncFrac100 = envInt "EONEGO_T_TM_INCFRAC" 75 0 150
 let TmHardClockPct = envInt "EONEGO_T_TM_HARDPCT" 40 10 90
 let TmHardSoftMult = envInt "EONEGO_T_TM_HARDMULT" 4 2 12
+let TmSafetyPct = envInt "EONEGO_T_TM_SAFETYPCT" 2 0 50
 
 // --- Dynamic TM scale (the TM campaign): softScalePct rescales the soft budget at READ time
 //     (SearchControl.SoftBudgetMs); 100 = neutral = integer-identical to the unscaled budget.

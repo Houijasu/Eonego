@@ -219,52 +219,54 @@ let private buildConfig (st: UCIState) : SearchConfig =
       UseIir = true
       UseRazoring = true
       UseHistoryPruning = true
-      UseHistPruneCombined = (Environment.GetEnvironmentVariable("EONEGO_HISTCOMBINED") = "1")
+      UseHistPruneCombined = (Environment.GetEnvironmentVariable("EONEGO_HISTCOMBINED") <> "0")
       UseDeltaPruning = true
-      UseQsDeltaCorrected = (Environment.GetEnvironmentVariable("EONEGO_QSDELTACORR") = "1")
+      UseQsDeltaCorrected = (Environment.GetEnvironmentVariable("EONEGO_QSDELTACORR") <> "0")
       UseContHist = true
       UseSingular = true
       UseNmpVerify = true
       UseLmrTweaks = true
       UseAspTweaks = true
-      // A/B env knobs for match.py per-player overrides (campaign step B4): defaults preserve
-      // release behaviour; each flag flips for one player without a rebuild.
+      // A/B env knobs for match.py per-player overrides (campaign step B4). 2026-07-08 (user
+      // request): this whole block is FLIPPED to default-ON (kitchen-sink build) — each now reads
+      // `<> "0"`, so the feature is ON unless its env var is set to "0". PRE-SPRT and unvalidated in
+      // combination; set the individual EONEGO_* var to 0 to disable any one.
       UseQsTt = (Environment.GetEnvironmentVariable("EONEGO_QSTT") <> "1")
       UseTtEvalAdjust = (Environment.GetEnvironmentVariable("EONEGO_TTEVADJ") <> "1")
-      UseCheckExt = (Environment.GetEnvironmentVariable("EONEGO_CHECKEXT") = "1")
-      UseOneReplyExt = (Environment.GetEnvironmentVariable("EONEGO_ONEREPLY") = "1")
-      UseQsEvasionCap = (Environment.GetEnvironmentVariable("EONEGO_QSEVCAP") = "1")
-      UseTtCapture = (Environment.GetEnvironmentVariable("EONEGO_TTCAPTURE") = "1")
+      UseCheckExt = (Environment.GetEnvironmentVariable("EONEGO_CHECKEXT") <> "0")
+      UseOneReplyExt = (Environment.GetEnvironmentVariable("EONEGO_ONEREPLY") <> "0")
+      UseQsEvasionCap = (Environment.GetEnvironmentVariable("EONEGO_QSEVCAP") <> "0")
+      UseTtCapture = (Environment.GetEnvironmentVariable("EONEGO_TTCAPTURE") <> "0")
       UseCorrHist = (Environment.GetEnvironmentVariable("EONEGO_CORRHIST") <> "1")
-      UseCorrMinor = (Environment.GetEnvironmentVariable("EONEGO_CORRMINOR") = "1")
-      UseCorrMajor = (Environment.GetEnvironmentVariable("EONEGO_CORRMAJOR") = "1")
-      UseCorrNonPawn = (Environment.GetEnvironmentVariable("EONEGO_CORRNONPAWN") = "1")
-      UseCorrCont = (Environment.GetEnvironmentVariable("EONEGO_CORRCONT") = "1")
-      UseCaptFut = (Environment.GetEnvironmentVariable("EONEGO_CAPFUT") = "1")
-      UsePartialCommit = (Environment.GetEnvironmentVariable("EONEGO_PARTIAL") = "1")
+      UseCorrMinor = (Environment.GetEnvironmentVariable("EONEGO_CORRMINOR") <> "0")
+      UseCorrMajor = (Environment.GetEnvironmentVariable("EONEGO_CORRMAJOR") <> "0")
+      UseCorrNonPawn = (Environment.GetEnvironmentVariable("EONEGO_CORRNONPAWN") <> "0")
+      UseCorrCont = (Environment.GetEnvironmentVariable("EONEGO_CORRCONT") <> "0")
+      UseCaptFut = (Environment.GetEnvironmentVariable("EONEGO_CAPFUT") <> "0")
+      UsePartialCommit = (Environment.GetEnvironmentVariable("EONEGO_PARTIAL") <> "0")
       UseCont4 = (Environment.GetEnvironmentVariable("EONEGO_CONT4") <> "1")
       UseR50Damp = (Environment.GetEnvironmentVariable("EONEGO_R50DAMP") <> "1")
-      UseQsChecks = (Environment.GetEnvironmentVariable("EONEGO_QSCHECKS") = "1")
-      UseRootEffort = (Environment.GetEnvironmentVariable("EONEGO_ROOTEFFORT") = "1")
-      UseRootVerify = (Environment.GetEnvironmentVariable("EONEGO_ROOTVERIFY") = "1")
+      UseQsChecks = (Environment.GetEnvironmentVariable("EONEGO_QSCHECKS") <> "0")
+      UseRootEffort = (Environment.GetEnvironmentVariable("EONEGO_ROOTEFFORT") <> "0")
+      UseRootVerify = (Environment.GetEnvironmentVariable("EONEGO_ROOTVERIFY") <> "0")
       UseRetro = (Environment.GetEnvironmentVariable("EONEGO_RETRO") <> "0")
       // Syzygy WDL probe: inert until `setoption name SyzygyPath` loads tables
       // (Syzygy.Largest = 0 gates every probe); EONEGO_SYZYGY=0 is the kill switch.
       // (Was `<> "1"` — that inverted the documented kill switch: =1 disabled, =0 didn't.)
       UseSyzygy = (Environment.GetEnvironmentVariable("EONEGO_SYZYGY") <> "0")
-      // df-pn mate oracle: default OFF pre-SPRT (the CHECKEXT/CAPFUT class); flip to
-      // <> "0" only after a passing match verdict.
-      UseDFPN = (Environment.GetEnvironmentVariable("EONEGO_DFPN") = "1")
+      // df-pn mate oracle: DEFAULT-ON as of the 2026-07-08 kitchen-sink flip (EONEGO_DFPN=0 disables;
+      // was default-OFF pre-SPRT). The oracle never stops a normal search (only under `go mate N`).
+      UseDFPN = (Environment.GetEnvironmentVariable("EONEGO_DFPN") <> "0")
       // Policy sidecar: ON iff startup actually loaded one (EONEGO_POLICY gate; see run()).
       UsePolicy = st.Policy.IsSome || st.OwnPolicy.IsSome
-      // Dynamic time management (the TM campaign; default OFF pre-SPRT): each component is
-      // independently A/B-able per player without a rebuild. Game clocks only — movetime
-      // matches make all of these inert (soft = 0). EONEGO_TMLOG=1 adds per-move telemetry.
-      UseTmMtgHarden = (Environment.GetEnvironmentVariable("EONEGO_TMMTG") = "1")
-      UseTmStability = (Environment.GetEnvironmentVariable("EONEGO_TMSTAB") = "1")
-      UseTmTrend = (Environment.GetEnvironmentVariable("EONEGO_TMTREND") = "1")
-      UseTmFailLow = (Environment.GetEnvironmentVariable("EONEGO_TMFAILLOW") = "1")
-      UseTmEffort = (Environment.GetEnvironmentVariable("EONEGO_TMEFFORT") = "1")
+      // Dynamic time management (the TM campaign; DEFAULT-ON as of the 2026-07-08 kitchen-sink flip,
+      // each EONEGO_TM*=0 disables its component): independently A/B-able per player. Game clocks
+      // only — movetime matches make all of these inert (soft = 0). EONEGO_TMLOG=1 adds telemetry.
+      UseTmMtgHarden = (Environment.GetEnvironmentVariable("EONEGO_TMMTG") <> "0")
+      UseTmStability = (Environment.GetEnvironmentVariable("EONEGO_TMSTAB") <> "0")
+      UseTmTrend = (Environment.GetEnvironmentVariable("EONEGO_TMTREND") <> "0")
+      UseTmFailLow = (Environment.GetEnvironmentVariable("EONEGO_TMFAILLOW") <> "0")
+      UseTmEffort = (Environment.GetEnvironmentVariable("EONEGO_TMEFFORT") <> "0")
       MoveOverhead = st.MoveOverhead
       // NNUE accumulator checkpoint cache (AccumulatorCache.fs): fully built but inert at
       // 0 MiB. EONEGO_ACCMB=<MiB> arms it for SPRT (per-search table shared across the
@@ -437,16 +439,31 @@ let run () =
                 | Some bytes -> (match NNUE.loadBytes bytes with Loaded n -> Some n | Failed _ -> None)
                 | None -> None
 
-    // Policy net (EONEGO_POLICY). Two formats share the one env var, dispatched by file magic:
+    // Policy net. The EONPOL02 sidecar is ON BY DEFAULT (user directive 2026-07-07): an unset
+    // EONEGO_POLICY now loads the embedded `policy.dat` exactly as "1" did. Formats share the one
+    // env var, dispatched by file magic:
     //   EONPOL02 sidecar — reads the NNUE trunk; ftHash-bound; any position.
     //   EONPOL03 own-trunk — its own board-feature net; only fires at ≤6 pieces (endgames).
-    // Values: unset => classic search (byte-identical); "1" => embedded sidecar `policy.dat`;
-    //   "own1" => embedded own-trunk `ownpolicy.dat`; <path> => the file (magic picks the format).
+    // Values: unset/"1" => embedded sidecar `policy.dat` (DEFAULT ON); "0"/"off" => classic search
+    //   (byte-identical kill switch); "own1" => embedded own-trunk `ownpolicy.dat`; <path> => the
+    //   file (magic picks the format).
     let policyEnv = Environment.GetEnvironmentVariable("EONEGO_POLICY")
 
+    // Normalise the gate: unset/empty behaves as "1" (default ON); "0"/"off"/"none" is the kill
+    // switch. Anything else (incl. a path) passes through unchanged.
+    let policyMode =
+        match policyEnv with
+        | null | "" -> "1"
+        | v ->
+            match v.ToLowerInvariant() with
+            | "0"
+            | "off"
+            | "none" -> "0"
+            | _ -> v
+
     let ownPolicy =
-        match policyEnv, net with
-        | (null | ""), _ -> None
+        match policyMode, net with
+        | "0", _ -> None
         | _, None -> None
         | "own1", Some _ ->
             match readEmbedded "ownpolicy.dat" with
@@ -473,15 +490,17 @@ let run () =
         if ownPolicy.IsSome then
             None
         else
-            match policyEnv, net with
-            | (null | ""), _ -> None
+            match policyMode, net with
+            | "0", _ -> None
             | _, None -> None
             | "own1", _ -> None
             | "1", Some n ->
                 match readEmbedded "policy.dat" with
                 | Some bytes ->
                     match Policy.loadBytes bytes n.FtHash with
-                    | Policy.PolicyLoaded p -> Some p
+                    | Policy.PolicyLoaded p ->
+                        writeLine "info string policy sidecar: embedded (default on; EONEGO_POLICY=0 to disable)"
+                        Some p
                     | Policy.PolicyFailed why ->
                         writeLine ("info string embedded policy load FAILED (" + why + "); policy off")
                         None

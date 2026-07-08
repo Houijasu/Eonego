@@ -35,42 +35,46 @@ let ``no clock means no time stop`` () =
 
 [<Fact>]
 let ``sudden death splits the clock by the fallback movestogo`` () =
-    // avail = 59990; soft = 59990/30 + 1000*75/100 = 1999 + 750; hard = min(24000, 2749*4)
+    // safety = 60000*2/100 = 1200; avail = 60000 - 10 - 1200 = 58790;
+    // soft = 58790/30 + 1000*75/100 = 1959 + 750; hard = min(avail, 24000, 2709*4)
     let lim = { defaultLimits with WTime = 60000; WInc = 1000 }
-    Assert.Equal((2749L, 10996L), computeTimes 10 false lim White)
+    Assert.Equal((2709L, 10836L), computeTimes 10 false lim White)
 
 [<Fact>]
 let ``explicit movestogo divides the clock directly`` () =
-    // avail = 59990; soft = 59990/20 = 2999; hard = min(24000, 11996)
+    // avail = 60000 - 10 - 1200 safety = 58790; soft = 58790/20 = 2939; hard = min(avail, 24000, 2939*4)
     let lim = { defaultLimits with WTime = 60000; MovesToGo = 20 }
-    Assert.Equal((2999L, 11996L), computeTimes 10 false lim White)
+    Assert.Equal((2939L, 11756L), computeTimes 10 false lim White)
 
 [<Fact>]
 let ``black to move reads btime and binc`` () =
-    // avail = 29990; soft = 29990/30 + 500*75/100 = 999 + 375; hard = min(12000, 1374*4)
+    // safety = 30000*2/100 = 600; avail = 30000 - 10 - 600 = 29390;
+    // soft = 29390/30 + 500*75/100 = 979 + 375; hard = min(avail, 12000, 1354*4)
     let lim = { defaultLimits with BTime = 30000; BInc = 500; WTime = 1 }
-    Assert.Equal((1374L, 5496L), computeTimes 10 false lim Black)
+    Assert.Equal((1354L, 5416L), computeTimes 10 false lim Black)
 
 [<Fact>]
 let ``legacy movestogo one leaves soft above hard`` () =
-    // The known wart the harden flag fixes: soft = avail = 9990 but hard caps at 40% = 4000.
+    // The known wart the harden flag fixes: soft = avail = 9790 (10000 - 10 - 200 safety) but hard
+    // caps at 40% = 4000.
     let lim = { defaultLimits with WTime = 10000; MovesToGo = 1 }
-    Assert.Equal((9990L, 4000L), computeTimes 10 false lim White)
+    Assert.Equal((9790L, 4000L), computeTimes 10 false lim White)
 
 // ---------------------------------------------------------------------------
 // computeTimes — UseTmMtgHarden (defaults: MtgClamp=50, MtgLowStep=10)
 // ---------------------------------------------------------------------------
 [<Fact>]
 let ``harden lets movestogo one spend ninety percent of the clock`` () =
-    // hardPct = min 90 (40 + 5*10) = 90; hard = 9990*90/100 = 8991; soft clamped to hard.
+    // avail = 10000 - 10 - 200 safety = 9790; hardPct = min 90 (40 + 5*10) = 90;
+    // hard = 9790*90/100 = 8811; soft clamped to hard.
     let lim = { defaultLimits with WTime = 10000; MovesToGo = 1 }
-    Assert.Equal((8991L, 8991L), computeTimes 10 true lim White)
+    Assert.Equal((8811L, 8811L), computeTimes 10 true lim White)
 
 [<Fact>]
 let ``harden clamps an absurd movestogo`` () =
-    // mtg 200 -> 50: soft = 59990/50 = 1199 (legacy gave 299); hard = min(24000, 4796).
+    // mtg 200 -> 50: avail = 58790; soft = 58790/50 = 1175; hard = min(avail, 24000, 4700).
     let lim = { defaultLimits with WTime = 60000; MovesToGo = 200 }
-    Assert.Equal((1199L, 4796L), computeTimes 10 true lim White)
+    Assert.Equal((1175L, 4700L), computeTimes 10 true lim White)
 
 [<Fact>]
 let ``harden leaves a normal movestogo unchanged`` () =

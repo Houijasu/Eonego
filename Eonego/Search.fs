@@ -2745,7 +2745,14 @@ let computeTimes (moveOverhead: int) (mtgHarden: bool) (l: SearchLimits) (stm: C
                 else
                     Tunables.TmMtg
 
-            let avail = max 1L (int64 time - overhead)
+            // Time-safety reserve (EONEGO_T_TM_SAFETYPCT, default 2%): hold back a small extra slice of
+            // the clock beyond the fixed MoveOverhead so scheduling jitter / GUI-delivery latency can't
+            // push the move past the flag. `avail` shrinks by it, so soft + the soft-bound hard track
+            // down. When the margin is ON the hard cap is also clamped to `avail` (else-branch below) so
+            // the reserve holds even at a high HardClockPct; that clamp is gated on SafetyPct>0 so
+            // SafetyPct=0 reproduces the EXACT v1 budgets (avail = clock - overhead, no clamp).
+            let safety = int64 time * int64 Tunables.TmSafetyPct / 100L
+            let avail = max 1L (int64 time - overhead - safety)
             let soft = avail / int64 mtg + int64 inc * int64 Tunables.TmIncFrac100 / 100L
 
             let hard =
@@ -2753,7 +2760,8 @@ let computeTimes (moveOverhead: int) (mtgHarden: bool) (l: SearchLimits) (stm: C
                     let hardPct = min 90 (Tunables.TmHardClockPct + (6 - l.MovesToGo) * Tunables.TmMtgLowStep)
                     min (avail * int64 hardPct / 100L) (soft * int64 Tunables.TmHardSoftMult)
                 else
-                    min (int64 time * int64 Tunables.TmHardClockPct / 100L) (soft * int64 Tunables.TmHardSoftMult)
+                    let capped = min (int64 time * int64 Tunables.TmHardClockPct / 100L) (soft * int64 Tunables.TmHardSoftMult)
+                    if Tunables.TmSafetyPct > 0 then min avail capped else capped
 
             let soft = if mtgHarden then min soft hard else soft
             (max 1L soft, max 1L hard)

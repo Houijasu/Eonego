@@ -104,3 +104,23 @@ let ``killers slide and de-duplicate per ply`` () =
     Assert.Equal(k2, t.Killer 5 0)
     Assert.Equal(k1, t.Killer 5 1)
     Assert.Equal(MoveNone, t.Killer 6 0) // a different ply is untouched
+
+[<Fact>]
+let ``continuation correction history indexes every (side, piece, square) without overflow`` () =
+    // Regression (crash: IndexOutOfRangeException "when black to move"): corrCont was sized 2*768 but
+    // indexed (c <<< 10) ||| (prevPc*64 + prevTo) — stride 1024, not 768. For Black (c = 1) the base
+    // is 1024, so a previous King/Queen move (piece code >= 8: WQueen = 8, WKing = 10) gives an index
+    // >= 1536 and the checked read throws. Exercise the WHOLE valid input space; must never throw.
+    let t = Tables()
+
+    for c in [ White; Black ] do
+        for pt in [ Pawn; Knight; Bishop; Rook; Queen; King ] do
+            for owner in [ White; Black ] do
+                let prevPc = makePiece owner pt
+
+                for prevTo in 0..63 do
+                    t.UpdateCorrCont c prevPc prevTo 128 // write: index must be in range
+                    t.CorrHistCont c prevPc prevTo |> ignore // read: index must be in range
+
+    // the specific case that used to crash (Black to move, previous move by the White king)
+    Assert.NotEqual(0, t.CorrHistCont Black (makePiece White King) 60)

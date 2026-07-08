@@ -79,8 +79,12 @@ type Tables() =
     let mutable corrMajor: int16[] = Array.empty
     // Non-pawn correction history: keyed by Position.NonPawnKey (all non-pawn pieces).
     let mutable corrNonPawn: int16[] = Array.empty
-    // Continuation correction history: keyed by previous move (prevPc*64+prevTo), 2 sides.
-    let corrCont: int16[] = Array.zeroCreate (2 * 768)
+    // Continuation correction history: keyed by previous move, indexed [c <<< 10 | (prevPc*64+prevTo)].
+    // The payload prevPc*64+prevTo is 0..767 (12 pieces * 64), but the color bit sits at 1<<10, so the
+    // per-side STRIDE is 1024 — the array MUST be 2*1024 to match. (A 2*768 array overflowed for Black,
+    // c=1, after a King/Queen prev-move (prevPc>=8 -> payload>=512 -> index>=1536): the "black to move"
+    // IndexOutOfRange crash, pinned by HistoryTests.)
+    let corrCont: int16[] = Array.zeroCreate (2 * 1024)
 
     /// Allocate the config-gated tables this search will actually use (idempotent; called by
     /// Worker.SetupRoot with the active config flags before the search starts).
