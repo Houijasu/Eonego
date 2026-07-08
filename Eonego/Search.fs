@@ -2252,11 +2252,19 @@ let private reportLine (w: Worker) (depth: int) (pvNum: int) (score: int) (bound
         .Append(" score ")
         .Append(scoreString score)
         .Append(bound)
-        .Append(" nodes ")
-        .Append(nodes)
-        .Append(" nps ")
-        .Append(nps)
     |> ignore
+
+    // UCI_ShowWDL: root policy-head WDL (per-mille, stm-relative) on every info line, clamped
+    // by proven scores (wdlForScore). ValueNone — the default everywhere but the UCI layer —
+    // keeps the line byte-identical to legacy output. Same values on every MultiPV line by
+    // design: the field describes the ROOT game state (the UCI convention).
+    (match w.Control.RootWdl with
+     | ValueSome rootWdl ->
+         let struct (ww, wd, wl) = wdlForScore score rootWdl
+         sb.Append(" wdl ").Append(ww).Append(' ').Append(wd).Append(' ').Append(wl) |> ignore
+     | ValueNone -> ())
+
+    sb.Append(" nodes ").Append(nodes).Append(" nps ").Append(nps) |> ignore
 
     // Fritz emits `hashfull` only once the table is measurably filled, omitting it while still 0.
     if hashfull > 0 then
@@ -3142,8 +3150,13 @@ let private goCore (control: SearchControl) (workers: Worker[]) : Move =
             .Append(max chosen.CompletedDepth DFPNPlies)
             .Append(" score mate ")
             .Append((DFPNPlies + 1) / 2)
-            .Append(" pv")
         |> ignore
+
+        // UCI_ShowWDL: a certified mate is a certain win for the side to move.
+        if control.RootWdl.IsSome then
+            sb.Append(" wdl 1000 0 0") |> ignore
+
+        sb.Append(" pv") |> ignore
 
         for m in control.Oracle.PV do
             sb.Append(' ').Append(toUCI m) |> ignore
@@ -3195,15 +3208,6 @@ let private goCore (control: SearchControl) (workers: Worker[]) : Move =
         |> ignore
 
         writeLine (tmSb.ToString())
-
-    // Policy WDL head (root, on-demand): one 3x32 dot off the value stack per `go` — never in the
-    // per-node path. Emitted only when a WDL-carrying sidecar is loaded (EONEGO_POLICY), so classic
-    // runs keep byte-identical output. Per-mille, side-to-move relative (the UCI wdl convention).
-    (match control.Policy, control.Net with
-     | Some pnet, Some net when pnet.HasWdl ->
-         let struct (wdlW, wdlD, wdlL) = Policy.evalWDL net pnet workers.[0].Pos
-         writeLine ("info wdl " + string wdlW + " " + string wdlD + " " + string wdlL)
-     | _ -> ())
 
     // Final whole-search totals right before bestmove (the standard UCI closing summary line);
     // GUIs read this as the authoritative node/time accounting for the move.
