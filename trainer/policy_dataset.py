@@ -108,6 +108,33 @@ def build_policy_arrays(records, qmax: int = QMAX):
     return np.array(keep, dtype=np.int64), arrays
 
 
+_SIG_ORDER = "KQRBNP"
+_SIG_VALS = {"k": 0, "q": 9, "r": 5, "b": 3, "n": 3, "p": 1}
+
+
+def signature_of_fen(fen: str) -> str:
+    """Canonical material signature (e.g. 'KQRvKR'): each side's pieces in K,Q,R,B,N,P order,
+    stronger army (piece-value sum; lexicographic tiebreak) first. Color/STM-independent, so a
+    signature-disjoint split can never leak mirrored positions across the train/holdout line."""
+    w, b = [], []
+    for c in fen.split()[0]:
+        if c.isalpha():
+            (w if c.isupper() else b).append(c.lower())
+
+    def fmt(ps):
+        return "".join(sorted((p.upper() for p in ps), key=_SIG_ORDER.index))
+
+    sw, sb = fmt(w), fmt(b)
+    vw = sum(_SIG_VALS[p] for p in w)
+    vb = sum(_SIG_VALS[p] for p in b)
+    return f"{sw}v{sb}" if (vw, sw) >= (vb, sb) else f"{sb}v{sw}"
+
+
+def signatures_for(records, keep) -> np.ndarray:
+    """Material signature per KEPT row (index-aligned with build_policy_arrays' keep)."""
+    return np.array([signature_of_fen(records[i][0]) for i in keep])
+
+
 def compute_a1(net_path, recs, chunk: int = 200_000):
     """Exact integer a1 activations (N, 32) u8 + buckets, through the FROZEN value stacks
     (mirror of NNUE.a1FromFt). Chunked so multi-million-row dumps stay in RAM."""
