@@ -490,6 +490,10 @@ type SearchControl
     member _.AccCheckpoint: AccCheckpointTable = accCheckpoint
     member val LastBest: Move = MoveNone with get, set // result of the most recent go()
     member val LastScore: int = 0 with get, set
+    /// UCI_ShowWDL: the root position's policy-head WDL (per-mille, stm-relative), set once per
+    /// `go` by the UCI layer BEFORE the search thread starts; ValueNone = option off / no WDL
+    /// sidecar, which keeps every info line byte-identical to the legacy output.
+    member val RootWdl: (struct (int * int * int)) voption = ValueNone with get, set
     /// df-pn oracle publication slot — fresh per control (= per `go`), so there is no clearing
     /// protocol; the oracle thread Publishes, goCore reads after joining it.
     member val Oracle: Eonego.DFPN.OracleResult = Eonego.DFPN.OracleResult() with get

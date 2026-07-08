@@ -30,3 +30,30 @@ let ``the clamp boundary sits at the bottom of the TB band`` () =
     Assert.Equal<struct (int * int * int)>(rootWdl, wdlForScore (bottom - 1) rootWdl)
     Assert.Equal<struct (int * int * int)>(struct (0, 0, 1000), wdlForScore (-bottom) rootWdl)
     Assert.Equal<struct (int * int * int)>(rootWdl, wdlForScore (-(bottom - 1)) rootWdl)
+
+let private defaultLimits: SearchLimits =
+    { MoveTime = 0
+      WTime = 0
+      WInc = 0
+      BTime = 0
+      BInc = 0
+      MovesToGo = 0
+      Depth = 0
+      Nodes = 0L
+      Infinite = false
+      Mate = 0
+      Ponder = false
+      SearchMoves = [||] }
+
+[<Fact>]
+let ``RootWdl defaults to ValueNone on a fresh SearchControl`` () =
+    let ctrl =
+        SearchControl(
+            defaultConfig,
+            defaultLimits,
+            Eonego.Transposition.TranspositionTable(16),
+            Eonego.Position.StartPosFen,
+            [||]
+        )
+
+    Assert.True ctrl.RootWdl.IsNone
