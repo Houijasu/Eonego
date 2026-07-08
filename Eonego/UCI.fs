@@ -45,6 +45,9 @@ type private UCIState =
       mutable HashMb: int
       mutable MultiPv: int
       mutable MoveOverhead: int
+      // UCI_ShowWDL: append the root policy-head WDL to every info line. Only meaningful when the
+      // loaded sidecar carries the WDL section (the option is only ADVERTISED then, too).
+      mutable ShowWdl: bool
       Net: Network option
       Policy: Policy.PolicyNetwork option
       OwnPolicy: Policy.OwnNetwork option
@@ -337,6 +340,20 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
                 ?ownPolicy = st.OwnPolicy
             )
 
+        // UCI_ShowWDL: one policy-head WDL evaluation of the ROOT per `go` (a 3x32 dot on the UCI
+        // thread — never the per-node path). reportLine appends it to every info line while
+        // ValueSome; the net-free Position is fine (ftInto takes the from-scratch path).
+        (match st.Policy, st.Net with
+         | Some pnet, Some net when st.ShowWdl && pnet.HasWdl ->
+             let p = Position()
+             p.LoadFen st.RootFen
+
+             for mv in st.RootMoves do
+                 p.Make mv
+
+             control.RootWdl <- ValueSome(Policy.evalWDL net pnet p)
+         | _ -> ())
+
         // Arm on the UCI thread BEFORE the search thread exists: a `stop`/`quit` arriving right
         // after t.Start() must find the stop flag armed-and-clear, not race the thread's own Reset
         // (which either erased the stop — unbounded search — or aborted depth 1 into first-legal).
@@ -397,6 +414,9 @@ let private handleSetOption (st: UCIState) (tokens: string[]) =
             st.MultiPv <- max 1 (min 256 v)
         elif String.Equals(name, "Move Overhead", StringComparison.OrdinalIgnoreCase) then
             st.MoveOverhead <- max 0 (min 5000 v)
+        elif String.Equals(name, "UCI_ShowWDL", StringComparison.OrdinalIgnoreCase) then
+            // Accepted even when not advertised (harmless: emission also requires a WDL sidecar).
+            st.ShowWdl <- String.Equals(tokens.[vi + 1], "true", StringComparison.OrdinalIgnoreCase)
         elif String.Equals(name, "SyzygyPath", StringComparison.OrdinalIgnoreCase) then
             let pathVal = String.Join(" ", tokens.[vi + 1 ..])
             if Syzygy.init pathVal then
@@ -521,6 +541,7 @@ let run () =
           HashMb = DefaultHashMb
           MultiPv = 1
           MoveOverhead = 10
+          ShowWdl = false
           Net = net
           Policy = policy
           OwnPolicy = ownPolicy
@@ -553,6 +574,13 @@ let run () =
                     // checkbox on this declaration, so without it the feature is unreachable.
                     writeLine "option name Ponder type check default false"
                     writeLine "option name SyzygyPath type string default <empty>"
+                    // UCI_ShowWDL: advertised ONLY when the loaded sidecar actually carries a WDL
+                    // head (sidecar loads before this loop, so availability is known here) — a GUI
+                    // never sees an option that cannot work.
+                    (match st.Policy with
+                     | Some p when p.HasWdl -> writeLine "option name UCI_ShowWDL type check default false"
+                     | _ -> ())
+
                     writeLine "uciok"
                 | "isready" ->
                     writeLine "readyok"
