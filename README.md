@@ -87,6 +87,7 @@ dotnet test  Eonego.Tests/Eonego.Tests.fsproj -c Release
 | `MultiPV` | 1 | Number of principal variations to report |
 | `Move Overhead` | 10 | Milliseconds reserved per move for GUI/communication |
 | `Ponder` | false | Declares support for `go ponder` / `ponderhit` |
+| `UCI_ShowWDL` | false | Append `wdl W D L` (per-mille, side-to-move) to info lines; advertised only when the embedded policy sidecar carries a WDL head |
 | `SyzygyPath` | *(empty)* | Path to Syzygy tablebase files |
 
 `go searchmoves` restricts the root to a given move list — useful for analyzing a single
