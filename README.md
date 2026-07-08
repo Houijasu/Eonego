@@ -46,6 +46,7 @@ alpha-beta search.
   - Learns static-eval bias from pawn structure and minor-piece placement
 - **Move ordering**
   - Staged picker: transposition move, captures, killers, counter-moves, quiet history
+  - Quiet history blends butterfly, continuation (1/2/4-ply), and pawn-structure tables
 - **Transposition table**
   - Lockless clustered hash table with aging
 - **Tablebases & endgame**
