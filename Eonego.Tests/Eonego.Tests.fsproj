@@ -32,6 +32,7 @@
     <Compile Include="TranspositionTests.fs" />
     <Compile Include="PliesFromNullTests.fs" />
     <Compile Include="SearchTests.fs" />
+    <Compile Include="WdlTests.fs" />
     <Compile Include="TimeManTests.fs" />
     <Compile Include="DrawDetectionTests.fs" />
     <Compile Include="LazySmpTests.fs" />

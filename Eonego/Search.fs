@@ -44,6 +44,14 @@ let MATE_IN_MAX_PLY = 31754 // MATE - MaxSearchPly
 [<Literal>]
 let TB_WIN = 31753 // MATE_IN_MAX_PLY - 1
 
+/// Display WDL triple for an info line (UCI_ShowWDL): a proven mate/TB score overrides the
+/// policy head's root estimate — per-mille certainty next to `score mate N`, never a hedge.
+/// Everything below the TB band passes the root triple through untouched.
+let wdlForScore (score: int) (rootWdl: struct (int * int * int)) : struct (int * int * int) =
+    if score >= TB_WIN - MaxSearchPly then struct (1000, 0, 0)
+    elif score <= -(TB_WIN - MaxSearchPly) then struct (0, 0, 1000)
+    else rootWdl
+
 [<Literal>]
 let INF = 32001
 
