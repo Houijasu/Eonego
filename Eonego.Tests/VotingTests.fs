@@ -42,6 +42,15 @@ let ``a proven mate overrides any consensus`` () =
     Assert.Equal(3, voteBest moves scores depths 4)
 
 [<Fact>]
+let ``a proven forced loss overrides an unproven consensus`` () =
+    // A mate-band loss is still an exact proof. Heuristic voters must not replace it with a
+    // superficially better non-mate score, or LazySMP can publish an unproved escape from mate.
+    let moves = [| m1; m1; m1; m3 |]
+    let scores = [| 100; 100; 100; -MATE + 5 |]
+    let depths = [| 25; 25; 25; 8 |]
+    Assert.Equal(3, voteBest moves scores depths 4)
+
+[<Fact>]
 let ``the shortest proven mate wins among mate voters`` () =
     let moves = [| m1; m2; m3 |]
     let scores = [| MATE - 9; MATE - 3; MATE - 5 |]

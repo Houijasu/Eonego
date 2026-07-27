@@ -54,7 +54,8 @@ let inline private ruh (a: int16[]) (i: int) : int =
 type Tables() =
     // [color<<<12 | fromTo(12-bit)] -> int16 saturating main (butterfly) history.
     let main: int16[] = Array.zeroCreate (2 * 4096)
-    // [((pc*64)+to)<<<3 + capturedPT] -> int16 capture history. pc 0..11, to 0..63, capturedPT 0..4 (8-wide slot).
+    // [((pc*64)+to)<<<3 + victim] -> int16 capture history. pc 0..11, to 0..63,
+    // victim 0..4 or NoPieceType=6 for a capture-stage promotion onto an empty square (8-wide slot).
     let capture: int16[] = Array.zeroCreate (12 * 64 * 8)
     // [prevPc*64 + prevTo] -> the move that refuted the previous move.
     let counter: Move[] = Array.create (12 * 64) MoveNone
@@ -91,6 +92,11 @@ type Tables() =
     // (EnsureAux, cont4 pattern): UsePawnHist's kill switch must cost zero bytes. Checked reads only
     // (the lazy-table rule above).
     let mutable pawnHist: int16[] = Array.empty
+    // Threat-aware main history (EONEGO_THREATHIST, Coda's 4D butterfly): [thrIdx(2b) <<< 13 |
+    // color <<< 12 | fromTo], thrIdx = fromThreatened*2 + toThreatened against the ENEMY attack map
+    // of the node. REPLACES `main` for quiet reads/updates when the flag is on (Search/MovePick
+    // gate; 64 KiB, lazily allocated per the cont4 rule).
+    let mutable threatMain: int16[] = Array.empty
 
     /// Allocate the config-gated tables this search will actually use (idempotent; called by
     /// Worker.SetupRoot with the active config flags before the search starts).
@@ -100,9 +106,13 @@ type Tables() =
         (useCorrMajor: bool)
         (useCorrNonPawn: bool)
         (usePawnHist: bool)
+        (useThreatHist: bool)
         : unit =
         if useCont4 && cont4.Length = 0 then
             cont4 <- Array.zeroCreate (768 * 768)
+
+        if useThreatHist && threatMain.Length = 0 then
+            threatMain <- Array.zeroCreate (4 * 2 * 4096)
 
         if useCorrMinor && corrMinor.Length = 0 then
             corrMinor <- Array.zeroCreate (2 * 16384)
@@ -131,6 +141,7 @@ type Tables() =
         Array.Clear(corrNonPawn, 0, corrNonPawn.Length)
         Array.Clear(corrCont, 0, corrCont.Length)
         Array.Clear(pawnHist, 0, pawnHist.Length)
+        Array.Clear(threatMain, 0, threatMain.Length)
 
     /// Worker pool, between MOVES of one game: drop the per-search hint moves (killers are ply-indexed
     /// and ply meanings shift; counters conservatively too) but keep every gravity table — warm
@@ -144,8 +155,8 @@ type Tables() =
     member _.MainHistory (c: Color) (fromToKey: int) : int = ruh main ((c <<< 12) ||| fromToKey)
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
-    member _.CaptureHistory (pc: Piece) (dst: Square) (capturedPT: PieceType) : int =
-        ruh capture (((pc * 64 + dst) <<< 3) + capturedPT)
+    member _.CaptureHistory (pc: Piece) (dst: Square) (victim: PieceType) : int =
+        ruh capture (((pc * 64 + dst) <<< 3) + victim)
 
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member _.CounterMove (prevPc: Piece) (prevTo: Square) : Move = counter.[prevPc * 64 + prevTo]
@@ -224,9 +235,21 @@ type Tables() =
         let v = int main.[i]
         main.[i] <- int16 (v + b - v * (abs b) / MainHistD)
 
+    // --- threat-aware main history (lazy table; callers are cfg-gated, see the cont4 rule) ---
+    [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+    member _.ThreatHistory (c: Color) (thrIdx: int) (fromToKey: int) : int =
+        ruh threatMain ((thrIdx <<< 13) ||| (c <<< 12) ||| fromToKey)
+
+    /// Gravity update of threat-aware main history (same clamp band as UpdateMain).
+    member _.UpdateThreatMain (c: Color) (thrIdx: int) (m: Move) (bonus: int) : unit =
+        let i = (thrIdx <<< 13) ||| (c <<< 12) ||| (fromTo m)
+        let b = max -MainHistD (min MainHistD bonus)
+        let v = int threatMain.[i]
+        threatMain.[i] <- int16 (v + b - v * (abs b) / MainHistD)
+
     /// Gravity update of capture history.
-    member _.UpdateCapture (pc: Piece) (dst: Square) (capturedPT: PieceType) (bonus: int) : unit =
-        let i = ((pc * 64 + dst) <<< 3) + capturedPT
+    member _.UpdateCapture (pc: Piece) (dst: Square) (victim: PieceType) (bonus: int) : unit =
+        let i = ((pc * 64 + dst) <<< 3) + victim
         let b = max -CaptureHistD (min CaptureHistD bonus)
         let v = int capture.[i]
         capture.[i] <- int16 (v + b - v * (abs b) / CaptureHistD)

@@ -59,6 +59,19 @@ let ``KB vs KB same-coloured bishops is a draw`` () =
     // Bf2 (dark) and Bc1 (dark) -> same colour -> draw.
     Assert.True(insufficientMaterial (Position.OfFen "8/8/4k3/8/8/4K3/5B2/2b5 w - - 0 1"))
 
+[<Theory>]
+[<InlineData("8/8/4k3/8/8/4K3/3B4/2B5 w - - 0 1")>] // K + two same-coloured bishops vs K
+[<InlineData("8/2b3b1/4k3/8/8/4K3/5B2/8 w - - 0 1")>] // three bishops across both sides, all same colour
+let ``any number of bishops confined to one square colour is insufficient`` (fen: string) =
+    let pos = Position.OfFen fen
+    Assert.True(insufficientMaterial pos)
+    Assert.True(isImmediateDraw pos)
+
+[<Fact>]
+let ``multiple bishops spanning both square colours are not insufficient`` () =
+    // Bc2 is on a dark square and Bc1 on a light square: mating material exists.
+    Assert.False(insufficientMaterial (Position.OfFen "8/8/4k3/8/8/4K3/2B5/2B5 w - - 0 1"))
+
 [<Fact>]
 let ``KB vs KB opposite-coloured bishops is not insufficient`` () =
     // Bf2 (dark) and Bd1 (light) -> a real game, not a forced draw.

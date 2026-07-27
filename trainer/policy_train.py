@@ -32,14 +32,20 @@ def main():
     ap.add_argument("--lam-wdl", type=float, default=0.5)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--val-frac", type=float, default=0.02)
+    ap.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     args = ap.parse_args()
 
     import torch
 
+    from policy_device import device_summary, select_device
     from policy_model import PolicyHead, WDLHead, masked_goodset_ce
 
     torch.manual_seed(args.seed)
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        dev = select_device(args.device)
+    except RuntimeError as exc:
+        ap.error(str(exc))
+    print(device_summary(dev))
 
     records = pd.read_gen(args.data)
     recs = pd.read_dump(args.dump)

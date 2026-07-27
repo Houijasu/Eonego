@@ -542,8 +542,10 @@ let addThreat (acc: int16[]) (psqt: int[]) (threatWeights: sbyte[]) (threatPsqt:
 /// Max weight rows folded into one accumulator pass. Larger row sets are split into multiple passes
 /// (first pass src->dst, remainder in-place on dst): L2 hardware prefetchers track only ~16-32 streams,
 /// and each pass adds just 4 KB of L1-resident accumulator traffic. Benchmark knob.
+/// 32 -> 48 (2026-07-11): interleaved depth-13 bench A/B, 16 pairs pooled: 48 won 12/16 (sign test
+/// p~0.04), median +3.3% nps; 64 was worse than 48. Chunking is bit-exact, fingerprint unchanged.
 [<Literal>]
-let FusedMaxRowsPerPass = 32
+let FusedMaxRowsPerPass = 48
 
 /// One fused pass over a row-list SLICE: dst[j] = src[j] + Σ halfW[halfAdd[k]] − Σ halfW[halfSub[k]]
 /// + Σ thrW[thrAdd[k]] − Σ thrW[thrSub[k]] (j in [0,L1); psqt likewise over PsqtBuckets).

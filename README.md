@@ -1,7 +1,7 @@
 # Eonego
 
 A UCI chess engine written from scratch in **F# on .NET 10**, compiled to a single
-self-contained native binary with **NativeAOT** (Windows x64). It plays strong, positionally
+self-contained native binary with **NativeAOT** (Windows and Linux x64). It plays strong, positionally
 minded chess driven by an in-house **FullThreats-architecture NNUE** and a measured
 alpha-beta search.
 
@@ -30,12 +30,12 @@ alpha-beta search.
   - LazySMP multi-threading with thread voting at the root
   - Mate lines reported through to the full mate sequence
 - **DFPN**
-  - Optional proof-number mate solver running beside the main search
+  - Proof-number mate solver running beside the main search (on by default; `EONEGO_DFPN=0` disables)
   - Finds forced mates in checks-only lines; proofs are verified before they override the best move
 - **Policy head**
-  - Optional neural move prior: a sidecar on the NNUE trunk, or a separate endgame net for
-    low-material positions
-  - Feeds late-move reduction and can emit win/draw/loss estimates at the root
+  - Neural move prior loaded by default: a sidecar on the NNUE trunk, plus a separate endgame net
+    for low-material positions (`EONEGO_POLICY=0` disables)
+  - Feeds late-move reduction and emits win/draw/loss estimates at the root (see `UCI_ShowWDL`)
 - **LMR**
   - Late-move reductions guided by search history and move-count pruning
   - Can use the policy head to reduce unlikely quiet moves more aggressively
@@ -43,7 +43,7 @@ alpha-beta search.
   - Null-move pruning, reverse futility, razoring, ProbCut, internal iterative reduction
   - Singular extensions, history and SEE pruning, quiescence transposition cutoffs
 - **Correction history**
-  - Learns static-eval bias from pawn structure and minor-piece placement
+  - Learns static-eval bias from pawn structure, minor/major/non-pawn material, and the previous move
 - **Move ordering**
   - Staged picker: transposition move, captures, killers, counter-moves, quiet history
   - Quiet history blends butterfly, continuation (1/2/4-ply), and pawn-structure tables
@@ -57,20 +57,36 @@ alpha-beta search.
 
 Requirements:
 
-- .NET SDK with `net10.0` support
-- Visual Studio **"Desktop development with C++"** workload (NativeAOT links with MSVC)
+- .NET SDK with `net10.0` support, and PowerShell 7+ (`pwsh`) to run the build script
+- A native toolchain for NativeAOT: Visual Studio **"Desktop development with C++"** on Windows,
+  `clang` + `zlib` headers + `binutils` on Linux
 - **Git LFS** for `nets/main.nnue` (~106 MB): `git lfs install` then clone (or `git lfs pull`)
 
 ```powershell
 pwsh ./publish.ps1
-# -> Eonego/bin/Release/net10.0/win-x64/publish/Eonego.exe
+# -> Eonego/bin/Release/net10.0/<rid>/publish/Eonego[.exe]
 ```
 
 If the network file is missing, `publish.ps1` can fetch it automatically. Pre-built releases
 on [GitHub](https://github.com/Houijasu/Eonego/releases) ship with the net already embedded.
 
-The AOT binary targets the **build machine's** CPU (PEXT, AVX2, AVX-VNNI, …). Build on the
-machine you play on, or choose an explicit instruction-set baseline for a portable binary.
+`publish.ps1` runs on Windows, Linux, and macOS and targets the host by default. NativeAOT fixes
+the instruction set at compile time, so the default baseline is **x86-64-v3 (AVX2 + BMI2)** — the
+practical floor for the SIMD NNUE kernels, and portable to any Intel Haswell (2013) or AMD Zen 1
+(2017) or newer CPU.
+
+| Command | Output |
+|---|---|
+| `pwsh ./publish.ps1` | Portable AOT for the host OS — AVX2 baseline |
+| `pwsh ./publish.ps1 -InstructionSet x86-64-v4` | AOT with AVX-512, for Skylake-X / Zen 4+ testers |
+| `pwsh ./publish.ps1 -InstructionSet native` | Max-speed AOT pinned to the build machine — **faults on any other CPU** |
+| `pwsh ./publish.ps1 -Mode jit` | Self-contained single-file build that detects the CPU at runtime |
+| `pwsh ./publish.ps1 -Mode jit -Rid linux-x64` | Linux tester binary, cross-published from any host |
+
+NativeAOT cannot cross-compile between operating systems, so a Linux AOT binary must be built on
+Linux; `-Mode jit` cross-publishes from anywhere (the tester then needs `chmod +x`). The instruction
+set and the AOT/JIT choice do not change the search tree — node counts are identical across all of
+these builds, so the nodesweep byte-identity contract holds for every variant.
 
 For development:
 
@@ -85,6 +101,7 @@ dotnet test  Eonego.Tests/Eonego.Tests.fsproj -c Release
 |---|---|---|
 | `Threads` | 1 | Search threads (1–256) |
 | `Hash` | 256 | Transposition table size in MB |
+| `Clear Hash` | — | Button: wipe the transposition table |
 | `MultiPV` | 1 | Number of principal variations to report |
 | `Move Overhead` | 10 | Milliseconds reserved per move for GUI/communication |
 | `Ponder` | false | Declares support for `go ponder` / `ponderhit` |
@@ -111,9 +128,10 @@ matches (playing strength).
 
 ## Testing
 
-400 automated tests cover move generation, make/unmake, SEE, move ordering, transposition
-table behavior, NNUE correctness, draw detection, multi-threading, tablebase integration,
-policy inference, and search equivalence against an unpruned baseline.
+408 automated tests cover move generation, make/unmake, SEE, move ordering, history and
+correction tables, transposition-table behavior, NNUE correctness, draw detection,
+multi-threading, tablebase integration, policy/WDL inference, time management, and search
+equivalence against an unpruned baseline.
 
 ## License
 
@@ -121,6 +139,9 @@ MIT — see [LICENSE](LICENSE).
 
 ## Status
 
-Actively developed. Strength is tracked through SPRT self-play against earlier versions.
-Syzygy probing, pondering, the endgame policy path, and several experimental search features
-are implemented but not all promoted to default-on yet.
+Actively developed; strength is tracked through SPRT self-play against earlier versions. As of
+**0.1.0**, the previously experimental search features — DFPN, the policy head, the dynamic
+time-management components, and the extended history/correction terms — are enabled by default,
+each still individually disableable through its `EONEGO_*` environment variable. These defaults
+are pre-SPRT and under validation; the time manager also reserves a small proportional safety
+margin on the clock to avoid flag-fall under load.

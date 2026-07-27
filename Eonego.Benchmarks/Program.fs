@@ -576,62 +576,8 @@ type SearchBench() =
     member _.SearchDepth7() =
         negamax worker worker.Pos (-INF) INF 7 0 true false
 
-/// Phase 1 — NNUE accumulator checkpoint cache A/B (cache-on vs cache-off). Pins the contribution of the
-/// lock-free checkpoint to steady-state search nps: cache-off is the pre-Phase-1 baseline; cache-on pays a
-/// ~4 KiB BlockCopy+hash per materialization but saves the O(distance) frame-delta walk on hits.
-[<MemoryDiagnoser>]
-[<ShortRunJob>]
-type AccCheckpointSearchBench() =
-
-    let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -" // Kiwipete (rich tree)
-    let mutable workerOn = Unchecked.defaultof<Worker>
-    let mutable workerOff = Unchecked.defaultof<Worker>
-    let mutable net: Network option = None
-
-    [<GlobalSetup>]
-    member _.Setup() =
-        net <- loadFullThreatsNet ()
-
-        let cfgOn =
-            { defaultConfig with
-                Threads = 1
-                HashMb = 16
-                UseTt = true
-                UsePruning = true
-                AccCheckpointMb = 4 }
-
-        let cfgOff =
-            { defaultConfig with
-                Threads = 1
-                HashMb = 16
-                UseTt = true
-                UsePruning = true
-                AccCheckpointMb = 0 }
-
-        let ttOn = TranspositionTable(16)
-        let controlOn = SearchControl(cfgOn, defaultLimits, ttOn, fen, [||], ?net = net)
-        workerOn <- Worker(0, true, controlOn)
-        workerOn.SetupRoot()
-        controlOn.Reset()
-        controlOn.StartClock 0L 0L
-
-        let ttOff = TranspositionTable(16)
-        let controlOff = SearchControl(cfgOff, defaultLimits, ttOff, fen, [||], ?net = net)
-        workerOff <- Worker(0, true, controlOff)
-        workerOff.SetupRoot()
-        controlOff.Reset()
-        controlOff.StartClock 0L 0L
-
-    [<Benchmark(Baseline = true)>]
-    member _.SearchDepth7CacheOff() =
-        negamax workerOff workerOff.Pos (-INF) INF 7 0 true false
-
-    [<Benchmark>]
-    member _.SearchDepth7CacheOn() =
-        negamax workerOn workerOn.Pos (-INF) INF 7 0 true false
-
 /// Multi-threaded entry for benchmarking only: mirrors `Search.go`'s thread topology (N workers sharing one
-/// SearchControl - only the lock-free TT/DAG/checkpoint tables are shared mutable state) but stops on a NODE
+/// SearchControl - only the lock-free TT is shared mutable state) but stops on a NODE
 /// budget instead of depth/time and skips the UCI `bestmove` stdout write, so repeated BenchmarkDotNet
 /// invocations stay quiet and the wall-clock budget stays roughly comparable across thread counts.
 let private searchNodesMultiThreaded (fen: string) (nodes: int64) (cfg: SearchConfig) (net: Network option) : int64 =
@@ -678,11 +624,11 @@ let private searchNodesMultiThreaded (fen: string) (nodes: int64) (cfg: SearchCo
 
     total
 
-/// Phase 1 multi-threaded A/B (checkpoint-cache-on vs off), isolating the AccCheckpoint contribution
-/// at real concurrency instead of the Threads=1-only `AccCheckpointSearchBench` above.
+/// Fixed-node multi-threaded search wall-time at 1/4/8 workers (the BDN counterpart of
+/// scripts/mtbench.ps1; the retired checkpoint-cache A/B used to live here — see docs/nps-baselines.md).
 [<MemoryDiagnoser>]
 [<ShortRunJob>]
-type AccCheckpointSearchMtBench() =
+type SearchMtBench() =
 
     let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq -" // Kiwipete (rich tree)
     let nodeBudget = 200_000L
@@ -695,27 +641,14 @@ type AccCheckpointSearchMtBench() =
     member _.Setup() =
         net <- loadFullThreatsNet ()
 
-    [<Benchmark(Baseline = true)>]
-    member this.SearchNodesCacheOff() =
-        let cfg =
-            { defaultConfig with
-                Threads = this.Threads
-                HashMb = 16
-                UseTt = true
-                UsePruning = true
-                AccCheckpointMb = 0 }
-
-        searchNodesMultiThreaded fen nodeBudget cfg net
-
     [<Benchmark>]
-    member this.SearchNodesCacheOn() =
+    member this.SearchNodes() =
         let cfg =
             { defaultConfig with
                 Threads = this.Threads
                 HashMb = 16
                 UseTt = true
-                UsePruning = true
-                AccCheckpointMb = 4 }
+                UsePruning = true }
 
         searchNodesMultiThreaded fen nodeBudget cfg net
 
@@ -733,8 +666,7 @@ let main argv =
                typeof<MovePickBench>
                typeof<EvalBench>
                typeof<SearchBench>
-               typeof<AccCheckpointSearchBench>
-               typeof<AccCheckpointSearchMtBench> |]
+               typeof<SearchMtBench> |]
         )
         .Run(args)
     |> ignore

@@ -1,7 +1,7 @@
 /// MovePick stage-machine verification: the picker yields exactly the legal move set (cross-checked vs
 /// generateLegal), the TT move is first-and-once, good captures precede quiets and bad captures trail them,
 /// killers/counter occupy the refutation slot, the evasion/qsearch/probcut chains behave, and skipQuiets is
-/// structurally lazy (quiets are never generated when skipped).
+/// structurally lazy while preserving quiet underpromotions.
 module Eonego.Tests.MovePickTests
 
 #nowarn "9" // NativePtr.stackalloc
@@ -234,3 +234,14 @@ let ``skipQuiets never generates quiets (structural laziness)`` () =
     let first = nextMove &mp true
     Assert.Equal(MoveNone, first) // nothing to emit (quiets skipped)
     Assert.Equal(0, mp.EndMoves) // generate(Quiets) NEVER ran (would set ~20)
+
+[<Fact>]
+let ``skipQuiets still emits quiet underpromotions`` () =
+    let p = Position.OfFen "7k/P7/8/8/8/8/8/7K w - - 0 1"
+    let drained = drainMain p (Tables()) MoveNone MoveNone MoveNone MoveNone 8 true
+
+    Assert.Contains(mkPromotion (sq 0 6) (sq 0 7) Queen, drained)
+    Assert.Contains(mkPromotion (sq 0 6) (sq 0 7) Rook, drained)
+    Assert.Contains(mkPromotion (sq 0 6) (sq 0 7) Bishop, drained)
+    Assert.Contains(mkPromotion (sq 0 6) (sq 0 7) Knight, drained)
+    Assert.DoesNotContain(mkMove (sq 7 0) (sq 6 0), drained) // ordinary quiet Kg1 is still skipped

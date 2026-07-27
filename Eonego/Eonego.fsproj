@@ -29,7 +29,9 @@
 
     <!-- Runtime / JIT tuning -->
     <TieredCompilation>false</TieredCompilation>
-    <UseWindowsThreadPool>true</UseWindowsThreadPool>
+    <!-- Windows-only knob: the Unix runtime has no Windows thread pool, so scope it to win-* targets
+         (publish.ps1 can cross-publish a linux-x64 tester build from a Windows box). -->
+    <UseWindowsThreadPool Condition="'$(RuntimeIdentifier)' == '' or $(RuntimeIdentifier.StartsWith('win'))">true</UseWindowsThreadPool>
 
     <!-- Native AOT publishing -->
     <PublishAot>true</PublishAot>
@@ -38,10 +40,13 @@
          drives the optimize-for-speed codegen flag and auto-enables IlcPgoOptimize (framework MIBC PGO)
          plus VxSort. Verified vs microsoft.dotnet.ilcompiler 10.0.5 Native.targets (lines 29/165/274). -->
     <OptimizationPreference>Speed</OptimizationPreference>
-    <!-- Use the build machine's full ISA (AVX2 + BMI1/BMI2/PEXT + POPCNT/LZCNT) so the AOT binary uses
-         the PEXT slider backend instead of the magic fallback. `native` targets THIS CPU (13980HX) — the
-         binary then requires a CPU with at least these features to run. -->
-    <IlcInstructionSet>native</IlcInstructionSet>
+    <!-- IlcInstructionSet is deliberately NOT set: the shipping binary must run on any x64 machine a
+         tester owns. ILC then compiles to the portable baseline and emits RUNTIME checks for the higher
+         instruction sets, so `Bmi2.X64.IsSupported` / `Avx2.IsSupported` / `Avx512BW.IsSupported` become
+         CPU-dispatched at startup rather than constant-folded — PEXT sliders and the AVX2/AVX-512 NNUE
+         kernels still light up on hardware that has them. Pin it only for a private max-speed build:
+         `pwsh ./publish.ps1 -InstructionSet native` (that binary faults on any lesser CPU). -->
+    <!-- <IlcInstructionSet>native</IlcInstructionSet> -->
     <StackTraceSupport>false</StackTraceSupport>
     <UseSystemResourceKeys>true</UseSystemResourceKeys>
     <MetadataUpdaterSupport>false</MetadataUpdaterSupport>
@@ -54,12 +59,13 @@
     <Compile Include="Move.fs" />
     <Compile Include="Zobrist.fs" />
     <Compile Include="Accumulator.fs" />
-    <Compile Include="AccumulatorCache.fs" />
     <Compile Include="Position.fs" />
     <Compile Include="Threats.fs" />
     <Compile Include="NNUE.fs" />
     <Compile Include="Policy.fs" />
     <Compile Include="MoveGeneration.fs" />
+    <Compile Include="GraphFeatures.fs" />
+    <Compile Include="GraphGpu.fs" />
     <Compile Include="Retrograde.fs" />
     <Compile Include="History.fs" />
     <Compile Include="MovePick.fs" />

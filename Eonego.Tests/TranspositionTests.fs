@@ -49,6 +49,19 @@ let ``store then probe round-trips`` () =
     Assert.False pv
 
 [<Fact>]
+let ``logical qsearch depths round-trip through reserved byte encodings`` () =
+    for depth in [ DepthQsCaptures; DepthQsChecks ] do
+        let tt = TranspositionTable(1)
+        let key = 0xA5A5A5A500000000UL ^^^ uint64 (depth + 3)
+        tt.Store key depth BoundExact 17 -9 MoveNone false
+        let struct (hit, _, score, eval, decodedDepth, bound, _) = tt.Probe key
+        Assert.True(hit)
+        Assert.Equal(17, score)
+        Assert.Equal(-9, eval)
+        Assert.Equal(depth, decodedDepth)
+        Assert.Equal(BoundExact, bound)
+
+[<Fact>]
 let ``ttPv flag round-trips and is sticky across overwrites`` () =
     let tt = TranspositionTable(1)
     let key = 0x0123456789ABCDEFUL

@@ -6,7 +6,8 @@
 /// — NEVER an instance method (a method on a by-ref-like struct would mutate a COPY and the stage would
 /// never advance). It is a `while` loop over the stage id (NOT `let rec`: a byref-like parameter can defeat
 /// .tail under AOT). Laziness is purely STRUCTURAL: generate(Quiets) is invoked only inside the QuietInit
-/// stage, so an early beta cutoff (or always passing skipQuiets) before that stage never materializes quiets.
+/// stage, so an early beta cutoff before that stage normally never materializes quiets. The one deliberate
+/// exception is a quiet underpromotion: skipQuiets must still surface tactical promotion choices.
 ///
 /// LazySMP / lockless: zero module-level mutable state; both buffers are stackalloc'd by the CONSUMING
 /// search frame and handed in (a function may never return a Span over its own stackalloc); Tables is one
@@ -122,12 +123,20 @@ type MovePick =
     val mutable PolFrom: Span<int>
     val mutable PolTo: Span<int>
     val mutable PolKey: Span<uint64>
+    // Graph policy source (EONGR01 via GraphGpu). It fills the same 384-wide policy slots as the
+    // sidecar heads, so move ordering and LMR consume a single guarded logit contract.
+    val mutable Graph: GraphGpu.GraphBatcher
     // Own-trunk policy net (EONPOL03, null = off). Mutually exclusive with PolNet in practice; when
     // set it fills the SAME per-ply logit arrays, but only at ≤6-piece positions (Policy.ownApplies).
     val mutable OwnNet: Policy.OwnNetwork
     // Pawn history gate (Search sets it post-construction from cfg.UsePawnHist; every factory leaves
     // it false so the lazily-allocated table is never touched by default — the cont4 lazy-table rule).
     val mutable UsePawnHist: bool
+    // Threat-aware history gate + the node's ENEMY attack map (EONEGO_THREATHIST). Search computes
+    // the map once per node BEFORE the move loop — the shared Position mutates through Make/Unmake,
+    // so it cannot be derived lazily mid-loop. Factories leave the gate false (lazy-table rule).
+    val mutable UseThreatHist: bool
+    val mutable EnemyAttacks: Bitboard
 
     // Explicit constructor: a by-ref-like struct cannot be zero-init'd (`MovePick()` /
     // `Unchecked.defaultof` both fail — Span fields + the byref-as-generic-arg rule). The four cursors
@@ -174,16 +183,25 @@ type MovePick =
           PolFrom = Span<int>()
           PolTo = Span<int>()
           PolKey = Span<uint64>()
+          Graph = null
           OwnNet = null
-          UsePawnHist = false }
+          UsePawnHist = false
+          UseThreatHist = false
+          EnemyAttacks = 0UL }
 
 // ---------------------------------------------------------------------------
-// Helpers (module functions over byref<MovePick> so swaps/scoring persist). A move is a "capture" for
-// ordering/refutation purposes iff its destination is occupied OR it is en passant.
+// Helpers (module functions over byref<MovePick> so swaps/scoring persist).
 // ---------------------------------------------------------------------------
 [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
 let private isCap (pos: Position) (m: Move) : bool =
-    pos.PieceOn(toSq m) <> NoPiece || isEnPassant m
+    isBoardCapture pos m
+
+[<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+let private hasQuietUnderpromotion (pos: Position) : bool =
+    let us = pos.SideToMove
+    let promoPawns = pos.PiecesCT us Pawn &&& (if us = White then Rank7 else Rank2)
+    let targets = (if us = White then shiftN promoPawns else shiftS promoPawns) &&& ~~~pos.Occupied
+    targets <> 0UL
 
 /// Swap Moves and Scores at i and j in lockstep (keeps the parallel buffers aligned).
 let private swap (mp: byref<MovePick>) (i: int) (j: int) : unit =
@@ -236,14 +254,8 @@ let private scoreCaptures (mp: byref<MovePick>) (s: int) (e: int) : unit =
     for i in s .. e - 1 do
         let m = mp.Moves.[i]
         let pc = pos.PieceOn(fromSq m)
-
-        let capturedPT =
-            if isEnPassant m then
-                Pawn
-            else
-                pieceType (pos.PieceOn(toSq m))
-
-        mp.Scores.[i] <- Tunables.CaptScoreMul * pieceValueOf capturedPT + tables.CaptureHistory pc (toSq m) capturedPT
+        let victim = captureHistorySlot pos m
+        mp.Scores.[i] <- Tunables.CaptScoreMul * moveMaterialGain pos m + tables.CaptureHistory pc (toSq m) victim
 
 let private scoreQuiets (mp: byref<MovePick>) (s: int) (e: int) : unit =
     let pos = mp.Pos
@@ -258,8 +270,19 @@ let private scoreQuiets (mp: byref<MovePick>) (s: int) (e: int) : unit =
 
         let mutable score =
             tables.MainHistory us (fromTo m)
+            // v2 ADDITIVE threat term (v1 replaced the butterfly outright and split its signal
+            // across 4 slow-learning buckets — measured negative; the dense table stays primary).
+            + (if mp.UseThreatHist then
+                   let thrIdx =
+                       (if testBit mp.EnemyAttacks (fromSq m) then 2 else 0)
+                       + (if testBit mp.EnemyAttacks dst then 1 else 0)
+
+                   tables.ThreatHistory us thrIdx (fromTo m)
+               else
+                   0)
             + tables.ContHistory1 mp.PrevPc1 mp.PrevTo1 pc dst
             + tables.ContHistory2 mp.PrevPc2 mp.PrevTo2 pc dst
+            + promotionGain m
 
         if mp.UsePawnHist then
             score <- score + tables.PawnHistory pawnKey pc dst
@@ -313,7 +336,11 @@ let mkMain
 
 let mkQSearch (pos: Position) (tables: Tables) (ttMove: Move) (moves: Span<Move>) (scores: Span<int>) : MovePick =
     let tt =
-        if ttMove <> MoveNone && pos.IsPseudoLegal ttMove then
+        if
+            ttMove <> MoveNone
+            && pos.IsPseudoLegal ttMove
+            && (pos.InCheck || isCaptureStage pos ttMove)
+        then
             ttMove
         else
             MoveNone
@@ -341,7 +368,7 @@ let mkProbCut
 // ---------------------------------------------------------------------------
 // nextMove — the staged advance. MODULE function over byref so mutation persists. Returns MoveNone when
 // the stage chain is exhausted. `skipQuiets` (re-read every call; the search may flip it mid-drain)
-// suppresses quiets AND quiet refutations, jumping from the refutation/quiet stages straight to bad captures.
+// suppresses ordinary quiets AND quiet refutations, while still surfacing underpromotions before bad captures.
 // ---------------------------------------------------------------------------
 let nextMove (mp: byref<MovePick>) (skipQuiets: bool) : Move =
     let mutable result = MoveNone
@@ -427,7 +454,7 @@ let nextMove (mp: byref<MovePick>) (skipQuiets: bool) : Move =
 
         // ---- quiet generation (THE only generate(Quiets) site -> structural laziness) ----
         | StgQuietInit ->
-            if skipQuiets then
+            if skipQuiets && not (hasQuietUnderpromotion mp.Pos) then
                 mp.Cur <- 0
                 mp.Stage <- StgBadCapture
             else
@@ -445,21 +472,34 @@ let nextMove (mp: byref<MovePick>) (skipQuiets: bool) : Move =
                 // Policy fill (lazy — only nodes that actually reach quiet scoring pay the inference,
                 // and only above PolMinDepth). The Zobrist guard makes the fill once-per-node and the
                 // arrays readable downstream (LMR term in Search.fs) for exactly this position. Two
-                // sources fill the SAME 384-wide arrays: the EONPOL02 sidecar (any position) or the
-                // EONPOL03 own-trunk net (only at ≤6 pieces — Policy.ownApplies). When the own net is
-                // loaded but doesn't apply, no fill happens and the stale-key guard leaves ordering/LMR
-                // untouched, exactly as if policy were off for this node.
+                // sources fill the SAME 384-wide arrays: graph EONGR01 (any position), EONPOL02 sidecar
+                // (any position), or EONPOL03 own-trunk net (only at ≤6 pieces — Policy.ownApplies).
+                // When a source doesn't apply/fails, the stale-key guard leaves ordering/LMR untouched,
+                // exactly as if policy were off for this node.
                 let mutable polFilled = false
 
                 if mp.Depth >= Tunables.PolMinDepth then
-                    if not (isNull mp.OwnNet) then
+                    if not (isNull mp.Graph) then
+                        if mp.PolKey.[0] <> mp.Pos.Key then
+                            match mp.Graph.TryEvaluate(mp.Pos, true) with
+                            | ValueSome g when g.FromLogits.Length = Policy.HeadOut && g.ToLogits.Length = Policy.HeadOut ->
+                                for i in 0 .. Policy.HeadOut - 1 do
+                                    mp.PolFrom.[i] <- g.FromLogits.[i]
+                                    mp.PolTo.[i] <- g.ToLogits.[i]
+
+                                mp.PolKey.[0] <- mp.Pos.Key
+                            | _ -> ()
+
+                        polFilled <- mp.PolKey.[0] = mp.Pos.Key
+
+                    if not polFilled && not (isNull mp.OwnNet) then
                         if Policy.ownApplies mp.Pos then
                             if mp.PolKey.[0] <> mp.Pos.Key then
                                 Policy.fillLogitsOwn mp.OwnNet mp.Pos mp.PolFrom mp.PolTo
                                 mp.PolKey.[0] <- mp.Pos.Key
 
                             polFilled <- true
-                    elif not (isNull mp.PolNet) then
+                    elif not polFilled && not (isNull mp.PolNet) then
                         if mp.PolKey.[0] <> mp.Pos.Key then
                             Policy.fillLogits mp.ValNet mp.PolNet mp.Pos mp.PolFrom mp.PolTo
                             mp.PolKey.[0] <- mp.Pos.Key
@@ -489,24 +529,26 @@ let nextMove (mp: byref<MovePick>) (skipQuiets: bool) : Move =
 
         // ---- quiets: stream in sorted order, skipping TT + refutations ----
         | StgQuiet ->
-            if skipQuiets then
+            let mutable found = false
+
+            while not found && mp.Cur < mp.EndMoves do
+                let m = mp.Moves.[mp.Cur]
+                mp.Cur <- mp.Cur + 1
+
+                if
+                    (not skipQuiets || isPromotion m)
+                    && m <> mp.TtMove
+                    && m <> mp.Killer1
+                    && m <> mp.Killer2
+                    && m <> mp.CounterMove
+                then
+                    result <- m
+                    found <- true
+                    producing <- false
+
+            if not found then
                 mp.Cur <- 0
                 mp.Stage <- StgBadCapture
-            else
-                let mutable found = false
-
-                while not found && mp.Cur < mp.EndMoves do
-                    let m = mp.Moves.[mp.Cur]
-                    mp.Cur <- mp.Cur + 1
-
-                    if m <> mp.TtMove && m <> mp.Killer1 && m <> mp.Killer2 && m <> mp.CounterMove then
-                        result <- m
-                        found <- true
-                        producing <- false
-
-                if not found then
-                    mp.Cur <- 0
-                    mp.Stage <- StgBadCapture
 
         // ---- bad captures: replay the spilled losers from the front, last ----
         | StgBadCapture ->

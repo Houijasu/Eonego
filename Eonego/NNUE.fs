@@ -723,9 +723,15 @@ let private fc2Dot (a1: Span<byte>) (fc2w: sbyte[]) (fc2b: int) (useAvx2: bool) 
 /// Net value (the network output, ~NormalizeToPawnValue per pawn): (125*psqt + 131*positional)/128.
 /// `useAvx2` selects the SIMD vs scalar forward path (production passes the module `UseAvx2`; tests pass both
 /// to assert bit-exactness). SkipLocalsInit drops stackalloc zeroing; every stack buffer is fully written
+/// Lazy-eval PSQT bail (EONEGO_LAZYEVAL=<cp>, 0/unset = off): when the materialized PSQT term alone
+/// is this far outside neutral (internal units, ~16.4 per output cp), skip the ftProduct+GEMV chain
+/// and return the PSQT-only blend. Changes eval semantics — SPRT-gated, default off (byte-identical).
+/// Module-global like the ISA gates: set once at UCI startup before any search thread exists.
+let mutable LazyEvalThresholdInternal = 0
+
 /// before read, and the two padded conc lanes are set explicitly.
 [<System.Runtime.CompilerServices.SkipLocalsInit>]
-let private evalFromAcc
+let private evalFromAccFull
     (net: Network)
     (pos: Position)
     (accW: Span<int16>)
@@ -762,7 +768,14 @@ let private evalFromAcc
 
     // Feature transformer (u8 ft, nnz chunk masks) + fc_0 (1024 -> 32): sparse chunk-skipping kernel when
     // enabled (requires AVX2 for the dword broadcasts), else the dense GEMV.
+    let profT0 =
+        if PosProf.Enabled then System.Diagnostics.Stopwatch.GetTimestamp() else 0L
+
     ftProductInto accUs accThem ft nnz useAvx2
+
+    if PosProf.Enabled then
+        PosProf.tTransform <- PosProf.tTransform + (System.Diagnostics.Stopwatch.GetTimestamp() - profT0)
+        PosProf.nFtCompute <- PosProf.nFtCompute + 1L
 
     if useSparse then
         fc0GemvSparse ft nnz stack.Fc0WSparse stack.Fc0B fc0 useVnni
@@ -840,6 +853,33 @@ let private evalFromAcc
     let posV = outputValue / 16
     (125 * psqtV + 131 * posV) / 128
 
+/// Forward-pass entry: PSQT-bail gate in front of the full chain (see LazyEvalThresholdInternal).
+let private evalFromAcc
+    (net: Network)
+    (pos: Position)
+    (accW: Span<int16>)
+    (accB: Span<int16>)
+    (psqW: Span<int>)
+    (psqB: Span<int>)
+    (useAvx2: bool)
+    (useVnni: bool)
+    (useSparse: bool)
+    : int =
+    if LazyEvalThresholdInternal > 0 then
+        let stm = pos.SideToMove
+        let psqtUs = if stm = White then psqW else psqB
+        let psqtThem = if stm = White then psqB else psqW
+        let bucket = (popCount pos.Occupied - 1) / 4
+        let psqtInternal = (psqtUs.[bucket] - psqtThem.[bucket]) / 2
+
+        if abs psqtInternal > LazyEvalThresholdInternal then
+            // PSQT-only blend (positional term treated as 0) — same scale as the full path's output.
+            (125 * (psqtInternal / 16)) / 128
+        else
+            evalFromAccFull net pos accW accB psqW psqB useAvx2 useVnni useSparse
+    else
+        evalFromAccFull net pos accW accB psqW psqB useAvx2 useVnni useSparse
+
 [<System.Runtime.CompilerServices.SkipLocalsInit>]
 let evalInternal (net: Network) (pos: Position) (useAvx2: bool) (useVnni: bool) (useSparse: bool) : int =
     if pos.Active then
@@ -911,6 +951,9 @@ let dumpFeatures (net: Network) (pos: Position) (ftOut: byte[]) : struct (int * 
 /// Deliberately does NOT touch evalFromAcc: the value forward stays byte-identical to pre-policy builds.
 [<System.Runtime.CompilerServices.SkipLocalsInit>]
 let ftInto (net: Network) (pos: Position) (ft: Span<byte>) (nnz: Span<byte>) : unit =
+    if PosProf.Enabled then
+        PosProf.nFtPolicy <- PosProf.nFtPolicy + 1L
+
     if pos.Active then
         pos.EnsureBothComputed()
         let accW = pos.AccSpanComputed White

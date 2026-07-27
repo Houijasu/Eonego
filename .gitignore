@@ -10,6 +10,16 @@ publish/
 *.native
 *.dll.config
 
+# Everything publish.ps1 and the native CMake build drop outside bin/: artifacts/dist/ holds the
+# shipping binaries (-CopyTo), 130-200 MB apiece and regenerable from any commit; artifacts/ also
+# holds eonego_cuda_build/ and the uv cache. Release binaries belong on GitHub Releases, not in git.
+artifacts/
+
+# In-tree CMake configure output (the documented native build dir is artifacts/eonego_cuda_build)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
 # BenchmarkDotNet artifacts
 BenchmarkDotNet.Artifacts/
 
@@ -86,7 +96,6 @@ Desktop.ini
 # Project lock files
 project.lock.json
 project.fragment.lock.json
-artifacts/
 
 # Local documentation (not versioned)
 docs/
@@ -117,6 +126,12 @@ trainer/*_state*.json
 
 # Trainer / loop net exports (regenerable; canonical weights live in nets/)
 *.eongnnue
+
+# Graph evaluator datasets and model exports — regenerable from trainer/graph_*.py, and the same
+# policy as trainer/data/. Canonical weights stay tracked under nets/.
+data/
+*.eongr01
+!nets/*.eongr01
 
 # Downloaded UCI teacher binary used only as a local parity oracle (never commit)
 tmp_teacher/

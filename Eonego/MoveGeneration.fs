@@ -69,6 +69,36 @@ let Rank6: Bitboard = 0x0000FF0000000000UL // rank index 5
 [<Literal>]
 let Rank7: Bitboard = 0x00FF000000000000UL // rank index 6
 
+// One move-class contract shared by generation, picking, qsearch, and history teaching.
+// Captures contains every board capture plus a non-capturing queen promotion; Quiets contains
+// ordinary quiets plus non-capturing underpromotions.
+[<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+let isBoardCapture (pos: Position) (m: Move) : bool =
+    isEnPassant m || pos.PieceOn(toSq m) <> NoPiece
+
+[<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+let isCaptureStage (pos: Position) (m: Move) : bool =
+    isBoardCapture pos m || (isPromotion m && promoType m = Queen)
+
+/// Capture-history victim slot. NoPieceType is the reserved slot for a queen push-promotion.
+[<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+let captureHistorySlot (pos: Position) (m: Move) : PieceType =
+    if isEnPassant m then
+        Pawn
+    else
+        let captured = pos.PieceOn(toSq m)
+        if captured = NoPiece then NoPieceType else pieceType captured
+
+[<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+let promotionGain (m: Move) : int =
+    if isPromotion m then pieceValueOf (promoType m) - pieceValueOf Pawn else 0
+
+/// Immediate material swing used for tactical move ordering: victim value plus promotion gain.
+[<MethodImpl(MethodImplOptions.AggressiveInlining)>]
+let moveMaterialGain (pos: Position) (m: Move) : int =
+    let victim = captureHistorySlot pos m
+    (if victim = NoPieceType then 0 else pieceValueOf victim) + promotionGain m
+
 // ---------------------------------------------------------------------------
 // (2) Emit helpers — the only AggressiveInlining-attributed functions here.
 //     Span passed by value (free copy, same buffer); index threaded by byref.

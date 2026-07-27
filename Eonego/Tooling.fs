@@ -27,6 +27,7 @@ let private usage () =
     writeLine "Eonego tooling subcommands:"
     writeLine "  gen --start <fen> --games N --out <file> --net <path> [--depth D | --nodes K] [--temp T] [--seed S] [--random-plies P] [--max-plies M]"
     writeLine "  dumpft --net <path> --in <fens> --out <bin>   (trainer FT dump: 1034-byte records bucket/stm/psqt/eval/ft[1024])"
+    writeLine "  dumpgraph --in <fens> --out <bin>   (graph evaluator feature dump: EONGF01 fixed-size records)"
     writeLine "  dumppolicy --net <nnue> --policy <sidecar> --in <fens> --out <txt>   (policy parity dump: fen TAB 64 from-logits TAB 64 to-logits [TAB w d l])"
     writeLine "  tbgen --tb <dir[;dir2]> --out <file> --signatures <list> [--per-signature N] [--total N] [--seed S]   (native Syzygy-labeled records with WDL-preserving move sets)"
     writeLine "  retro <fen> [--verify]   (solve the position's retrograde signatures, print stats + its value; --verify runs the full self-consistency proof)"
@@ -406,6 +407,34 @@ let runDumpFt (args: string[]) : int =
         errLine "dumpft requires --net <path> --in <fens> --out <bin>"
         1
 
+/// Graph evaluator feature dump: for each input FEN (bare fen, or `fen;...` records), write
+/// an EONGF01 header followed by fixed-size GraphFeatures records. Record order matches input.
+let runDumpGraph (args: string[]) : int =
+    let m = parseFlags args
+
+    match flag m "in", flag m "out" with
+    | Some inPath, Some outPath ->
+        let fens = ResizeArray<string>()
+
+        for line in File.ReadLines inPath do
+            let t = line.Trim()
+
+            if t.Length > 0 && not (t.StartsWith "#") then
+                fens.Add(t.Split(';').[0].Trim())
+
+        use writer = new BinaryWriter(File.Create outPath)
+        GraphFeatures.writeHeader writer fens.Count
+
+        for fen in fens do
+            let pos = Position.OfFen fen
+            GraphFeatures.writeRecord writer (GraphFeatures.extract pos)
+
+        writer.Flush()
+        writeLine ("dumped " + string fens.Count + " graph records to " + outPath)
+        0
+    | _ ->
+        errLine "dumpgraph requires --in <fens> --out <bin>"
+        1
 /// Policy parity dump (trainer/policy_parity.py's engine side): for each input FEN, run the sidecar
 /// head forward from scratch and emit one text record `fen \t f0..f63 \t t0..t63 [\t w d l]`
 /// (raw i32 logits, STM-relative square order; per-mille WDL when the sidecar carries the section).

@@ -53,6 +53,11 @@ let Queen = 4
 [<Literal>]
 let King = 5
 
+/// Piece-type sentinel used by tables that reserve a non-piece slot (for example a
+/// capture-stage queen promotion onto an empty square). Never pass this to piece-value arrays.
+[<Literal>]
+let NoPieceType = 6
+
 [<Literal>]
 let NoPiece = 12
 

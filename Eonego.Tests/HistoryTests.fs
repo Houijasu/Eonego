@@ -128,7 +128,7 @@ let ``continuation correction history indexes every (side, piece, square) withou
 [<Fact>]
 let ``pawn history: EnsureAux allocates, update/read roundtrip, keys isolate`` () =
     let t = Tables()
-    t.EnsureAux false false false false true
+    t.EnsureAux false false false false true false
     let key1 = 0x1234UL
     let key2 = 0x1235UL // differs in the low 9 bits -> different slot
     let pc = makePiece White Pawn
@@ -144,7 +144,7 @@ let ``pawn history: EnsureAux allocates, update/read roundtrip, keys isolate`` (
 [<Fact>]
 let ``pawn history: gravity saturates within the divisor band`` () =
     let t = Tables()
-    t.EnsureAux false false false false true
+    t.EnsureAux false false false false true false
     let key = 0xBEEFUL
     let pc = makePiece Black Knight
     let dst = sq 2 5
@@ -162,10 +162,10 @@ let ``pawn history: gravity saturates within the divisor band`` () =
 [<Fact>]
 let ``pawn history: Clear zeroes; EnsureAux is idempotent`` () =
     let t = Tables()
-    t.EnsureAux false false false false true
+    t.EnsureAux false false false false true false
     let pc = makePiece White Bishop
     t.UpdatePawnHist 7UL pc (sq 3 1) 500
-    t.EnsureAux false false false false true // second call must not reallocate/lose data
+    t.EnsureAux false false false false true false // second call must not reallocate/lose data
     Assert.NotEqual(0, t.PawnHistory 7UL pc (sq 3 1))
     t.Clear()
     Assert.Equal(0, t.PawnHistory 7UL pc (sq 3 1))

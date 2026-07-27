@@ -22,7 +22,6 @@ module Eonego.Position
 
 open System.Diagnostics
 open System.Runtime.CompilerServices
-open Eonego.AccCheckpoint
 open Eonego.Bitboard
 open Eonego.Move
 open Eonego.Zobrist
@@ -103,6 +102,23 @@ module PosProf =
     let mutable nCutRefutation = 0L // ... caused by a killer1/killer2/countermove quiet
     let mutable nCutQuietTail = 0L // ... caused by a NON-refutation quiet (the policy-addressable slice)
     let CutQuietIdx: int64[] = Array.zeroCreate 16 // nCutQuietTail by tried-quiet index (clamped to 15)
+    // Track 1 Step 2 telemetry (2026-07-19): sizes delta canonicalization (Step 3), lazy-chain
+    // coalescing (Step 4) and the per-frame FT cache (Step 5) BEFORE any of them land. The Step 3-5
+    // counters stay 0 until their producer ships — an honest "not implemented yet", not dead code.
+    let WalkLen: int64[] = Array.zeroCreate 33 // frames per materialization walk (clamped; [32] = 32+)
+    let mutable nBarrierKing = 0L // back-walks blocked by an own-king-move frame -> refresh
+    let mutable nBarrierOverflow = 0L // back-walks blocked by a threat-overflow frame -> refresh
+    let mutable nBarrierRoot = 0L // back-walks that ran to an uncomputed frame 0 -> refresh (rare)
+    let mutable nCancelHalf = 0L // HalfKA rows cancelled by add/remove netting (Step 3)
+    let mutable nCancelThr = 0L // threat rows cancelled by add/remove netting (Step 3)
+    let mutable nCoalesceFallback = 0L // coalesced walks that exceeded the scratch caps (Step 4)
+    let mutable tCanon = 0L // canonicalization time (Step 3; subset of tEnsure)
+    let mutable tCoalesce = 0L // coalesced segment apply time (Step 4; subset of tEnsure)
+    let mutable tTransform = 0L // ftProductInto inside value eval (subset of tEval, outside tEnsure)
+    let mutable nFtCompute = 0L // FT products computed for value eval
+    let mutable nFtCacheHit = 0L // FT products served from the per-frame cache (Step 5)
+    let mutable nFtPolicy = 0L // FT products recomputed for the policy head (NNUE.ftInto)
+    let mutable tPolicy = 0L // policy inference time (Policy.fillLogits body, incl. its ftInto)
 
     let reset () =
         tMake <- 0L
@@ -135,6 +151,20 @@ module PosProf =
         nCutRefutation <- 0L
         nCutQuietTail <- 0L
         Array.fill CutQuietIdx 0 CutQuietIdx.Length 0L
+        Array.fill WalkLen 0 WalkLen.Length 0L
+        nBarrierKing <- 0L
+        nBarrierOverflow <- 0L
+        nBarrierRoot <- 0L
+        nCancelHalf <- 0L
+        nCancelThr <- 0L
+        nCoalesceFallback <- 0L
+        tCanon <- 0L
+        tCoalesce <- 0L
+        tTransform <- 0L
+        nFtCompute <- 0L
+        nFtCacheHit <- 0L
+        nFtPolicy <- 0L
+        tPolicy <- 0L
 
 // ---------------------------------------------------------------------------
 // Module-level static tables — built once via `do initTables ()`. These read ONLY Bitboard [<Literal>]
@@ -268,6 +298,11 @@ type StateInfo =
       mutable CheckSqR: Bitboard
       mutable CheckSqQ: Bitboard } // King never gives check -> no field
 
+// Steps 3-4 of the 2026-07-19 NPS campaign (delta canonicalization; multi-frame walk coalescing)
+// were implemented here, measured, and REVERTED: per-frame netting cost more than the ~0.4 rows it
+// removed (−7% NPS), and single-pass segment applies lost 0/12 A/B pairs (−4.3% median) because
+// skipping intermediate materialization forfeits sibling reuse. See docs/nps-baselines.md.
+
 // ---------------------------------------------------------------------------
 // Position
 // ---------------------------------------------------------------------------
@@ -299,11 +334,6 @@ type Position() =
     let mutable active = false
     let mutable eagerUpdates = false
     let mutable top = 0
-    // Phase 1 — optional lock-free NNUE accumulator checkpoint cache. When non-null, `EnsureBothComputed`
-    // consults it as a fast-path before walking the lazy frame stack, and populates it on a successful
-    // materialization. Owned by `SearchControl`, bound per-worker via `BindCheckpoint`; cleared via the
-    // owning table's `Clear()` between searches (NOT here — the position may outlive multiple searches).
-    let mutable checkpoint: AccCheckpointTable = null
     let mutable accW: int16[] = Array.empty
     let mutable accB: int16[] = Array.empty
     let mutable psqW: int[] = Array.empty
@@ -946,6 +976,10 @@ type Position() =
                 let profT0 =
                     if PosProf.Enabled then System.Diagnostics.Stopwatch.GetTimestamp() else 0L
 
+                // Step 3 (Track 1) measured per-frame canonicalization here at −7% NPS: the sort cost
+                // per conversion (~14 entries) dwarfs the ~0.4 rows it nets (−2.7% rowsThr, midgame
+                // d13, 2026-07-19). `canonicalizeSigned` survives for Step 4's combined multi-frame
+                // segments, where one sort amortizes over the whole segment and chains cancel harder.
                 let off = this.ThreatOff frame
                 let packed = f.Invoke(this, frameThreats, off, threatN, changedW, changedB)
                 let nW = int (packed >>> 32)
@@ -980,6 +1014,8 @@ type Position() =
         let mutable nHalfAdd = 0
         let mutable nHalfSub = 0
 
+        // (Step 3 also measured a HalfKA cancel-scan here: cancelHalf was 0 across full bench runs —
+        // one frame's dirty pieces never produce a +row/-row pair — so the gather stays branch-lean.)
         for i in 0 .. dirtyN - 1 do
             let idx =
                 Accumulator.makeIndex pColor frameDirtyPc.[dOff + i] frameDirtySq.[dOff + i] ksq
@@ -1212,6 +1248,14 @@ type Position() =
                         baseFrame <- baseFrame - 1
 
                 if blocked || not computed.[baseFrame] then
+                    if PosProf.Enabled then
+                        if blocked && frameThreatOverflow.[baseFrame] then
+                            PosProf.nBarrierOverflow <- PosProf.nBarrierOverflow + 1L
+                        elif blocked then
+                            PosProf.nBarrierKing <- PosProf.nBarrierKing + 1L
+                        else
+                            PosProf.nBarrierRoot <- PosProf.nBarrierRoot + 1L
+
                     if UseFinny then
                         this.RefreshFromFinny(pColor, top)
                     else
@@ -1220,6 +1264,10 @@ type Position() =
                     // Fused walk: materialize EVERY frame from its parent -- same store traffic as the old
                     // apply-onto-top (one 2 KB store per walked frame), but sibling evals now reuse the
                     // materialized ancestors instead of re-walking them.
+                    if PosProf.Enabled then
+                        let len = min (top - baseFrame) 32
+                        PosProf.WalkLen.[len] <- PosProf.WalkLen.[len] + 1L
+
                     let ksqW = this.KingSquare White
                     let ksqB = this.KingSquare Black
 
@@ -1236,34 +1284,7 @@ type Position() =
             let profT0 =
                 if PosProf.Enabled then System.Diagnostics.Stopwatch.GetTimestamp() else 0L
 
-            // Phase 1 fast-path: best-effort checkpoint cache. A validated hit pays an O(1) snapshot copy
-            // instead of the O(distance) frame-delta walk below. Stored snapshots are bit-exact for any given
-            // position regardless of the make/unmake path that reached it, so a hit is provably equivalent
-            // to re-running the lazy walk.
-            let accOffW = this.AccOff White top
-            let accOffB = this.AccOff Black top
-            let psqOffW = this.PsqOff White top
-            let psqOffB = this.PsqOff Black top
-
-            let cached =
-                match checkpoint with
-                | null -> false
-                | cache ->
-                    cache.TryProbe(this.Key, accW, accOffW, accB, accOffB, psqW, psqOffW, psqB, psqOffB)
-
-            if cached then
-                computedW.[top] <- true
-                computedB.[top] <- true
-            else
-                this.EnsureBothComputedCore()
-
-                // Best-effort populate. Checking both flags post-materialization guarantees we never cache a
-                // partial snapshot, even on the mixed-rebuild branch + the per-perspective fallback path.
-                if computedW.[top] && computedB.[top] then
-                    match checkpoint with
-                    | null -> ()
-                    | cache ->
-                        cache.Store(this.Key, accW, accOffW, accB, accOffB, psqW, psqOffW, psqB, psqOffB)
+            this.EnsureBothComputedCore()
 
             if PosProf.Enabled then
                 PosProf.tEnsure <- PosProf.tEnsure + (System.Diagnostics.Stopwatch.GetTimestamp() - profT0)
@@ -1297,45 +1318,14 @@ type Position() =
         + " " + m "thrW" threatWeights threatWBase
         + " " + m "thrPsqt" threatPsqt 0
 
-    /// Bind the per-worker checkpoint cache. Pass `null` to disable (tests, from-scratch eval, etc.).
-    /// `SearchControl` owns the table lifecycle; this Position merely holds a borrowed reference for the
-    /// duration of a search.
-    member _.BindCheckpoint(cache: AccCheckpointTable) : unit = checkpoint <- cache
-
-    /// Detach the cache (no-op if already detached). Called by `SearchControl` once the search has joined to
-    /// release the worker's borrowed reference; the position can continue to be reused by tests/tools.
-    member _.UnbindCheckpoint() : unit = checkpoint <- null
-
     /// TEST HOOK: toggle eager materialization after `EnableNNUE` (which sets the production default).
     /// With `false`, Make records dirty frames only and evaluation pays the lazy multi-frame catch-up walk —
     /// the path the guardrail tests exercise. Production call sites never touch this.
     member internal _.SetEagerUpdates(v: bool) : unit = eagerUpdates <- v
 
-    /// Unconditionally publish the current frame's computed accumulator snapshot to the bound checkpoint
-    /// cache, if any. Used by `Worker.SetupRoot` to seed the root after `EnableNNUE` has already set the
-    /// `computed` flags (so the early-return path inside `EnsureBothComputed` skips the populate).
-    /// No-op when the accumulator is inactive, the current frame is not yet materialized, or no cache is bound.
-    member this.SeedCheckpoint() : unit =
-        if active && computedW.[top] && computedB.[top] then
-            match checkpoint with
-            | null -> ()
-            | cache ->
-                cache.Store(
-                    this.Key,
-                    accW,
-                    this.AccOff White top,
-                    accB,
-                    this.AccOff Black top,
-                    psqW,
-                    this.PsqOff White top,
-                    psqB,
-                    this.PsqOff Black top
-                )
-
-    /// Phase 1 — the unchanged frame-walk materialization used when the checkpoint cache misses (or is
-    /// null). Byte-for-byte identical to the pre-Phase-1 `EnsureBothComputed`; retained verbatim so that
-    /// benchmarks + parity tests can isolate Phase 1's perf contribution empirically (toggle the UCI option
-    /// `EnableAccCheckpoint` off — Phase 1 Step 5 — to route all calls through this core).
+    /// The frame-walk materialization core (retired 2026-07-19: the Phase-1 Zobrist-keyed accumulator
+    /// checkpoint cache that used to front this was measured at ≈−30% NPS when armed at 4/8/16 MiB —
+    /// store-side hashing + copies outran the walks it saved — and was removed; see docs/nps-baselines.md).
     member private this.EnsureBothComputedCore() =
         if active && not (computedW.[top] && computedB.[top]) then
             let mutable baseW = top
@@ -1356,6 +1346,10 @@ type Position() =
             let rebuildB = blockedB || not computedB.[baseB]
 
             if not rebuildW && not rebuildB && baseW = baseB then
+                if PosProf.Enabled then
+                    let len = min (top - baseW) 32
+                    PosProf.WalkLen.[len] <- PosProf.WalkLen.[len] + 1L
+
                 let ksqW = this.KingSquare White
                 let ksqB = this.KingSquare Black
 
@@ -1366,6 +1360,18 @@ type Position() =
                     computedW.[f] <- true
                     computedB.[f] <- true
             elif rebuildW && rebuildB then
+                if PosProf.Enabled then
+                    // Attribute the refresh to whichever perspective's back-walk blocked first
+                    // (W preferred arbitrarily when both blocked — cause classes, not exact counts).
+                    let bf = if blockedW then baseW else baseB
+
+                    if (blockedW || blockedB) && frameThreatOverflow.[bf] then
+                        PosProf.nBarrierOverflow <- PosProf.nBarrierOverflow + 1L
+                    elif blockedW || blockedB then
+                        PosProf.nBarrierKing <- PosProf.nBarrierKing + 1L
+                    else
+                        PosProf.nBarrierRoot <- PosProf.nBarrierRoot + 1L
+
                 if UseFinny then
                     this.RefreshFromFinnyBoth(top)
                 else
@@ -1532,6 +1538,35 @@ type Position() =
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]
     member this.AttackedBy (c: Color) (sq: Square) : bool =
         (this.AttackersToOcc sq &&& byColorBB.[c]) <> 0UL
+
+    /// Union of every square color c attacks (sliders see through nothing; occupancy = all pieces).
+    /// One pass over c's pieces (~popcount lookups) — build ONCE per node and bit-test per move;
+    /// the per-square AttackedBy is too slow inside move-scoring loops (threat-aware history).
+    member _.AttacksBy(c: Color) : Bitboard =
+        let occ = byTypeBB.[AllPieces]
+        let mutable att = kingAttacks (lsb (byTypeBB.[King] &&& byColorBB.[c]))
+
+        let mutable pawns = byTypeBB.[Pawn] &&& byColorBB.[c]
+
+        while pawns <> 0UL do
+            att <- att ||| pawnAttacks c (popLsb &pawns)
+
+        let mutable knights = byTypeBB.[Knight] &&& byColorBB.[c]
+
+        while knights <> 0UL do
+            att <- att ||| knightAttacks (popLsb &knights)
+
+        let mutable diag = (byTypeBB.[Bishop] ||| byTypeBB.[Queen]) &&& byColorBB.[c]
+
+        while diag <> 0UL do
+            att <- att ||| bishopAttacks (popLsb &diag) occ
+
+        let mutable ortho = (byTypeBB.[Rook] ||| byTypeBB.[Queen]) &&& byColorBB.[c]
+
+        while ortho <> 0UL do
+            att <- att ||| rookAttacks (popLsb &ortho) occ
+
+        att
 
     /// Material value of a PieceType (same table SEE/ordering use); King = 0.
     [<MethodImpl(MethodImplOptions.AggressiveInlining)>]

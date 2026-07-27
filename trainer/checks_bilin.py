@@ -32,7 +32,28 @@ def main():
     # --- model ---
     import torch
 
+    from policy_device import device_summary, select_device
     from policy_model import BilinearPolicyHead, masked_goodset_ce, masked_goodset_ce_bilin
+
+    cpu_dev = select_device("cpu")
+    all_ok &= check("force CPU device", cpu_dev.type == "cpu")
+    auto_dev = select_device("auto")
+    all_ok &= check("auto device selection", auto_dev.type in ("cpu", "cuda"))
+    summary = device_summary(cpu_dev)
+    all_ok &= check(
+        "device summary includes torch and CUDA state",
+        "torch:" in summary and "cuda_available:" in summary,
+    )
+    if torch.cuda.is_available():
+        all_ok &= check("force CUDA device", select_device("cuda").type == "cuda")
+    else:
+        try:
+            select_device("cuda")
+            clear_cuda_error = False
+        except RuntimeError as exc:
+            msg = str(exc)
+            clear_cuda_error = "--device cuda" in msg and "torch.cuda.is_available()" in msg
+        all_ok &= check("force CUDA fails clearly without CUDA", clear_cuda_error)
 
     torch.manual_seed(0)
     B, Q, D = 5, 7, 8

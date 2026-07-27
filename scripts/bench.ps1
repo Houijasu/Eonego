@@ -17,6 +17,9 @@ $positions = @(
 )
 
 if (-not (Test-Path $Exe)) { throw "engine not found: $Exe (build Release first)" }
+# ProcessStartInfo.FileName resolves a relative path against [Environment]::CurrentDirectory, which is
+# NOT the PowerShell location - Process.Start then returns null and every later call NREs. Pin it now.
+$Exe = (Resolve-Path $Exe).Path
 
 # Reads one line with a hard deadline; $null means timeout or EOF (caller kills on timeout).
 function Read-EngineLine([System.Diagnostics.Process]$proc, [datetime]$deadline) {

@@ -31,6 +31,7 @@ let main argv =
         match argv.[0] with
         | "gen" -> Eonego.Tooling.runGen argv.[1..]
         | "dumpft" -> Eonego.Tooling.runDumpFt argv.[1..]
+        | "dumpgraph" -> Eonego.Tooling.runDumpGraph argv.[1..]
         | "dumppolicy" -> Eonego.Tooling.runDumpPolicy argv.[1..]
         | "dumppolicyown" -> Eonego.Tooling.runDumpPolicyOwn argv.[1..]
         | "tbgen" -> Eonego.Tooling.runTbGen argv.[1..]

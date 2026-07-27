@@ -254,12 +254,18 @@ let forwardFromFt
 /// lazily from MovePick's StgQuietInit (once per node, Zobrist-guarded by the caller).
 [<System.Runtime.CompilerServices.SkipLocalsInit>]
 let fillLogits (net: NNUE.Network) (pnet: PolicyNetwork) (pos: Position) (fromOut: Span<int>) (toOut: Span<int>) : unit =
+    let profT0 =
+        if PosProf.Enabled then System.Diagnostics.Stopwatch.GetTimestamp() else 0L
+
     let ftPtr = NativePtr.stackalloc<byte> NNUE.L1
     let ft = Span<byte>(NativePtr.toVoidPtr ftPtr, NNUE.L1)
     let nnzPtr = NativePtr.stackalloc<byte> (NNUE.L1 / 32)
     let nnz = Span<byte>(NativePtr.toVoidPtr nnzPtr, NNUE.L1 / 32)
     NNUE.ftInto net pos ft nnz
     forwardFromFt pnet ft fromOut toOut NNUE.UseAvx2 NNUE.UseVnni
+
+    if PosProf.Enabled then
+        PosProf.tPolicy <- PosProf.tPolicy + (System.Diagnostics.Stopwatch.GetTimestamp() - profT0)
 
 // ===========================================================================
 // EONPOL03 — the OWN-TRUNK policy net (trainer/policy_own.py). Unlike EONPOL02 it does NOT read the

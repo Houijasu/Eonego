@@ -55,6 +55,19 @@ let LmrOff100 = envInt "EONEGO_T_LMR_OFF100" 47 0 100 // was 50
 // LMR tweak: extra reduction when combined history is below this threshold.
 let LmrHistThresh = envInt "EONEGO_T_LMR_HIST" -11499 -30000 0 // was -12000
 
+// --- LMR2 (Coda/SF-style richer LMR; each term opt-in via its EONEGO_LMR* flag, pre-SPRT) ---
+// EONEGO_LMRHISTCONT=1: continuous history scaling replaces the threshold step —
+// r -= hist/Hist2Div (strong history shortens, weak history deepens the reduction).
+let LmrHist2Div = envInt "EONEGO_T_LMR_HIST2DIV" 16384 1024 65536
+// EONEGO_LMRCUTCNT=1: extra reduction when the child ply already produced more than
+// CutCntThresh beta cutoffs under this node (SF ss->cutoffCnt / Coda cutoff_count).
+let LmrCutCntThresh = envInt "EONEGO_T_LMR_CUTCNT" 2 0 16
+// EONEGO_LMRDEEPER=1: doDeeper/doShallower — after a reduced scout fails high, re-search one ply
+// deeper when it beat best by Base + Mul*r, one ply shallower when it barely cleared best.
+let LmrDeeperBase = envInt "EONEGO_T_LMR_DEEPBASE" 60 1 500
+let LmrDeeperMul = envInt "EONEGO_T_LMR_DEEPMUL" 10 0 100
+let LmrShallowMargin = envInt "EONEGO_T_LMR_SHALLOW" 20 0 500
+
 // --- Late-move (move-count) pruning: moveCount >= (LmpBase + d*d) / (improving ? 1 : 2) ---
 let LmpBase = envInt "EONEGO_T_LMP_BASE" 9 1 20 // was 3 — the wave's biggest single move
 
@@ -79,6 +92,9 @@ let SeeCaptMult = envInt "EONEGO_T_SEE_CAPT" 99 1 500 // was 90
 
 // --- Qsearch delta pruning: rawEval + Base + capturedValue <= alpha ---
 let QsDeltaBase = envInt "EONEGO_T_QS_DELTA" 196 1 1000 // was 200
+// Qsearch searched-capture cap (EONEGO_QSCAP=1): max captures searched per non-check qs node
+// (promotions / mated-band best exempt). Coda ships 5.
+let QsCaptureCap = envInt "EONEGO_T_QS_CAP" 5 1 32
 
 // --- Singular extensions: margin = ttScore - Mul16*depth/16 (x16 scaling gives SPSA sub-integer
 //     resolution around the default 2*depth = 32/16) ---

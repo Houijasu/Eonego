@@ -37,19 +37,20 @@ let private readEmbedded (name: string) : byte[] option =
         s.CopyTo ms
         Some(ms.ToArray())
 
-/// Tunable options: Threads, Hash, MultiPV, Move Overhead; every search toggle is
-/// hardwired ON. The NNUE net is embedded in the binary (see Eonego.fsproj), so there is no EvalFile
-/// UCI option.
+/// Tunable options: Threads, Hash, MultiPV, Move Overhead, Use NNUE. The NNUE net is embedded in the
+/// binary (see Eonego.fsproj), so there is no EvalFile UCI option.
 type private UCIState =
     { mutable Threads: int
       mutable HashMb: int
       mutable MultiPv: int
       mutable MoveOverhead: int
+      mutable UseNnue: bool
       // UCI_ShowWDL: append the root policy-head WDL to every info line. Only meaningful when the
       // loaded sidecar carries the WDL section (the option is only ADVERTISED then, too).
       mutable ShowWdl: bool
       Net: Network option
       Policy: Policy.PolicyNetwork option
+      Graph: GraphGpu.GraphBatcher option
       OwnPolicy: Policy.OwnNetwork option
       Tt: TranspositionTable
       mutable RootFen: string
@@ -146,16 +147,17 @@ let private parsePosition (st: UCIState) (tokens: string[]) =
     st.RootMoves <- acc.ToArray()
 
 // go [depth d | nodes n | movetime t | wtime .. winc .. btime .. binc .. movestogo .. | infinite |
-//     mate n | searchmoves m1 m2 ...]. Returns the limits plus the RAW searchmoves tokens (the go
-// handler stamps them against the current position — parseGo has no board).
+//     mate n | searchmoves m1 m2 ...]. Returns the limits, the RAW searchmoves tokens, and whether
+// the keyword was present (the go handler stamps them against the current position — parseGo has no board).
 let private goKeywords =
     [| "depth"; "nodes"; "movetime"; "wtime"; "btime"; "winc"; "binc"; "movestogo"; "mate"
        "infinite"; "ponder"; "searchmoves" |]
 
-let private parseGo (tokens: string[]) : SearchLimits * string[] =
+let private parseGo (tokens: string[]) : SearchLimits * string[] * bool =
     let mutable lim = defaultLimits
     let mutable i = 0
     let searchMoves = System.Collections.Generic.List<string>()
+    let mutable searchMovesSpecified = false
 
     let arg () =
         if i + 1 < tokens.Length then tryInt tokens.[i + 1] else 0
@@ -163,6 +165,7 @@ let private parseGo (tokens: string[]) : SearchLimits * string[] =
     while i < tokens.Length do
         match tokens.[i] with
         | "searchmoves" ->
+            searchMovesSpecified <- true
             i <- i + 1
 
             while i < tokens.Length && not (Array.contains tokens.[i] goKeywords) do
@@ -208,7 +211,7 @@ let private parseGo (tokens: string[]) : SearchLimits * string[] =
             i <- i + 1
         | _ -> i <- i + 1
 
-    (lim, searchMoves.ToArray())
+    (lim, searchMoves.ToArray(), searchMovesSpecified)
 
 /// Build the search config from UCI state + the EONEGO_* A/B env flags. Shared by `startSearch` and
 /// the `bench` command so both exercise the exact same toggles (a `bench` NPS number is only useful if
@@ -221,7 +224,9 @@ let private buildConfig (st: UCIState) : SearchConfig =
       UseProbCut = true
       UseIir = true
       UseRazoring = true
-      UseHistoryPruning = true
+      // Kill switch added 2026-07-12 (was hardwired true): Coda removed history pruning after
+      // three failed SPRTs — ours has never been A/B-able at runtime until now.
+      UseHistoryPruning = (Environment.GetEnvironmentVariable("EONEGO_HISTPRUNE") <> "0")
       UseHistPruneCombined = (Environment.GetEnvironmentVariable("EONEGO_HISTCOMBINED") <> "0")
       UseDeltaPruning = true
       UseQsDeltaCorrected = (Environment.GetEnvironmentVariable("EONEGO_QSDELTACORR") <> "0")
@@ -229,6 +234,12 @@ let private buildConfig (st: UCIState) : SearchConfig =
       UseSingular = true
       UseNmpVerify = true
       UseLmrTweaks = true
+      // Threat-aware quiet history: NEW default-OFF (opt-in `=1`, pre-SPRT).
+      UseThreatHist = (Environment.GetEnvironmentVariable("EONEGO_THREATHIST") = "1")
+      // LMR2 terms: NEW default-OFF (opt-in `=1`, pre-SPRT — not part of the kitchen-sink flip).
+      UseLmrHistCont = (Environment.GetEnvironmentVariable("EONEGO_LMRHISTCONT") = "1")
+      UseLmrCutCnt = (Environment.GetEnvironmentVariable("EONEGO_LMRCUTCNT") = "1")
+      UseLmrDeeper = (Environment.GetEnvironmentVariable("EONEGO_LMRDEEPER") = "1")
       UseAspTweaks = true
       // A/B env knobs for match.py per-player overrides (campaign step B4). 2026-07-08 (user
       // request): this whole block is FLIPPED to default-ON (kitchen-sink build) — each now reads
@@ -239,6 +250,8 @@ let private buildConfig (st: UCIState) : SearchConfig =
       UseCheckExt = (Environment.GetEnvironmentVariable("EONEGO_CHECKEXT") <> "0")
       UseOneReplyExt = (Environment.GetEnvironmentVariable("EONEGO_ONEREPLY") <> "0")
       UseQsEvasionCap = (Environment.GetEnvironmentVariable("EONEGO_QSEVCAP") <> "0")
+      // NEW default-OFF (opt-in `=1`, pre-SPRT — not part of the kitchen-sink flip).
+      UseQsCaptureCap = (Environment.GetEnvironmentVariable("EONEGO_QSCAP") = "1")
       UseTtCapture = (Environment.GetEnvironmentVariable("EONEGO_TTCAPTURE") <> "0")
       UseCorrHist = (Environment.GetEnvironmentVariable("EONEGO_CORRHIST") <> "1")
       UseCorrMinor = (Environment.GetEnvironmentVariable("EONEGO_CORRMINOR") <> "0")
@@ -263,8 +276,11 @@ let private buildConfig (st: UCIState) : SearchConfig =
       // df-pn mate oracle: DEFAULT-ON as of the 2026-07-08 kitchen-sink flip (EONEGO_DFPN=0 disables;
       // was default-OFF pre-SPRT). The oracle never stops a normal search (only under `go mate N`).
       UseDFPN = (Environment.GetEnvironmentVariable("EONEGO_DFPN") <> "0")
-      // Policy sidecar: ON iff startup actually loaded one (EONEGO_POLICY gate; see run()).
-      UsePolicy = st.Policy.IsSome || st.OwnPolicy.IsSome
+      // Policy sidecar: ON iff startup actually loaded one (EONEGO_POLICY gate; see run()) and the
+      // user has not disabled the NNUE path. EONPOL02 shares the NNUE trunk; graph policy is separate.
+      UsePolicy = st.UseNnue && (st.Policy.IsSome || st.OwnPolicy.IsSome)
+      UseGraph = st.Graph.IsSome
+      GraphMode = (match st.Graph with Some g -> g.Mode | None -> GraphGpu.GraphMode.Leaf)
       // Dynamic time management (the TM campaign; DEFAULT-ON as of the 2026-07-08 kitchen-sink flip,
       // each EONEGO_TM*=0 disables its component): independently A/B-able per player. Game clocks
       // only — movetime matches make all of these inert (soft = 0). EONEGO_TMLOG=1 adds telemetry.
@@ -274,26 +290,54 @@ let private buildConfig (st: UCIState) : SearchConfig =
       UseTmFailLow = (Environment.GetEnvironmentVariable("EONEGO_TMFAILLOW") <> "0")
       UseTmEffort = (Environment.GetEnvironmentVariable("EONEGO_TMEFFORT") <> "0")
       MoveOverhead = st.MoveOverhead
-      // NNUE accumulator checkpoint cache (AccumulatorCache.fs): fully built but inert at
-      // 0 MiB. EONEGO_ACCMB=<MiB> arms it for SPRT (per-search table shared across the
-      // LazySMP workers); unset keeps the byte-identical default.
-      AccCheckpointMb =
-        (match Int32.TryParse(Environment.GetEnvironmentVariable("EONEGO_ACCMB")) with
-         | true, v -> max 0 (min 1024 v)
-         | _ -> 0)
       MultiPv = st.MultiPv }
 
 let private startSearch (st: UCIState) (lim: SearchLimits) =
     stopAndJoin st
+    let searchNet = if st.UseNnue then st.Net else None
+    let searchPolicy = if st.UseNnue then st.Policy else None
+    let searchOwnPolicy = if st.UseNnue then st.OwnPolicy else None
 
-    match st.Net with
-    | None ->
-        writeLine "info string no NNUE net embedded; cannot search"
-        let p = Position()
-        p.LoadFen st.RootFen
-        for m in st.RootMoves do p.Make m
-        writeLine ("bestmove " + toUCI (Search.firstLegalMove p))
-    | Some _ ->
+    match searchNet, st.UseNnue with
+    | None, _ ->
+        if not st.UseNnue then
+            writeLine "info string NNUE disabled by UCI option; graph evaluator/neutral eval path active"
+        else
+            writeLine "info string no NNUE net embedded; cannot search"
+
+        if st.UseNnue then
+            let p = Position()
+            p.LoadFen st.RootFen
+            for m in st.RootMoves do p.Make m
+            writeLine ("bestmove " + toUCI (Search.firstLegalMove p))
+        else
+            // Continue into search with Net=None. Graph leaf eval is used when available; otherwise
+            // Search.evalPos returns a neutral static score, which keeps the engine UCI-functional.
+            let cfg = buildConfig st
+            let control = SearchControl(cfg, lim, st.Tt, st.RootFen, st.RootMoves, ?graph = st.Graph)
+            Search.arm control
+            st.Control <- Some control
+            let usePool = Environment.GetEnvironmentVariable("EONEGO_POOL") <> "0"
+
+            if usePool && st.Pool.Length <> cfg.Threads then
+                st.Pool <- Array.init cfg.Threads (fun i -> Worker(i, (i = 0), control))
+
+            let pool = st.Pool
+
+            let t =
+                Thread(
+                    ThreadStart(fun () ->
+                        if usePool then
+                            Search.goPooledArmed control pool |> ignore
+                        else
+                            Search.goArmed control |> ignore),
+                    16 * 1024 * 1024
+                )
+
+            t.IsBackground <- true
+            st.SearchThread <- Some t
+            t.Start()
+    | Some _, _ ->
         // All search toggles are hardwired ON; Threads/Hash/MultiPV/MoveOverhead come from state.
         let cfg = buildConfig st
 
@@ -338,15 +382,16 @@ let private startSearch (st: UCIState) (lim: SearchLimits) =
                 st.Tt,
                 st.RootFen,
                 st.RootMoves,
-                ?net = st.Net,
-                ?policy = st.Policy,
-                ?ownPolicy = st.OwnPolicy
+                ?net = searchNet,
+                ?policy = searchPolicy,
+                ?ownPolicy = searchOwnPolicy,
+                ?graph = st.Graph
             )
 
         // UCI_ShowWDL: one policy-head WDL evaluation of the ROOT per `go` (a 3x32 dot on the UCI
         // thread — never the per-node path). reportLine appends it to every info line while
         // ValueSome; the net-free Position is fine (ftInto takes the from-scratch path).
-        (match st.Policy, st.Net with
+        (match searchPolicy, searchNet with
          | Some pnet, Some net when st.ShowWdl && pnet.HasWdl ->
              let p = Position()
              p.LoadFen st.RootFen
@@ -417,6 +462,8 @@ let private handleSetOption (st: UCIState) (tokens: string[]) =
             st.MultiPv <- max 1 (min 256 v)
         elif String.Equals(name, "Move Overhead", StringComparison.OrdinalIgnoreCase) then
             st.MoveOverhead <- max 0 (min 5000 v)
+        elif String.Equals(name, "Use NNUE", StringComparison.OrdinalIgnoreCase) then
+            st.UseNnue <- String.Equals(tokens.[vi + 1], "true", StringComparison.OrdinalIgnoreCase)
         elif String.Equals(name, "UCI_ShowWDL", StringComparison.OrdinalIgnoreCase) then
             // Accepted even when not advertised (harmless: emission also requires a WDL sidecar).
             st.ShowWdl <- String.Equals(tokens.[vi + 1], "true", StringComparison.OrdinalIgnoreCase)
@@ -539,14 +586,70 @@ let run () =
                     writeLine ("info string EONEGO_POLICY load FAILED (" + why + "); policy off")
                     None
 
+    // Lazy-eval PSQT bail (EONEGO_LAZYEVAL=<cp>): skip the NNUE forward chain when |psqt| alone
+    // exceeds the threshold. Value in output centipawns, stored in internal psqt units (~16.4/cp).
+    // 0/unset = off (byte-identical). Pre-SPRT; set once here before any search thread exists.
+    (match Int32.TryParse(Environment.GetEnvironmentVariable "EONEGO_LAZYEVAL") with
+     | true, cp when cp > 0 -> NNUE.LazyEvalThresholdInternal <- (max 1 (min 4000 cp)) * 16
+     | _ -> ())
+
+    let graph =
+        let env = Environment.GetEnvironmentVariable("EONEGO_GRAPH")
+        let disabled =
+            match env with
+            | null | "" -> true
+            | v ->
+                match v.ToLowerInvariant() with
+                | "0" | "off" | "none" -> true
+                | _ -> false
+
+        let envInt name defaultVal lo hi =
+            match Int32.TryParse(Environment.GetEnvironmentVariable(name)) with
+            | true, v -> max lo (min hi v)
+            | _ -> defaultVal
+
+        let mode =
+            match Environment.GetEnvironmentVariable("EONEGO_GRAPH_MODE") with
+            | null | "" -> GraphGpu.GraphMode.Leaf
+            | v ->
+                match v.ToLowerInvariant() with
+                | "policy" -> GraphGpu.GraphMode.Policy
+                | "all" -> GraphGpu.GraphMode.All
+                | _ -> GraphGpu.GraphMode.Leaf
+
+        if disabled then
+            None
+        else
+            let graphPath = match env with null -> "" | v -> v
+            match GraphGpu.load graphPath with
+            | GraphGpu.GraphLoaded gnet ->
+                let device = envInt "EONEGO_GRAPH_DEVICE" 0 0 64
+                let batch = envInt "EONEGO_GRAPH_BATCH" GraphGpu.DefaultBatch 1 65536
+                let waitUs = envInt "EONEGO_GRAPH_WAIT_US" GraphGpu.DefaultWaitUs 0 1_000_000
+                let batcher = new GraphGpu.GraphBatcher(gnet, mode, device, batch, waitUs)
+                writeLine (
+                    "info string graph evaluator: " + graphPath
+                    + " mode=" + mode.ToString().ToLowerInvariant()
+                    + " backend=" + batcher.NativeBackend.ToString().ToLowerInvariant()
+                    + " graphnetWeights=" + string batcher.HasGraphNetWeights
+                    + " learnedCuda=" + string batcher.HasLearnedCuda
+                    + " batch=" + string batch
+                    + " waitUs=" + string waitUs
+                )
+                Some batcher
+            | GraphGpu.GraphFailed why ->
+                writeLine ("info string EONEGO_GRAPH load FAILED (" + why + "); graph off")
+                None
     let st =
         { Threads = 1
           HashMb = DefaultHashMb
           MultiPv = 1
           MoveOverhead = 10
+          UseNnue = (Environment.GetEnvironmentVariable("EONEGO_NNUE") <> "0")
           ShowWdl = false
           Net = net
           Policy = policy
+          Graph = graph
           OwnPolicy = ownPolicy
           Tt = TranspositionTable(DefaultHashMb)
           RootFen = StartPosFen
@@ -573,6 +676,10 @@ let run () =
                     writeLine "option name Clear Hash type button"
                     writeLine "option name MultiPV type spin default 1 min 1 max 256"
                     writeLine "option name Move Overhead type spin default 10 min 0 max 5000"
+                    writeLine (
+                        "option name Use NNUE type check default "
+                        + (if st.UseNnue then "true" else "false")
+                    )
                     // Pondering is fully wired (`go ponder`/`ponderhit`); GUIs gate their ponder
                     // checkbox on this declaration, so without it the feature is unreachable.
                     writeLine "option name Ponder type check default false"
@@ -615,39 +722,47 @@ let run () =
 
                         Eonego.Retrograde.requestSolveFor p
                 | "go" ->
-                    let (lim, smUCI) = parseGo tokens.[1..]
+                    let (lim, smUCI, searchMovesSpecified) = parseGo tokens.[1..]
 
-                    // Stamp `searchmoves` tokens against the actual position (parseUCI is castling/
-                    // en-passant flag-lossy, same reason parsePosition re-stamps). Unmatched tokens drop.
-                    let lim =
-                        if smUCI.Length = 0 then
-                            lim
+                    if not searchMovesSpecified then
+                        startSearch st lim
+                    else
+                        // Stamp `searchmoves` against the actual position (parseUCI loses castling/EP
+                        // flags). An explicitly supplied but wholly invalid set must not degrade into an
+                        // unrestricted search.
+                        let p = Position()
+                        p.LoadFen st.RootFen
+
+                        for mv in st.RootMoves do
+                            p.Make mv
+
+                        let stamped =
+                            smUCI
+                            |> Array.map (matchMove p)
+                            |> Array.filter (fun m -> m <> MoveNone)
+                            |> Array.distinct
+
+                        if stamped.Length = 0 then
+                            stopAndJoin st
+                            writeLine "info string searchmoves contains no legal moves"
+                            writeLine "bestmove 0000"
                         else
-                            let p = Position()
-                            p.LoadFen st.RootFen
-
-                            for mv in st.RootMoves do
-                                p.Make mv
-
-                            let stamped =
-                                smUCI |> Array.map (matchMove p) |> Array.filter (fun m -> m <> MoveNone)
-
-                            { lim with SearchMoves = stamped }
-
-                    startSearch st lim
+                            startSearch st { lim with SearchMoves = stamped }
                 | "bench" ->
                     // Single-thread fixed-depth NPS + node fingerprint over a fixed FEN set. `bench [depth]`
                     // (default 13). Reproducible at Threads=1; EONEGO_PROF=1 adds the make-path threat-scan
                     // breakdown (the H1 measurement). Not part of the UCI protocol — a manual/CLI tool.
                     stopAndJoin st
 
-                    match st.Net with
-                    | None -> writeLine "info string no NNUE net embedded; cannot bench"
-                    | Some _ ->
+                    let benchNet = if st.UseNnue then st.Net else None
+
+                    match benchNet, st.UseNnue with
+                    | None, true -> writeLine "info string no NNUE net embedded; cannot bench"
+                    | _ ->
                         let depth =
                             if tokens.Length > 1 then max 1 (min 40 (tryInt tokens.[1])) else 13
 
-                        let struct (nodes, ticks) = Search.bench depth (buildConfig st) st.Net
+                        let struct (nodes, ticks) = Search.bench depth (buildConfig st) benchNet
 
                         let ms =
                             double ticks * 1000.0 / double System.Diagnostics.Stopwatch.Frequency

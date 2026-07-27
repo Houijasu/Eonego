@@ -44,6 +44,21 @@ let BoundExact = 3
 [<Literal>]
 let ClusterSize = 4
 
+/// Logical depths for the two incompatible qsearch move domains. Store encodes these into reserved
+/// byte values above MaxSearchPly; Probe decodes them back so main search never treats a qsearch entry
+/// as a 250-ply result. The domains intentionally compare unequal in qsearch.
+[<Literal>]
+let DepthQsCaptures = -2
+
+[<Literal>]
+let DepthQsChecks = -1
+
+[<Literal>]
+let private DepthQsCapturesRaw = 253
+
+[<Literal>]
+let private DepthQsChecksRaw = 254
+
 /// 16-byte XOR-lockless entry. Empty <=> Key = 0 && Data = 0 (a real entry always has bound <> BoundNone).
 [<Struct>]
 type TtEntry =
@@ -67,6 +82,18 @@ let inline dGenBound (d: uint64) : int = int (byte (d >>> 56))
 let inline dBound (d: uint64) : int = (dGenBound d) &&& 3
 let inline dTtPv (d: uint64) : bool = ((dGenBound d) >>> 2) &&& 1 = 1
 let inline dGen (d: uint64) : int = (dGenBound d) >>> 3
+
+let inline private encodeDepth (depth: int) : int =
+    if depth = DepthQsCaptures then DepthQsCapturesRaw
+    elif depth = DepthQsChecks then DepthQsChecksRaw
+    else depth
+
+let inline private decodeDepth (depth: int) : int =
+    if depth = DepthQsCapturesRaw then DepthQsCaptures
+    elif depth = DepthQsChecksRaw then DepthQsChecks
+    else depth
+
+let inline private replacementDepth (data: uint64) : int = max 0 (decodeDepth (dDepth data))
 
 /// EONEGO_TT_REFRESH=1: a probe HIT re-stamps the entry's generation (reference behaviour), so cutoff-serving
 /// entries stop losing replacement priority (relAge*2 ≈ 2 effective depth per game move) and aging out
@@ -167,7 +194,7 @@ type TranspositionTable(mb: int) =
 
         if (k0 ^^^ d0) = key && (gb0 &&& 3) <> BoundNone then
             this.RefreshGen b key d0
-            struct (true, dMove d0, dScore d0, dEval d0, dDepth d0, gb0 &&& 3, ((gb0 >>> 2) &&& 1) = 1)
+            struct (true, dMove d0, dScore d0, dEval d0, decodeDepth (dDepth d0), gb0 &&& 3, ((gb0 >>> 2) &&& 1) = 1)
         else
             let k1 = Volatile.Read(&entries.[b + 1].Key)
             let d1 = Volatile.Read(&entries.[b + 1].Data)
@@ -175,7 +202,7 @@ type TranspositionTable(mb: int) =
 
             if (k1 ^^^ d1) = key && (gb1 &&& 3) <> BoundNone then
                 this.RefreshGen (b + 1) key d1
-                struct (true, dMove d1, dScore d1, dEval d1, dDepth d1, gb1 &&& 3, ((gb1 >>> 2) &&& 1) = 1)
+                struct (true, dMove d1, dScore d1, dEval d1, decodeDepth (dDepth d1), gb1 &&& 3, ((gb1 >>> 2) &&& 1) = 1)
             else
                 let k2 = Volatile.Read(&entries.[b + 2].Key)
                 let d2 = Volatile.Read(&entries.[b + 2].Data)
@@ -183,7 +210,7 @@ type TranspositionTable(mb: int) =
 
                 if (k2 ^^^ d2) = key && (gb2 &&& 3) <> BoundNone then
                     this.RefreshGen (b + 2) key d2
-                    struct (true, dMove d2, dScore d2, dEval d2, dDepth d2, gb2 &&& 3, ((gb2 >>> 2) &&& 1) = 1)
+                    struct (true, dMove d2, dScore d2, dEval d2, decodeDepth (dDepth d2), gb2 &&& 3, ((gb2 >>> 2) &&& 1) = 1)
                 else
                     let k3 = Volatile.Read(&entries.[b + 3].Key)
                     let d3 = Volatile.Read(&entries.[b + 3].Data)
@@ -191,7 +218,7 @@ type TranspositionTable(mb: int) =
 
                     if (k3 ^^^ d3) = key && (gb3 &&& 3) <> BoundNone then
                         this.RefreshGen (b + 3) key d3
-                        struct (true, dMove d3, dScore d3, dEval d3, dDepth d3, gb3 &&& 3, ((gb3 >>> 2) &&& 1) = 1)
+                        struct (true, dMove d3, dScore d3, dEval d3, decodeDepth (dDepth d3), gb3 &&& 3, ((gb3 >>> 2) &&& 1) = 1)
                     else
                         struct (false, MoveNone, 0, 0, 0, BoundNone, false)
 
@@ -221,7 +248,7 @@ type TranspositionTable(mb: int) =
                 i <- i + 1
             else
                 let relAge = (generation - dGen d) &&& 0x1F
-                let q = dDepth d - relAge * 2
+                let q = replacementDepth d - relAge * 2
 
                 if q < slotQ then
                     (slotQ <- q
@@ -235,15 +262,16 @@ type TranspositionTable(mb: int) =
         // Keep the existing move when overwriting the same position with MoveNone (standard behaviour).
         let mv = if move <> MoveNone || not isMatch then move else dMove ed
         // On a key match, preserve a meaningfully deeper non-exact entry's value/depth/bound.
-        let updateValue = (not isMatch) || (bound = BoundExact) || (depth + 4 > dDepth ed)
-        let dpt = if updateValue then depth else dDepth ed
+        let oldDepth = decodeDepth (dDepth ed)
+        let updateValue = (not isMatch) || (bound = BoundExact) || (depth + 4 > oldDepth)
+        let dpt = if updateValue then depth else oldDepth
         let sc = if updateValue then score else dScore ed
         let ev = if updateValue then eval else dEval ed
         let bd = if updateValue then bound else dBound ed
         // ttPv is sticky: once a position is marked PV, keep it marked across overwrites (standard behaviour).
         let pvOut = ttPv || (isMatch && dTtPv ed)
         let pvBit = if pvOut then 1 else 0
-        let data = packData mv sc ev dpt ((generation <<< 3) ||| (pvBit <<< 2) ||| bd)
+        let data = packData mv sc ev (encodeDepth dpt) ((generation <<< 3) ||| (pvBit <<< 2) ||| bd)
         Volatile.Write(&entries.[slot].Data, data)
         Volatile.Write(&entries.[slot].Key, key ^^^ data)
 

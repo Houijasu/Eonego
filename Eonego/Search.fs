@@ -23,7 +23,6 @@ open Eonego.MoveGeneration
 open Eonego.History
 open Eonego.MovePick
 open Eonego.Transposition
-open Eonego.AccCheckpoint
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -73,6 +72,12 @@ let inline valueFromTt (v: int) (ply: int) : int =
     elif v <= -MATE_IN_MAX_PLY then v + ply
     else v
 
+/// Search-table key. Repetition deliberately uses Position.Key without the halfmove clock, but TT
+/// bounds are only valid for the same rule-50 horizon. Counter zero preserves the board key so the
+/// common zeroing-move path and external TT diagnostics keep their established index.
+let internal ttKey (pos: Position) : uint64 =
+    pos.Key ^^^ (uint64 pos.Rule50 * 0x9E37_79B9_7F4A_7C15UL)
+
 /// LMR reduction table r[depth][moveCount], built once at init (read-only ⇒ LazySMP-safe, like the eval
 /// tables). r grows with both depth and move number: late moves at high depth are searched much shallower.
 // Flat 64*64 (row d*64 + m), NOT int[,]: a single-dimension array's element access elides bounds checks the
@@ -120,6 +125,14 @@ type SearchConfig =
       UseSingular: bool
       UseNmpVerify: bool
       UseLmrTweaks: bool
+      // Threat-aware quiet history (Coda 4D butterfly adoption): when ON, ThreatHistory replaces
+      // MainHistory in quiet scoring, LMR history, history pruning, and the cutoff updates.
+      UseThreatHist: bool
+      // LMR2 terms (Coda/SF adoption candidates, individually SPRT-gated; see Tunables "LMR2"):
+      // continuous history scaling, child-cutoff-count bump, doDeeper/doShallower re-search.
+      UseLmrHistCont: bool
+      UseLmrCutCnt: bool
+      UseLmrDeeper: bool
       UseAspTweaks: bool
       // Qsearch TT protocol: non-PV bound cutoffs at qsearch entry + a BoundLower store on stand-pat
       // fail-highs. The store is tree-neutral (a revisit reaches the identical stand-pat value) and only
@@ -128,8 +141,8 @@ type SearchConfig =
       UseQsTt: bool
       // A bound-consistent TT score replaces the raw static eval as the WORKING eval that RFP/razoring/
       // NMP (and the qsearch stand-pat) prune on — a real search result is tighter than a heuristic eval.
-      // Stack.StaticEval, `improving`, move-loop futility and every TT store keep the RAW eval
-      // (the unadjusted static-eval contract; correction history depends on it staying raw).
+      // Stack.StaticEval, `improving`, and move-loop futility keep the node-local corrected/damped eval;
+      // TT stores keep the pure evaluator value.
       UseTtEvalAdjust: bool
       // Extend every SEE>=0 checking move by one ply (legacy behaviour). The reference engine dropped its
       // generic check extension years ago — the singular machinery and LMR cover the useful cases, and the
@@ -146,13 +159,16 @@ type SearchConfig =
       // +35% suite-node REGRESSION at d14/d15 (2026-07-02) — the pessimistic leaf values it injects
       // cost more tree than the skipped evasions save. Kept behind the flag for a future SPRT only.
       UseQsEvasionCap: bool
+      // Qsearch searched-capture cap (Coda adoption candidate): stop searching further captures at a
+      // non-check qsearch node once QsCaptureCap have been played (promotions / mated-band exempt).
+      UseQsCaptureCap: bool
       // TT-move-is-capture awareness: gates ttCapture-informed adjustments to RFP (skip when TT
       // move is quiet), NMP (extra reduction when TT move is quiet), and LMR (extra reduction for
       // non-TT quiets when TT found a capture). Standard in the reference engine.
       UseTtCapture: bool
       // Correction history: a per-(stm, pawn-structure) gravity table of persistent (bestValue −
       // staticEval) error corrects the WORKING static eval wherever it feeds pruning (negamax step 3 +
-      // qsearch stand-pat). Every TT store keeps the RAW eval. Adjudicated by self-play match — node
+      // qsearch stand-pat). Every TT store keeps the pure, uncorrected evaluator value. Adjudicated by self-play match — node
       // counts cannot judge an eval-accuracy feature.
       UseCorrHist: bool
       // Minor-piece correction history rider (needs UseCorrHist): a second correction table keyed by
@@ -214,6 +230,10 @@ type SearchConfig =
       // picker's StgQuietInit, consumed by the LMR term (v1, Phase-0 re-scope) and the inert ordering
       // blend. True only when UCI actually loaded a sidecar; false = byte-identical legacy search.
       UsePolicy: bool
+      // CUDA graph evaluator scaffold (GraphGpu.fs, EONEGO_GRAPH). V1 ownership is wired here while
+      // evaluation still falls back to NNUE until the native batcher is implemented.
+      UseGraph: bool
+      GraphMode: GraphGpu.GraphMode
       // --- Dynamic time management (the TM campaign; all default OFF pre-SPRT). Game clocks only —
       // movetime/depth/nodes searches have soft = 0, which makes every component inert. ---
       // movestogo hardening: clamp user mtg, widen the hard cap when few moves remain, soft <= hard.
@@ -227,11 +247,6 @@ type SearchConfig =
       // Scale the soft budget by the best move's share of this iteration's root nodes.
       UseTmEffort: bool
       MoveOverhead: int
-      // Phase 1: NNUE accumulator checkpoint cache. Set to 0 to disable; ~4 MiB is the recommended default
-      // (1024 slots, ~4.1 KiB/slot). Cleared per search by `SearchControl.NewSearch` (alongside the TT gen
-      // bump). Probes are best-effort lock-free (matching the TT); populates on each successful
-      // `Position.EnsureBothComputed` materialization.
-      AccCheckpointMb: int
       // Number of principal variations to report (UCI MultiPV). 1 = classic single-PV search. >1 makes the
       // main worker search each root line with the previous lines' best moves excluded at the root; helpers
       // always run single-PV. Forces the classic LazySMP path (no root-move work queue).
@@ -269,12 +284,17 @@ let defaultConfig =
       UseSingular = true
       UseNmpVerify = true
       UseLmrTweaks = true
+      UseThreatHist = false
+      UseLmrHistCont = false
+      UseLmrCutCnt = false
+      UseLmrDeeper = false
       UseAspTweaks = true
       UseQsTt = true
       UseTtEvalAdjust = true
       UseCheckExt = false
       UseOneReplyExt = false
       UseQsEvasionCap = false
+      UseQsCaptureCap = false
       UseTtCapture = false
       UseCorrHist = true
       UseCorrMinor = false
@@ -293,13 +313,14 @@ let defaultConfig =
       UseSyzygy = true
       UseDFPN = false
       UsePolicy = false
+      UseGraph = false
+      GraphMode = GraphGpu.GraphMode.Leaf
       UseTmMtgHarden = false
       UseTmStability = false
       UseTmTrend = false
       UseTmFailLow = false
       UseTmEffort = false
       MoveOverhead = 10
-      AccCheckpointMb = 0
       MultiPv = 1 }
 
 let defaultLimits =
@@ -335,7 +356,8 @@ let inline hasNonPawnMaterial (pos: Position) : bool =
      ||| pos.PiecesCT us Queen)
     <> 0UL
 
-/// KvK, KNvK, KBvK, KB-vs-KB-same-colour. All from public bitboard accessors.
+/// KvK, KNvK, KBvK, and bishop-only positions where every bishop is confined to one square colour.
+/// The latter includes legal same-coloured promotion sets, not only exactly one bishop per side.
 let insufficientMaterial (pos: Position) : bool =
     if pos.Pieces Pawn <> 0UL || pos.Pieces Rook <> 0UL || pos.Pieces Queen <> 0UL then
         false
@@ -346,16 +368,17 @@ let insufficientMaterial (pos: Position) : bool =
 
         if minors <= 1 then
             true
-        elif knights = 0 && bishops = 2 then
-            let wB = pos.PiecesCT White Bishop
-            let bB = pos.PiecesCT Black Bishop
+        elif knights = 0 then
+            let mutable bb = pos.Pieces Bishop
+            let first = popLsb &bb
+            let colour = (fileOf first + rankOf first) &&& 1
+            let mutable sameColour = true
 
-            if popCount wB = 1 && popCount bB = 1 then
-                let a = lsb wB
-                let b = lsb bB
-                ((fileOf a + rankOf a) &&& 1) = ((fileOf b + rankOf b) &&& 1)
-            else
-                false
+            while sameColour && bb <> 0UL do
+                let sq = popLsb &bb
+                sameColour <- ((fileOf sq + rankOf sq) &&& 1) = colour
+
+            sameColour
         else
             false
 
@@ -422,6 +445,36 @@ let isLegalRoot (pos: Position) (m: Move) : bool =
 
         found
 
+let private listedRootMove (allowed: Move[]) (m: Move) : bool =
+    allowed.Length = 0 || System.Array.IndexOf(allowed, m) >= 0
+
+let private isAllowedRootMove (pos: Position) (allowed: Move[]) (m: Move) : bool =
+    listedRootMove allowed m && isLegalRoot pos m
+
+let private firstAllowedRootMove (pos: Position) (allowed: Move[]) : Move =
+    let p = NativePtr.stackalloc<Move> MaxMoves
+    let buf = Span<Move>(NativePtr.toVoidPtr p, MaxMoves)
+    let n = generateLegal pos buf
+    let mutable found = MoveNone
+    let mutable i = 0
+
+    while found = MoveNone && i < n do
+        if listedRootMove allowed buf.[i] then found <- buf.[i]
+        i <- i + 1
+
+    found
+
+let private countAllowedRootMoves (pos: Position) (allowed: Move[]) : int =
+    let p = NativePtr.stackalloc<Move> MaxMoves
+    let buf = Span<Move>(NativePtr.toVoidPtr p, MaxMoves)
+    let n = generateLegal pos buf
+    let mutable count = 0
+
+    for i in 0 .. n - 1 do
+        if listedRootMove allowed buf.[i] then count <- count + 1
+
+    count
+
 // ---------------------------------------------------------------------------
 // Shared control: atomically-published stop/timing plus shared best-effort caches.
 // ---------------------------------------------------------------------------
@@ -447,7 +500,8 @@ type SearchControl
         rootMoves: Move[],
         ?net: Network,
         ?policy: Policy.PolicyNetwork,
-        ?ownPolicy: Policy.OwnNetwork
+        ?ownPolicy: Policy.OwnNetwork,
+        ?graph: GraphGpu.GraphBatcher
     ) =
     let mutable stopFlag = 0
     let mutable startTick = System.Diagnostics.Stopwatch.GetTimestamp()
@@ -475,11 +529,6 @@ type SearchControl
         let delta = System.Diagnostics.Stopwatch.GetTimestamp() - start
         (delta * 1000L) / System.Diagnostics.Stopwatch.Frequency
 
-    // Phase 1: per-search NNUE accumulator checkpoint cache. `null` when the config disables it (zero MiB).
-    // Owned here, bound to each worker's `Position` via `BindCheckpoint` in `Worker.SetupRoot`; cleared in
-    // `NewSearch` alongside `tt.newSearch`.
-    let accCheckpoint: AccCheckpointTable =
-        if config.AccCheckpointMb <= 0 then null else AccCheckpointTable(config.AccCheckpointMb)
     member _.Config = config
     member _.Limits = limits
     member _.Tt = tt
@@ -490,8 +539,8 @@ type SearchControl
     member _.Policy: Policy.PolicyNetwork option = policy
     /// Own-trunk policy net (EONPOL03); None unless EONEGO_POLICY pointed at an own-trunk file.
     member _.OwnPolicy: Policy.OwnNetwork option = ownPolicy
-    /// Borrowed reference to the per-search accumulator checkpoint cache; `null` when disabled in config.
-    member _.AccCheckpoint: AccCheckpointTable = accCheckpoint
+    /// CUDA graph evaluator batcher; None keeps the search on the NNUE path.
+    member _.Graph: GraphGpu.GraphBatcher option = graph
     member val LastBest: Move = MoveNone with get, set // result of the most recent go()
     member val LastScore: int = 0 with get, set
     /// UCI_ShowWDL: the root position's policy-head WDL (per-mille, stm-relative), set once per
@@ -501,20 +550,17 @@ type SearchControl
     /// df-pn oracle publication slot — fresh per control (= per `go`), so there is no clearing
     /// protocol; the oracle thread Publishes, goCore reads after joining it.
     member val Oracle: Eonego.DFPN.OracleResult = Eonego.DFPN.OracleResult() with get
-    /// Aggregate live node count across all workers (relaxed reads — reporting only, set by go()).
+    /// Aggregate live node count across all workers (relaxed reads, set by go()). Used for reporting and
+    /// aggregate node-limit enforcement; the coarse polling cadence intentionally bounds its precision.
     member val NodeSum: unit -> int64 = (fun () -> 0L) with get, set
     /// Aggregate Syzygy probe hits across all workers (relaxed reads — reporting only, set by go()).
     member val TbHitSum: unit -> int64 = (fun () -> 0L) with get, set
     member _.Stopped: bool = Volatile.Read(&stopFlag) <> 0
     member _.Stop() = Volatile.Write(&stopFlag, 1)
     member _.Reset() = Volatile.Write(&stopFlag, 0)
-    /// Per-search reset shared between `tt.NewSearch` and the checkpoint cache; safe to call only between
-    /// searches (no live Workers probing). `go` invokes this once before spawning workers.
-    member this.NewSearch() : unit =
-        tt.NewSearch()
-        match accCheckpoint with
-        | null -> ()
-        | cache -> cache.Clear()
+    /// Per-search TT generation bump; safe to call only between searches (no live Workers probing).
+    /// `go` invokes this once before spawning workers.
+    member this.NewSearch() : unit = tt.NewSearch()
     member _.ElapsedMs: int64 = elapsedMs ()
 
     member _.SoftTimeUp: bool =
@@ -588,14 +634,15 @@ type SearchControl
                 else
                     done' <- true
 
-    /// Main worker only: convert a time/node budget overrun into the shared stop flag.
-    member _.CheckTime(nodes: int64) =
+    /// Convert a time/node budget overrun into the shared stop flag. Every worker polls at the coarse
+    /// cadence so fast helpers cannot run far past an aggregate UCI node budget while waiting for main.
+    member this.CheckTime() =
         let hard = Volatile.Read(&hardMs) * Volatile.Read(&hardScalePct) / 100L
 
         if hard > 0L && elapsedMs () >= hard then
             Volatile.Write(&hardHitFlag, 1)
             Volatile.Write(&stopFlag, 1)
-        elif limits.Nodes > 0L && nodes >= limits.Nodes then
+        elif limits.Nodes > 0L && this.NodeSum() >= limits.Nodes then
             Volatile.Write(&stopFlag, 1)
 
 // ---------------------------------------------------------------------------
@@ -750,6 +797,15 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
     /// unreduced and PV-flagged even when late in the order. MoveNone = inactive.
     member val RootVerifyMove = MoveNone with get, set
 
+    /// pollStop cadence mask for THIS search: the legacy 2^TmPollShift-1 clock mask, tightened to 63
+    /// (64-node granularity) when a `go nodes` budget is active — the coarse mask overshoots a small
+    /// node budget by up to 8191 nodes/worker. Set in Reset; clock-only searches are byte-identical.
+    member val PollMask = (1L <<< Tunables.TmPollShift) - 1L with get, set
+
+    /// LMR2 (UseLmrCutCnt): per-ply beta-cutoff counters — [p] counts cutoffs produced at ply p under
+    /// the currently-searched branch; a node at ply reads [ply+1] (its children) and resets [ply+2].
+    member val CutoffCnt: int[] = Array.zeroCreate (MaxSearchPly + 4) with get
+
     member _.ClearRootExclusions() = nRootExcluded <- 0
 
     member _.AddRootExclusion(m: Move) =
@@ -791,14 +847,13 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
         | Some net -> NNUE.bindNNUE net pos
         | None -> ()
 
-        // Phase 1: borrow the per-search checkpoint cache so `EnsureBothComputed` can probe/store snapshots
-        // during the upcoming search. `null` disables the fast-path entirely. Seed the root snapshot now —
-        // `EnableNNUE` just materialized frame 0 and set the computed flags, so the early-return path inside
-        // `EnsureBothComputed` would otherwise skip the populate on the first eval at the root.
-        pos.BindCheckpoint control.AccCheckpoint
-        pos.SeedCheckpoint()
-
-        tables.EnsureAux control.Config.UseCont4 control.Config.UseCorrMinor control.Config.UseCorrMajor control.Config.UseCorrNonPawn control.Config.UsePawnHist
+        tables.EnsureAux
+            control.Config.UseCont4
+            control.Config.UseCorrMinor
+            control.Config.UseCorrMajor
+            control.Config.UseCorrNonPawn
+            control.Config.UsePawnHist
+            control.Config.UseThreatHist
 
         if defaultArg keepHistory false then
             tables.NewSearch()
@@ -811,7 +866,12 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
         // Stale policy slots from a previous search are (ply, key)-guarded so they could only ever be
         // re-read for the identical position at the identical ply — same net, same logits — but clear
         // anyway: 2 KB, and it keeps every search's policy state provably self-contained.
-        if control.Config.UsePolicy then
+        if
+            control.Config.UsePolicy
+            || (control.Config.UseGraph
+                && (control.Config.GraphMode = GraphGpu.GraphMode.Policy || control.Config.GraphMode = GraphGpu.GraphMode.All)
+                && control.Graph.IsSome)
+        then
             System.Array.Clear policyKey
 
         nodes <- 0L
@@ -821,6 +881,12 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
         rootScore <- 0
         completedDepth <- 0
         stopSeen <- false
+
+        this.PollMask <-
+            let m = (1L <<< Tunables.TmPollShift) - 1L
+            if control.Limits.Nodes > 0L then min m 63L else m
+
+        System.Array.Clear this.CutoffCnt
         nRootExcluded <- 0
         rootCnt <- 0
         rootListActive <- false
@@ -835,15 +901,12 @@ type Worker(id: int, isMain: bool, control: SearchControl) =
         this.TmLastFailLowPct <- 100
 
 // Clock/node-limit poll cadence: every 2^TmPollShift nodes (default 13 = mask 8191, the legacy
-// value — also the stop granularity of `go nodes`, so the default only moves behind an SPRT).
-let private tmPollMask = (1L <<< Tunables.TmPollShift) - 1L
-
+// value); `go nodes` searches tighten to a 64-node mask — see Worker.PollMask (set per search).
 let inline private pollStop (w: Worker) : bool =
     if w.StopSeen then
         true
-    elif (w.Nodes &&& tmPollMask) = 0L then
-        if w.IsMain then
-            w.Control.CheckTime w.Nodes
+    elif (w.Nodes &&& w.PollMask) = 0L then
+        w.Control.CheckTime()
 
         let stopped = w.Control.Stopped
         if stopped then
@@ -881,25 +944,59 @@ let private cutDumpWriter =
          w.AutoFlush <- true
          w)
 
-let evalPos (w: Worker) (pos: Position) : int =
+let private dampEval (w: Worker) (pos: Position) (v: int) : int =
+    let v = max -NNUE.EvalMax (min NNUE.EvalMax v)
+
+    if w.Control.Config.UseR50Damp then
+        v - v * pos.Rule50 / Tunables.Rule50DampDiv
+    else
+        v
+
+/// Evaluator result before rule-50 damping. This is the only static-eval form stored in the TT: the
+/// search-table key isolates the draw horizon, and consumers still apply damping exactly once.
+let evalRawPos (w: Worker) (pos: Position) : int =
     match w.Control.Net with
     | Some net ->
-        let v =
-            if PosProf.Enabled then
-                let profT0 = System.Diagnostics.Stopwatch.GetTimestamp()
-                let v = NNUE.evalCp net pos
-                PosProf.tEval <- PosProf.tEval + (System.Diagnostics.Stopwatch.GetTimestamp() - profT0)
-                PosProf.nEval <- PosProf.nEval + 1L
-                v
-            else
-                NNUE.evalCp net pos
-        // Rule-50 shuffle damping (see SearchConfig.UseR50Damp): identity at rule50 = 0, and damping
-        // only shrinks magnitude, so the EvalMax clamp inside evalCp still bounds the result.
-        if w.Control.Config.UseR50Damp then
-            v - v * pos.Rule50 / Tunables.Rule50DampDiv
-        else
+        if PosProf.Enabled then
+            let profT0 = System.Diagnostics.Stopwatch.GetTimestamp()
+            let v = NNUE.evalCp net pos
+            PosProf.tEval <- PosProf.tEval + (System.Diagnostics.Stopwatch.GetTimestamp() - profT0)
+            PosProf.nEval <- PosProf.nEval + 1L
             v
+        else
+            NNUE.evalCp net pos
     | None -> 0 // unreachable in play: UCI refuses to search with no net (see UCI.startSearch)
+
+let evalPos (w: Worker) (pos: Position) : int =
+    // Rule-50 shuffle damping is applied on every consumption, including TT eval hits.
+    dampEval w pos (evalRawPos w pos)
+
+let private graphLeafRequested (w: Worker) : bool =
+    w.Control.Config.UseGraph
+    && (w.Control.Config.GraphMode = GraphGpu.GraphMode.Leaf || w.Control.Config.GraphMode = GraphGpu.GraphMode.All)
+    && w.Control.Graph.IsSome
+
+let private graphLeafHasInference (w: Worker) : bool =
+    graphLeafRequested w && w.Control.Graph.Value.SupportsInference
+
+let private graphPolicyRequested (w: Worker) : bool =
+    w.Control.Config.UseGraph
+    && (w.Control.Config.GraphMode = GraphGpu.GraphMode.Policy || w.Control.Config.GraphMode = GraphGpu.GraphMode.All)
+    && w.Control.Graph.IsSome
+
+let private graphPolicyHasInference (w: Worker) : bool =
+    graphPolicyRequested w && w.Control.Graph.Value.SupportsInference
+
+let evalRawLeafPos (w: Worker) (pos: Position) : int =
+    if graphLeafHasInference w then
+        match w.Control.Graph.Value.TryEvaluate(pos, false) with
+        | ValueSome g -> g.ValueCp
+        | ValueNone -> evalRawPos w pos
+    else
+        evalRawPos w pos
+
+let evalLeafPos (w: Worker) (pos: Position) : int =
+    dampEval w pos (evalRawLeafPos w pos)
 
 let private updatePv (w: Worker) (ply: int) (m: Move) =
     let pv = w.Pv
@@ -984,12 +1081,17 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
     // Acc-frame guard on pos.Top (search frames since the root rebase), NOT StPly: StPly includes the
     // GAME history, so after ~255 game plies the old guard bailed to a raw eval at every node.
     elif ply >= MaxSearchPly || pos.Top >= Position.AccStackLimit then
-        (if pos.InCheck then 0 else evalPos w pos)
+        (if pos.InCheck then 0 else evalLeafPos w pos)
     else
         let cfg = w.Control.Config
+        let useGraphLeaf = graphLeafHasInference w
         let useTt = cfg.UseTt
+        let useQsTt = cfg.UseQsTt && not useGraphLeaf
         let usePruning = cfg.UsePruning
         let inCheck = pos.InCheck
+        let qTtDepth =
+            if usePruning && cfg.UseQsChecks && qsDepth = 0 && not inCheck then DepthQsChecks
+            else DepthQsCaptures
         let isPvNode = betaIn - alphaIn > 1
         let mutable alpha = alphaIn
         let beta = betaIn
@@ -997,33 +1099,39 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
         let mutable ttMove = MoveNone
         let mutable ttEval = VALUE_NONE
         let mutable ttScore = 0
+        let mutable ttDepth = System.Int32.MinValue
         let mutable ttBound = BoundNone
 
         if useTt then
-            let struct (hit, m, sc, ev, _, bd, _) = w.Control.Tt.Probe pos.Key
+            let struct (hit, m, sc, ev, dp, bd, _) = w.Control.Tt.Probe(ttKey pos)
 
             if hit then
                 ttHit <- true
                 ttMove <- m
                 ttEval <- ev
                 ttScore <- valueFromTt sc ply
+                ttDepth <- dp
                 ttBound <- bd
+
+        // A main-search result covers either qsearch domain. The two qsearch domains themselves are
+        // deliberately isolated: quiet-check and captures-only bounds are not interchangeable.
+        let ttDomainHit = ttHit && (ttDepth >= 1 || ttDepth = qTtDepth)
 
         let mutable best = -INF
         let mutable bestMove = MoveNone
+        let mutable rawEvalForTt = VALUE_NONE
         let mutable rawEval = VALUE_NONE
         // The corrected/TT-adjusted stand-pat (the value that raised alpha below). UseQsDeltaCorrected
         // keys delta pruning off this instead of rawEval so both sides of the delta inequality share
-        // one eval basis; rawEval stays raw for the TT stores.
+        // one eval basis. rawEval is Rule50-damped; rawEvalForTt remains cache-safe.
         let mutable standPat = VALUE_NONE
         let mutable cutoff = false
 
-        // TT cutoff (non-PV): every entry is depth-sufficient here (qsearch stores at depth 0, negamax
-        // deeper), so only the bound has to agree with the window — the same gate as negamax step 2.
+        // TT cutoff (non-PV): require a main-search entry or the exact same qsearch move domain.
         if
             useTt
-            && cfg.UseQsTt
-            && ttHit
+            && useQsTt
+            && ttDomainHit
             && not isPvNode
             && (ttBound = BoundExact
                 || (ttBound = BoundLower && ttScore >= beta)
@@ -1033,14 +1141,16 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
             cutoff <- true
 
         if not inCheck && not cutoff then
-            // Stand-pat: reuse the TT-stored static eval when present (it is the same deterministic
-            // evalPos value qsearch would recompute and store), mirroring negamax. Bit-exact, skips the
-            // NNUE forward on a TT hit.
-            let rawSp = if ttEval <> VALUE_NONE then ttEval else evalPos w pos
+            // TT stores the evaluator's Rule50-independent value. Apply this node's damping after a hit.
+            rawEvalForTt <-
+                if (not useGraphLeaf) && ttEval <> VALUE_NONE then ttEval
+                else evalRawLeafPos w pos
+
+            let rawSp = dampEval w pos rawEvalForTt
             rawEval <- rawSp
 
-            // Correction history: same corrected-working-eval rule as negamax step 3 (rawEval stays raw
-            // for the TT stores below).
+            // Correction history: same corrected-working-eval rule as negamax step 3. TT stores keep
+            // rawEvalForTt, before both Rule50 damping and correction history.
             let rawSp =
                 if usePruning && cfg.UseCorrHist then
                     let stm = pos.SideToMove
@@ -1065,13 +1175,12 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
                 else
                     rawSp
 
-            // TT score as a better stand-pat (same bound-consistency rule as negamax step 3b). rawEval —
-            // what a fail-high store below and the post-move-loop store persist — stays the raw eval.
+            // TT score as a better stand-pat (same bound-consistency rule as negamax step 3b).
             let sp =
                 if
                     usePruning
                     && cfg.UseTtEvalAdjust
-                    && ttHit
+                    && ttDomainHit
                     && abs ttScore < MATE_IN_MAX_PLY
                     && (ttBound &&& (if ttScore > rawSp then BoundLower else BoundUpper)) <> 0
                 then
@@ -1085,10 +1194,10 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
             if sp >= beta then
                 cutoff <- true
                 // Stand-pat fail-high: without a store, a transposed re-visit repeats the eval (and its
-                // lazy-accumulator catch-up walk). sp is this node's genuine fail-soft return value, so a
-                // depth-0 BoundLower entry is sound; only written on a TT miss (never clobber deeper data).
-                if useTt && cfg.UseQsTt && not ttHit then
-                    w.Control.Tt.Store pos.Key 0 BoundLower (valueToTt sp ply) rawEval MoveNone false
+                // lazy-accumulator catch-up walk). A domain-tagged BoundLower entry is sound; don't
+                // clobber a compatible deeper entry.
+                if useTt && useQsTt && not ttDomainHit then
+                    w.Control.Tt.Store (ttKey pos) qTtDepth BoundLower (valueToTt sp ply) rawEvalForTt MoveNone false
             elif sp > alpha then
                 alpha <- sp
 
@@ -1127,9 +1236,15 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
                             && not (isEnPassant m)
                             && not (isPromotion m)
                         else
-                            not (isPromotion m)
-                            && not (pos.GivesCheck m)
-                            && (not (pos.SeeGe m 1) // existing SEE prune
+                            // Searched-capture cap (UseQsCaptureCap): cheap disjunct FIRST so the
+                            // capped tail skips the GivesCheck/SEE work below entirely.
+                            (cfg.UseQsCaptureCap
+                             && movesPlayed >= Tunables.QsCaptureCap
+                             && not (isPromotion m)
+                             && best > -MATE_IN_MAX_PLY)
+                            || (not (isPromotion m)
+                                && not (pos.GivesCheck m)
+                                && ((not (isEnPassant m) && not (pos.SeeGe m 1)) // EP SEE is special-cased to zero
                                 // delta pruning: a capture that can't lift alpha even after winning the
                                 // piece (captures only — guard pieceType against an empty destination).
                                 || (cfg.UseDeltaPruning
@@ -1144,12 +1259,12 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
                                             let evalBase =
                                                 if cfg.UseQsDeltaCorrected then standPat else rawEval
 
-                                            evalBase + Tunables.QsDeltaBase + capturedValue <= alpha)))))
+                                            evalBase + Tunables.QsDeltaBase + capturedValue <= alpha))))))
 
                 if legal && not prune then
                     movesPlayed <- movesPlayed + 1
                     pos.Make m
-                    w.Control.Tt.Prefetch pos.Key // child probes this exact key at entry
+                    w.Control.Tt.Prefetch(ttKey pos) // child probes this exact key at entry
                     let v = -(qsearch w pos (-beta) (-alpha) (ply + 1) (qsDepth - 1))
                     pos.Unmake m
 
@@ -1189,7 +1304,7 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
 
                     if isQuiet && pos.GivesCheck qm && pos.SeeGe qm 0 then
                         pos.Make qm
-                        w.Control.Tt.Prefetch pos.Key
+                        w.Control.Tt.Prefetch(ttKey pos)
                         let v = -(qsearch w pos (-beta) (-alpha) (ply + 1) (qsDepth - 1))
                         pos.Unmake qm
 
@@ -1211,13 +1326,13 @@ let rec qsearch (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (ply: i
             if inCheck && movesPlayed = 0 then
                 -MATE + ply
             else
-                if useTt && not (pollStop w) then
+                if useTt && (not useGraphLeaf) && not (pollStop w) then
                     let bound =
                         if best <= alphaIn then BoundUpper
                         elif best >= beta then BoundLower
                         else BoundExact
 
-                    w.Control.Tt.Store pos.Key 0 bound (valueToTt best ply) rawEval bestMove false
+                    w.Control.Tt.Store (ttKey pos) qTtDepth bound (valueToTt best ply) rawEvalForTt bestMove false
 
                 best
 
@@ -1263,7 +1378,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
     // Acc-frame guard on pos.Top (search frames since the root rebase), NOT StPly: StPly includes the
     // GAME history, so after ~255 game plies the old guard bailed to a raw eval at every node.
     elif ply >= MaxSearchPly || pos.Top >= Position.AccStackLimit then
-        (if pos.InCheck then 0 else evalPos w pos)
+        (if pos.InCheck then 0 else evalLeafPos w pos)
     elif depthIn <= 0 then
         qsearch w pos alphaIn betaIn ply 0
     else
@@ -1272,6 +1387,10 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
         let useTt = cfg.UseTt
         let inCheck = pos.InCheck
         let ssCur = ply + StackOffset
+        let rootAllowed = w.Control.Limits.SearchMoves
+        // MultiPV side lines and explicit root subsets are different minimax domains. Their root
+        // scores/bounds must never be published under the unrestricted position key.
+        let restrictedRoot = ply = 0 && (rootAllowed.Length > 0 || w.RootPvIdx > 0)
         // Singular extension: this node's own excluded move (set by the parent for a singular search). Clear
         // the CHILD's slot so a normal recursion sees no exclusion; never clear our own (that erases it).
         let excludedMove = w.Stack.[ssCur].ExcludedMove
@@ -1295,6 +1414,11 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
         // ttPv: this node is (or was) on a PV. Sticky — start from isPv, OR in a probed former-PV mark.
         let mutable ttPv = isPv
 
+        // LMR2 cutoff-count: fresh grandchild slot so counts from sibling subtrees can't leak in
+        // (SF's `(ss+2)->cutoffCnt = 0`). Children increment [ply+1]; this node's LMR reads it.
+        if cfg.UseLmrCutCnt && ply + 2 < MaxSearchPly then
+            w.CutoffCnt.[ply + 2] <- 0
+
         // 1. mate-distance pruning (gated -> oracle stays strictly full-window)
         if usePruning then
             if alpha < -MATE + ply then
@@ -1309,22 +1433,27 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
         // 2. TT probe + (non-PV) cutoff
         if not produced && useTt then
-            let struct (hit, m, sc, ev, dp, bd, pv) = w.Control.Tt.Probe pos.Key
+            let struct (hit, m, sc, ev, dp, bd, pv) = w.Control.Tt.Probe(ttKey pos)
 
             if hit then
                 ttHit <- true
                 ttMove <- m
                 ttScore <- valueFromTt sc ply
                 ttEval <- ev
-                ttDepth <- dp
-                ttBound <- bd
+                if restrictedRoot then
+                    // Static eval is position-local and remains reusable; search bounds/depth do not.
+                    ttDepth <- 0
+                    ttBound <- BoundNone
+                else
+                    ttDepth <- dp
+                    ttBound <- bd
                 ttPv <- ttPv || pv
 
-                if not isPv && excludedMove = MoveNone && dp >= depthIn then
+                if not isPv && excludedMove = MoveNone && ttDepth >= depthIn then
                     if
-                        bd = BoundExact
-                        || (bd = BoundLower && ttScore >= beta)
-                        || (bd = BoundUpper && ttScore <= alpha)
+                        ttBound = BoundExact
+                        || (ttBound = BoundLower && ttScore >= beta)
+                        || (ttBound = BoundUpper && ttScore <= alpha)
                     then
                         result <- ttScore
                         produced <- true
@@ -1367,7 +1496,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                 then
                     if useTt then
                         w.Control.Tt.Store
-                            pos.Key
+                            (ttKey pos)
                             (min (depthIn + 6) MaxSearchPly)
                             bound
                             (valueToTt tbValue ply)
@@ -1386,22 +1515,24 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                     else
                         tbMax <- tbValue
 
-        let ttCapture =
-            ttMove <> MoveNone && (pos.PieceOn(toSq ttMove) <> NoPiece || isEnPassant ttMove)
+        let ttCapture = ttMove <> MoveNone && isCaptureStage pos ttMove
 
         // 3. static eval (+ "improving": static eval higher than 2 plies ago — hoisted up so ProbCut/pruning
-        //    can read it; prunes less when our position is improving). `staticEval` is the CORRECTED value
-        //    (correction history) consumed by Stack/improving/pruning; `rawStaticEval` is what the TT store
-        //    persists (the unadjusted contract — the ttEval-reuse path above depends on it staying raw).
+        //    can read it; prunes less when our position is improving). `staticEval` is corrected,
+        //    `rawStaticEval` is Rule50-damped but uncorrected, and `ttStaticEval` is the pure evaluator
+        //    value persisted in the TT entry.
         let mutable staticEval = VALUE_NONE
         let mutable rawStaticEval = VALUE_NONE
+        let mutable ttStaticEval = VALUE_NONE
         let mutable improving = false
 
         if not produced then
-            rawStaticEval <-
-                if inCheck then VALUE_NONE
-                elif ttHit && ttEval <> VALUE_NONE then ttEval
-                else evalPos w pos
+            if not inCheck then
+                ttStaticEval <-
+                    if ttHit && ttEval <> VALUE_NONE then ttEval
+                    else evalRawPos w pos
+
+                rawStaticEval <- dampEval w pos ttStaticEval
 
             staticEval <-
                 if rawStaticEval <> VALUE_NONE && usePruning && cfg.UseCorrHist then
@@ -1435,9 +1566,9 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                     prev2 = VALUE_NONE || staticEval > prev2)
 
         // 3b. TT score as a better WORKING eval: a bound-consistent search score is tighter than the
-        //     heuristic static eval, so RFP/razoring/NMP below prune against it. Only this local —
-        //     Stack.StaticEval (already stored raw above), `improving`, the move-loop futility gate and
-        //     the TT store all keep the RAW eval (the unadjusted static-eval contract).
+        //     heuristic static eval, so RFP/razoring/NMP below prune against it. Only this local changes:
+        //     Stack.StaticEval and `improving` retain the node-local corrected/damped value, while the TT
+        //     store retains the Rule50-independent evaluator value.
         let mutable workingEval = staticEval
 
         if
@@ -1495,7 +1626,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                 w.Stack.[ssCur].CurrentMove <- MoveNull
                 w.Stack.[ssCur].MovedPiece <- NoPiece
                 pos.MakeNull()
-                w.Control.Tt.Prefetch pos.Key // child probes this exact key at entry
+                w.Control.Tt.Prefetch(ttKey pos) // child probes this exact key at entry
                 let v = -(negamax w pos (-beta) (-beta + 1) (depthIn - r) (ply + 1) false false)
                 pos.UnmakeNull()
 
@@ -1554,7 +1685,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                         w.Stack.[ssCur].CurrentMove <- pcMove
                         w.Stack.[ssCur].MovedPiece <- pos.PieceOn(fromSq pcMove)
                         pos.Make pcMove
-                        w.Control.Tt.Prefetch pos.Key // child probes this exact key at entry
+                        w.Control.Tt.Prefetch(ttKey pos) // child probes this exact key at entry
                         let mutable v = -(qsearch w pos (-probCutBeta) (-probCutBeta + 1) (ply + 1) 0)
 
                         if v >= probCutBeta then
@@ -1567,11 +1698,10 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                             if ttHit && ttDepth >= depthIn - 3 && ttScore <> VALUE_NONE && ttScore >= probCutBeta then
                                 result <- ttScore
                             else
-                                if useTt then
-                                    // rawStaticEval, NOT staticEval: every TT store persists the RAW eval (the
-                                    // contract at step 3 — the ttEval-reuse path re-applies correction history,
-                                    // so storing the corrected value here double-corrected on re-probe).
-                                    w.Control.Tt.Store pos.Key (depthIn - 3) BoundLower (valueToTt v ply) rawStaticEval pcMove false
+                                if useTt && not restrictedRoot then
+                                    // Persist the pure evaluator value. Rule50 damping and correction history
+                                    // are both re-applied for the probing node.
+                                    w.Control.Tt.Store (ttKey pos) (depthIn - 3) BoundLower (valueToTt v ply) ttStaticEval pcMove false
 
                                 result <- v
 
@@ -1659,23 +1789,42 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
             // Pawn history read gate (the table itself is EnsureAux-allocated in SetupRoot).
             mp.UsePawnHist <- cfg.UsePawnHist
 
-            // Policy sidecar hookup (UsePolicy is true only when UCI loaded one, so Net is Some too):
-            // hand the picker this ply's logit slices + the staleness slot; the fill itself stays lazy
-            // inside StgQuietInit. Exclusion re-searches share the slot — same ply, same position, same key.
+            // Threat-aware history: capture the node's enemy attack map ONCE, before the move loop
+            // mutates pos (scoring, LMR, history pruning and the cutoff updates all read it). Plain
+            // local (not mp.EnemyAttacks) for the Search-side reads — byref-like mp can't be captured.
+            let nodeEnemyAttacks =
+                if cfg.UseThreatHist then pos.AttacksBy(flipColor pos.SideToMove) else 0UL
+
+            let inline nodeThrIdx (mv: Move) : int =
+                (if testBit nodeEnemyAttacks (fromSq mv) then 2 else 0)
+                + (if testBit nodeEnemyAttacks (toSq mv) then 1 else 0)
+
+            if cfg.UseThreatHist then
+                mp.UseThreatHist <- true
+                mp.EnemyAttacks <- nodeEnemyAttacks
+
+            // Policy hookup: hand the picker this ply's logit slices + the staleness slot; the fill itself
+            // stays lazy inside StgQuietInit. Graph policy and sidecar policy share the same guarded arrays.
+            // Exclusion re-searches share the slot — same ply, same position, same key.
             // policyNodeKey = THIS node's key, captured before the move loop: at the LMR read site
             // pos.Make has already run, so pos.Key there is the CHILD's key and would never match.
             let policyNodeKey = pos.Key
+            let graphPolicyActive = graphPolicyHasInference w
 
-            if cfg.UsePolicy && (w.Control.Policy.IsSome || w.Control.OwnPolicy.IsSome) then
+            if graphPolicyActive || (cfg.UsePolicy && (w.Control.Policy.IsSome || w.Control.OwnPolicy.IsSome)) then
                 mp.PolFrom <- w.PolicyFrom.AsSpan(ply * Policy.HeadOut, Policy.HeadOut)
                 mp.PolTo <- w.PolicyTo.AsSpan(ply * Policy.HeadOut, Policy.HeadOut)
                 mp.PolKey <- w.PolicyKey.AsSpan(ply, 1)
 
+                if graphPolicyActive then
+                    mp.Graph <- w.Control.Graph.Value
+
                 match w.Control.OwnPolicy with
                 | Some onet -> mp.OwnNet <- onet
                 | None ->
-                    mp.PolNet <- w.Control.Policy.Value
-                    mp.ValNet <- w.Control.Net.Value
+                    if cfg.UsePolicy && w.Control.Policy.IsSome && w.Control.Net.IsSome then
+                        mp.PolNet <- w.Control.Policy.Value
+                        mp.ValNet <- w.Control.Net.Value
 
             if PosProf.Enabled then
                 PosProf.nNodesMain <- PosProf.nNodesMain + 1L
@@ -1703,7 +1852,6 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
             // Effort ACCOUNTING is decoupled from list-driven iteration (UseTmEffort wants the node
             // counts while the staged picker stays in charge); equals useRootList in legacy configs.
             let useRootEffort = ply = 0 && w.RootEffortActive && excludedMove = MoveNone
-            let rootAllowed = if ply = 0 then w.Control.Limits.SearchMoves else [||]
             let mutable rootIdx = 0
 
             // One-reply extension (UseOneReplyExt): in check with exactly one legal evasion the
@@ -1747,8 +1895,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                             + string (moveCount + w.RootPvIdx)
                         )
 
-                    let isQuiet =
-                        (pos.PieceOn(toSq m) = NoPiece) && not (isEnPassant m) && not (isPromotion m)
+                    let isQuiet = not (isCaptureStage pos m)
 
                     let givesCheck = pos.GivesCheck m
                     let mutable doMove = true
@@ -1773,7 +1920,8 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                         if isQuiet then
                             // late-move (move-count) pruning — stop trying quiets once deep into the list
                             if
-                                depth <= 8
+                                not (isPromotion m)
+                                && depth <= 8
                                 && moveCount >= (Tunables.LmpBase + depth * depth) / (if improving then 1 else 2)
                             then
                                 skipQuiets <- true
@@ -1781,19 +1929,27 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                             // history — a late quiet with very negative butterfly history. Per-move
                             // skip (NOT skipQuiets): the picker only partial-sorts quiets, so a worse
                             // quiet can precede a better one in the unsorted tail.
-                            elif cfg.UseHistoryPruning && lmrDepth <= 6 && moveCount > 3 then
+                            elif not (isPromotion m) && cfg.UseHistoryPruning && lmrDepth <= 6 && moveCount > 3 then
+                                let mainHist =
+                                    w.Tables.MainHistory us (fromTo m)
+                                    + (if cfg.UseThreatHist then
+                                           w.Tables.ThreatHistory us (nodeThrIdx m) (fromTo m)
+                                       else
+                                           0)
+
                                 let histBelow =
                                     if cfg.UseHistPruneCombined then
                                         let pc = pos.PieceOn(fromSq m)
-                                        let histSum = w.Tables.MainHistory us (fromTo m) + w.Tables.ContHistory1 prev1Pc prev1To pc (toSq m) + w.Tables.ContHistory2 prev2Pc prev2To pc (toSq m)
+                                        let histSum = mainHist + w.Tables.ContHistory1 prev1Pc prev1To pc (toSq m) + w.Tables.ContHistory2 prev2Pc prev2To pc (toSq m)
                                         histSum < -(Tunables.HistPruneCombinedBase + Tunables.HistPruneCombinedSlope * lmrDepth)
                                     else
-                                        w.Tables.MainHistory us (fromTo m) < -(Tunables.HistPruneBase + Tunables.HistPruneSlope * lmrDepth)
+                                        mainHist < -(Tunables.HistPruneBase + Tunables.HistPruneSlope * lmrDepth)
 
                                 if histBelow then doMove <- false
                             // futility — a quiet that can't lift alpha at shallow (reduced) depth
                             elif
                                 (not givesCheck)
+                                && not (isPromotion m)
                                 && lmrDepth <= 6
                                 && staticEval + Tunables.FutBase + Tunables.FutSlope * lmrDepth <= alpha
                             then
@@ -1805,6 +1961,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                             // lax threshold <= 0), so the second walk at the lax threshold is skipped entirely.
                             elif
                                 lmrDepth <= 7
+                                && not (isPromotion m)
                                 && (if givesCheck then
                                         see0Known <- true
                                         see0Val <- pos.SeeGe m 0
@@ -1902,7 +2059,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                         let effortStart = if useRootEffort then w.Nodes else 0L
 
                         pos.Make m
-                        w.Control.Tt.Prefetch pos.Key // child probes this exact key at entry
+                        w.Control.Tt.Prefetch(ttKey pos) // child probes this exact key at entry
 
                         if isQuiet then
                             if nQuiets < MaxMoves - 1 then
@@ -1938,7 +2095,7 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                                     if not improving then
                                         rr <- rr + 1
 
-                                    if not isQuiet then
+                                    if not isQuiet || isPromotion m then
                                         rr <- rr - 1
 
                                     // Richer LMR (gated; OFF => exactly the legacy reduction above). Net-REDUCING
@@ -1959,6 +2116,10 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
                                         let hist =
                                             w.Tables.MainHistory us (fromTo m)
+                                            + (if cfg.UseThreatHist then
+                                                   w.Tables.ThreatHistory us (nodeThrIdx m) (fromTo m)
+                                               else
+                                                   0)
                                             + w.Tables.ContHistory1 prev1Pc prev1To pc (toSq m)
                                             + w.Tables.ContHistory2 prev2Pc prev2To pc (toSq m)
                                             + (if cfg.UseCont4 then
@@ -1967,8 +2128,21 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                                                else
                                                    0)
 
-                                        if hist < Tunables.LmrHistThresh then
+                                        if cfg.UseLmrHistCont then
+                                            // LMR2 continuous scaling: replaces the threshold step.
+                                            // Signed — strong history also REDUCES the reduction,
+                                            // deliberately revisiting the house r-1 finding under SPRT.
+                                            rr <- rr - hist / Tunables.LmrHist2Div
+                                        elif hist < Tunables.LmrHistThresh then
                                             rr <- rr + 1
+
+                                    // LMR2 cutoff-count: this node's children already refuted >N
+                                    // siblings — expect more cutoffs, search the tail shallower.
+                                    if
+                                        cfg.UseLmrCutCnt
+                                        && w.CutoffCnt.[ply + 1] > Tunables.LmrCutCntThresh
+                                    then
+                                        rr <- rr + 1
 
                                     // Policy LMR (v1 consumption, Phase-0 re-scope): one extra reduction
                                     // step for quiets the policy head scores below PolLmrThresh. Reads
@@ -1976,7 +2150,12 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                                     // position (Zobrist guard) — refutation-stage quiets emitted before
                                     // StgQuietInit see a stale slot and are left alone. Net-REDUCING only
                                     // (the house LMR finding: r-1 variants cascade re-searches).
-                                    if cfg.UsePolicy && isQuiet && w.PolicyKey.[ply] = policyNodeKey then
+                                    if
+                                        (cfg.UsePolicy || graphPolicyActive)
+                                        && isQuiet
+                                        && not (isPromotion m)
+                                        && w.PolicyKey.[ply] = policyNodeKey
+                                    then
                                         // EONPOL02 logit index = moverPieceType*64 + relSq. pos.Make
                                         // already ran here, so the mover comes from the search stack,
                                         // not the (child) board.
@@ -2008,7 +2187,23 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                             v <- -(negamax w pos (-alpha - 1) (-alpha) (newDepth - r) (ply + 1) false true)
 
                             if v > alpha && r > 0 then
-                                v <- -(negamax w pos (-alpha - 1) (-alpha) newDepth (ply + 1) false (not cutNode))
+                                // LMR2 doDeeper/doShallower: a scout that cleared best by a wide
+                                // margin earns one extra ply on the verification; one that barely
+                                // cleared it gives a ply back (skipping the re-search entirely when
+                                // that lands on the scout depth). OFF => legacy full-depth re-scout.
+                                let scoutDepth = newDepth - r
+
+                                if cfg.UseLmrDeeper then
+                                    newDepth <-
+                                        if v > best + Tunables.LmrDeeperBase + Tunables.LmrDeeperMul * r then
+                                            newDepth + 1
+                                        elif v < best + Tunables.LmrShallowMargin then
+                                            max 1 (newDepth - 1)
+                                        else
+                                            newDepth
+
+                                if newDepth > scoutDepth then
+                                    v <- -(negamax w pos (-alpha - 1) (-alpha) newDepth (ply + 1) false (not cutNode))
 
                             if v > alpha && v < beta then
                                 v <- -(negamax w pos (-beta) (-alpha) newDepth (ply + 1) isPv false)
@@ -2047,6 +2242,10 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
                             if alpha >= beta then
                                 cutoff <- true
+
+                                // LMR2 cutoff-count: report this cutoff to the parent's counter slot.
+                                if cfg.UseLmrCutCnt then
+                                    w.CutoffCnt.[ply] <- w.CutoffCnt.[ply] + 1
 
                                 // Phase-0 policy-viability: classify the cutting move. Only the
                                 // "non-refutation quiet" bucket is addressable by a policy ordering
@@ -2105,7 +2304,11 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
 
                                     if isQuiet then
                                         let mPc = pos.PieceOn(fromSq m)
+
                                         w.Tables.UpdateMain us m bonus
+
+                                        if cfg.UseThreatHist then
+                                            w.Tables.UpdateThreatMain us (nodeThrIdx m) m bonus
                                         w.Tables.UpdateCont1 prev1Pc prev1To mPc (toSq m) bonus
                                         w.Tables.UpdateCont2 prev2Pc prev2To mPc (toSq m) bonus
 
@@ -2118,7 +2321,11 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                                         for qi in 0 .. nQuiets - 2 do
                                             let q = quietsBuf.[quietsBase + qi]
                                             let qPc = pos.PieceOn(fromSq q)
+
                                             w.Tables.UpdateMain us q (-malus)
+
+                                            if cfg.UseThreatHist then
+                                                w.Tables.UpdateThreatMain us (nodeThrIdx q) q (-malus)
                                             w.Tables.UpdateCont1 prev1Pc prev1To qPc (toSq q) (-malus)
                                             w.Tables.UpdateCont2 prev2Pc prev2To qPc (toSq q) (-malus)
 
@@ -2138,24 +2345,14 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                                         then
                                             w.Tables.SetCounter prevPiece (toSq prevMove) m
                                     else
-                                        let capPt =
-                                            if isEnPassant m then
-                                                Pawn
-                                            else
-                                                pieceType (pos.PieceOn(toSq m))
-
-                                        w.Tables.UpdateCapture (pos.PieceOn(fromSq m)) (toSq m) capPt bonus
+                                        let victim = captureHistorySlot pos m
+                                        w.Tables.UpdateCapture (pos.PieceOn(fromSq m)) (toSq m) victim bonus
 
                                         for ci in 0 .. nCaptures - 2 do
                                             let c = capturesBuf.[capturesBase + ci]
 
-                                            let cCapPt =
-                                                if isEnPassant c then
-                                                    Pawn
-                                                else
-                                                    pieceType (pos.PieceOn(toSq c))
-
-                                            w.Tables.UpdateCapture (pos.PieceOn(fromSq c)) (toSq c) cCapPt (-malus)
+                                            let victim = captureHistorySlot pos c
+                                            w.Tables.UpdateCapture (pos.PieceOn(fromSq c)) (toSq c) victim (-malus)
 
                 m <-
                     if cutoff then
@@ -2176,13 +2373,19 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                 // only move -> report a fail-low so the caller treats it as singular (don't store).
                 result <- (if excludedMove <> MoveNone then alpha elif inCheck then -MATE + ply else 0)
             else
-                if useTt && not multicut && not (pollStop w) && excludedMove = MoveNone then
+                if
+                    useTt
+                    && not restrictedRoot
+                    && not multicut
+                    && not (pollStop w)
+                    && excludedMove = MoveNone
+                then
                     let bound =
                         if best <= alphaIn then BoundUpper
                         elif best >= beta then BoundLower
                         else BoundExact
 
-                    w.Control.Tt.Store pos.Key depth bound (valueToTt best ply) rawStaticEval bestMove ttPv
+                    w.Control.Tt.Store (ttKey pos) depth bound (valueToTt best ply) ttStaticEval bestMove ttPv
 
                 // Correction history: teach the table this pawn structure's persistent eval error. Only
                 // when the result is eval-like (not in check, best move not a capture) and the bound
@@ -2193,11 +2396,12 @@ let rec negamax (w: Worker) (pos: Position) (alphaIn: int) (betaIn: int) (depthI
                     && cfg.UseCorrHist
                     && not multicut
                     && not inCheck
+                    && not restrictedRoot
                     && excludedMove = MoveNone
                     && not (pollStop w)
                     && rawStaticEval <> VALUE_NONE
                     && (bestMove = MoveNone
-                        || (pos.PieceOn(toSq bestMove) = NoPiece && not (isEnPassant bestMove)))
+                        || (not (isCaptureStage pos bestMove) && not (isPromotion bestMove)))
                     && not (best >= beta && best <= staticEval)
                     && not (bestMove = MoveNone && best >= staticEval)
                 then
@@ -2330,7 +2534,7 @@ let private reportLine (w: Worker) (depth: int) (pvNum: int) (score: int) (bound
                 ok <- false
 
         while ok && nMade < matePlies && nMade < MaxSearchPly - 1 do
-            let struct (hit, m, _, _, _, _, _) = w.Control.Tt.Probe pos.Key
+            let struct (hit, m, _, _, _, _, _) = w.Control.Tt.Probe(ttKey pos)
 
             if hit && isLegalRoot pos m then
                 sb.Append(' ').Append(toUCI m) |> ignore
@@ -2378,11 +2582,13 @@ let tmEffortPct (bestFracPct: int) : int =
 
 let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
     let cfg = w.Control.Config
+    let allowedRootMoves = w.Control.Limits.SearchMoves
+    let allowedRootCount = countAllowedRootMoves w.Pos allowedRootMoves
     // MultiPV: only the main worker searches extra lines (they exist purely for reporting); helpers stay
-    // single-PV. Clamped to the number of legal root moves so every line has a distinct best move.
+    // single-PV. Clamp to the active root domain, not every legal move outside `searchmoves`.
     let multiPv =
         if w.IsMain && cfg.MultiPv > 1 then
-            max 1 (min cfg.MultiPv (countLegalMoves w.Pos))
+            max 1 (min cfg.MultiPv allowedRootCount)
         else
             1
 
@@ -2683,7 +2889,22 @@ let iterativeDeepening (w: Worker) (maxDepth: int) : unit =
                 for k in 0 .. multiPv - 1 do
                     reportLine w depth (k + 1) lineScores.[k] "" linePvs (k * MaxSearchPly) lineMoves.[k]
 
-            // NO self-stop on a mate score (removed 2026-07-05). A mate at depth d does NOT preclude
+            // A standalone `go mate N` is the one mate-score self-stop contract: once the main search
+            // proves a mate within the requested move bound, the command is satisfied even when DFPN is
+            // disabled or its checks-only tree cannot prove the line. Infinite/ponder protocol wins when
+            // explicitly combined with it.
+            if
+                w.IsMain
+                && w.Control.Limits.Mate > 0
+                && not w.Control.Limits.Infinite
+                && not w.Control.Limits.Ponder
+                && lineScores.[0] >= MATE_IN_MAX_PLY
+                && MATE - lineScores.[0] <= 2 * w.Control.Limits.Mate - 1
+            then
+                w.Control.Stop()
+
+            // Normal timed/depth/infinite searches do not self-stop on a mate score. A mate at depth d
+            // does NOT preclude
             // a SHORTER mate found deeper: zugzwang nets hide quick mates behind reduced quiet moves,
             // and refinement can need nominal depth FAR beyond the mate length (the reference engine
             // needed d240+ to converge mate-13 -> mate-8 on rk6/p7/P1pN4/K1N5/8/8/2P5/8 w — a
@@ -2807,7 +3028,8 @@ let computeTimes (moveOverhead: int) (mtgHarden: bool) (l: SearchLimits) (stm: C
 /// completed at least one iteration; each contributes (score − minScore + 40) × depth to its move's
 /// tally. Deterministic: ties prefer the first-encountered move, then the deepest voter for the winning
 /// move, then the higher score, then the lowest worker index. Mate override: a voter holding a proven
-/// mate wins outright (deepest proof = highest score) — consensus must not outvote a proof.
+/// win or loss wins outright — consensus must not outvote a proof. Highest score selects the shortest
+/// win or, when every proof is negative, the longest survival.
 /// Pure over parallel arrays so tests can drive it without workers (cold path; runs once per `go`).
 let internal voteBest (moves: Move[]) (scores: int[]) (depths: int[]) (n: int) : int =
     let inline isVoter i = depths.[i] > 0 && moves.[i] <> MoveNone
@@ -2815,7 +3037,11 @@ let internal voteBest (moves: Move[]) (scores: int[]) (depths: int[]) (n: int) :
     let mutable mate = -1
 
     for i in 0 .. n - 1 do
-        if isVoter i && scores.[i] >= MATE_IN_MAX_PLY && (mate < 0 || scores.[i] > scores.[mate]) then
+        if
+            isVoter i
+            && abs scores.[i] >= MATE_IN_MAX_PLY
+            && (mate < 0 || scores.[i] > scores.[mate])
+        then
             mate <- i
 
     if mate >= 0 then
@@ -3113,6 +3339,27 @@ let private goCore (control: SearchControl) (workers: Worker[]) : Move =
         histLine "prof5 cutQuietIdx" PosProf.CutQuietIdx
         histLine "prof6 quietInitDepth" PosProf.QuietInitByDepth
 
+        // Track 1 Step 2 (2026-07-19): walk-length histogram sizes Step 4's chain coalescing;
+        // barrier causes size the refresh traffic; the ft/policy counters size Step 5's FT cache.
+        // canonMs/cancel*/coalFb belong to Steps 3-4 and stay 0 until those land.
+        histLine "prof7 walkLen" PosProf.WalkLen
+
+        writeLine (
+            "info string prof8 barrKing=" + string PosProf.nBarrierKing
+            + " barrOvf=" + string PosProf.nBarrierOverflow
+            + " barrRoot=" + string PosProf.nBarrierRoot
+            + " nFt=" + string PosProf.nFtCompute
+            + " ftHit=" + string PosProf.nFtCacheHit
+            + " ftPolicy=" + string PosProf.nFtPolicy
+            + " transformMs=" + ms PosProf.tTransform
+            + " policyMs=" + ms PosProf.tPolicy
+            + " canonMs=" + ms PosProf.tCanon
+            + " coalMs=" + ms PosProf.tCoalesce
+            + " cancelHalf=" + string PosProf.nCancelHalf
+            + " cancelThr=" + string PosProf.nCancelThr
+            + " coalFb=" + string PosProf.nCoalesceFallback
+        )
+
     // Thread vote (single-PV only): helpers' completed-iteration results outvote the main worker when
     // a deeper/better-scoring consensus exists. MultiPV's bestmove must match the main worker's
     // reported line 1 — it keeps the legacy worker-0 selection. n = 1 bypass keeps the single-thread
@@ -3128,11 +3375,13 @@ let private goCore (control: SearchControl) (workers: Worker[]) : Move =
 
     let rb = chosen.RootBest
 
+    let allowedRootMoves = control.Limits.SearchMoves
+
     let searchBest =
-        if isLegalRoot workers.[0].Pos rb then
+        if isAllowedRootMove workers.[0].Pos allowedRootMoves rb then
             rb
         else
-            firstLegalMove workers.[0].Pos
+            firstAllowedRootMove workers.[0].Pos allowedRootMoves
 
     // df-pn override: a VERIFIED checks-only mate beats anything except an equal-or-shorter mate
     // the search itself proved (voteBest already prefers search-found mates among voters). The
@@ -3142,7 +3391,7 @@ let private goCore (control: SearchControl) (workers: Worker[]) : Move =
 
     let DFPNWins =
         DFPNHas
-        && isLegalRoot workers.[0].Pos DFPNMove
+        && isAllowedRootMove workers.[0].Pos allowedRootMoves DFPNMove
         && not (chosen.RootScore >= MATE_IN_MAX_PLY && MATE - chosen.RootScore <= DFPNPlies)
 
     let best = if DFPNWins then DFPNMove else searchBest

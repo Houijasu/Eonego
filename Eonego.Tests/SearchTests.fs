@@ -153,6 +153,74 @@ let ``TT-on score equals TT-off score at fixed depth (pruning off)`` (fen: strin
     Assert.Equal(s1, s2)
 
 [<Fact>]
+let ``rule50 counter participates in the search-table key`` () =
+    let low = Position.OfFen "8/8/4k3/8/8/4K3/8/Q7 w - - 0 1"
+    let highFen = "8/8/4k3/8/8/4K3/8/Q7 w - - 80 1"
+
+    let cfg =
+        { defaultConfig with
+            UseTt = true
+            UseQsTt = true
+            UsePruning = false
+            UseQsChecks = true
+            UseRetro = false }
+
+    let high = makeWorker highFen cfg
+    Assert.Equal(low.Key, high.Pos.Key) // repetition identity deliberately ignores the halfmove clock
+    Assert.NotEqual(ttKey low, ttKey high.Pos)
+
+    // Seed an exact qsearch score for the low-counter position. A null-window probe at the same board
+    // with a different draw horizon must miss it rather than return this impossible sentinel score.
+    high.Control.Tt.Store (ttKey low) DepthQsCaptures BoundExact 777 VALUE_NONE MoveNone false
+    Assert.Equal(0, qsearch high high.Pos 0 1 0 0)
+
+[<Fact>]
+let ``TT search data is isolated by the rule50 counter`` () =
+    match tryLoadNet () with
+    | None -> ()
+    | Some net ->
+        let lowFen = "8/8/4k3/8/8/4K3/8/Q7 w - - 0 1"
+        let highFen = "8/8/4k3/8/8/4K3/8/Q7 w - - 80 1"
+
+        let cfg =
+            { defaultConfig with
+                UseTt = true
+                UseQsTt = true
+                UsePruning = false
+                UseTtEvalAdjust = false
+                UseCorrHist = false
+                UseR50Damp = true
+                UseRetro = false
+                UseSyzygy = false }
+
+        let tt = TranspositionTable(1)
+
+        let makeAt (fen: string) =
+            let control =
+                SearchControl(cfg, defaultLimits, tt, fen, [||], ?net = Some net)
+
+            control.Reset()
+            control.NewSearch()
+            let w = Worker(0, true, control)
+            w.SetupRoot()
+            control.StartClock 0L 0L
+            w
+
+        let low = makeAt lowFen
+        let lowEval = evalPos low low.Pos
+        Assert.Equal(lowEval, qsearch low low.Pos (-INF) INF 0 0)
+
+        let high = makeAt highFen
+        let highEval = evalPos high high.Pos
+        Assert.Equal(low.Pos.Key, high.Pos.Key)
+        Assert.NotEqual(ttKey low.Pos, ttKey high.Pos)
+        Assert.NotEqual(lowEval, highEval) // guard: this fixture must exercise damping
+
+        // A null-window node is eligible for an exact TT cutoff. Without the TT-specific rule50 key,
+        // this returns lowEval directly even though the current draw horizon and damped eval differ.
+        Assert.Equal(highEval, qsearch high high.Pos (highEval - 1) highEval 0 0)
+
+[<Fact>]
 let ``search survives a game history longer than the accumulator stack`` () =
     // Regression: SetupRoot bound NNUE before replaying `position ... moves`, so a history longer than
     // AccMaxPly (256) overflowed the accumulator frame stack (IndexOutOfRange crash in long GUI/match
@@ -191,6 +259,59 @@ let ``mate in two is found with the correct ply-adjusted score`` () =
     Assert.True(score >= MATE_IN_MAX_PLY)
     Assert.Equal(MATE - 3, score)
     Assert.NotEqual(MoveNone, m)
+
+[<Fact>]
+let ``mate search stops after proving a mate inside the requested bound`` () =
+    let fen = "k7/8/1K6/8/8/8/8/7R w - - 0 1"
+
+    let cfg =
+        { defaultConfig with
+            Threads = 1
+            UseRetro = false
+            UseSyzygy = false
+            UseDFPN = false }
+
+    let limits = { defaultLimits with Mate = 1 }
+    let control = SearchControl(cfg, limits, TranspositionTable(1), fen, [||])
+    control.Reset()
+    control.NewSearch()
+    let w = Worker(0, true, control)
+    w.SetupRoot()
+    control.NodeSum <- (fun () -> w.Nodes)
+    control.TbHitSum <- (fun () -> w.TbHits)
+    control.StartClock 0L 0L
+
+    // Eight is only a test guard. go mate 1 should stop immediately after depth 1 proves Rh8#,
+    // rather than treating Mate as an untimed request and exhausting the caller's maximum depth.
+    iterativeDeepening w 8
+    Assert.Equal(MATE - 1, w.RootScore)
+    Assert.Equal("h1h8", toUCI w.RootBest)
+    Assert.Equal(1, w.CompletedDepth)
+
+[<Fact>]
+let ``mate limit does not end an explicitly infinite search`` () =
+    let fen = "k7/8/1K6/8/8/8/8/7R w - - 0 1"
+
+    let cfg =
+        { defaultConfig with
+            Threads = 1
+            UseRetro = false
+            UseSyzygy = false
+            UseDFPN = false }
+
+    let limits = { defaultLimits with Mate = 1; Infinite = true }
+    let control = SearchControl(cfg, limits, TranspositionTable(1), fen, [||])
+    control.Reset()
+    control.NewSearch()
+    let w = Worker(0, true, control)
+    w.SetupRoot()
+    control.NodeSum <- (fun () -> w.Nodes)
+    control.TbHitSum <- (fun () -> w.TbHits)
+    control.StartClock 0L 0L
+
+    iterativeDeepening w 2
+    Assert.Equal(2, w.CompletedDepth)
+    Assert.False(control.Stopped)
 
 [<Fact>]
 let ``qsearch on a quiet position equals static eval`` () =
