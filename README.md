@@ -140,7 +140,8 @@ MIT — see [LICENSE](LICENSE).
 ## Status
 
 Actively developed; strength is tracked through SPRT self-play against earlier versions. Current
-release is **0.1.1**. Since 0.1.0, the previously experimental search features — DFPN, the policy
+release is **0.1.2**, which is throughput-only over 0.1.1 (NNUE accumulator kernel tuning; node
+counts are byte-identical). Since 0.1.0, the previously experimental search features — DFPN, the policy
 head, the dynamic time-management components, and the extended history/correction terms — are
 enabled by default, each still individually disableable through its `EONEGO_*` environment
 variable. These defaults are pre-SPRT and under validation; the time manager also reserves a small

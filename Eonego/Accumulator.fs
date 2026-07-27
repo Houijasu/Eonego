@@ -649,6 +649,15 @@ let private applyFusedPass
         // 16-ymm budget. Bit-exact: identical per-lane arithmetic, only the tiling changed.
         // Base-ref + element-offset loads/stores skip the bounds checks the JIT can't elide on runtime
         // offsets; the small index lists use ordinary bounds-checked access (n <= 128, negligible).
+        //
+        // Row-byref hoist (2026-07-27): each row's 8 loads go through ONE `Unsafe.Add` byref, with the
+        // 0/16/.../112 element offsets as compile-time constants. Passing `base + rb + k` as a runtime
+        // int offset made the JIT recompute the address per load and emit a `lea`/`movsxd` pair each time
+        // (int32 index -> sign-extend -> scale), i.e. 16 extra scalar uops per row on top of 8 loads.
+        // With the byref hoisted, the constants fold into the addressing-mode displacement and the whole
+        // row is 1 `lea` + 8 `vpaddw ymm, ymm, [reg+disp]` (verified in the JitDisasm listing).
+        // Interleaved bench-13 A/B, 40 pairs pooled: won 26/40, median +5.3% nps, geomean +3.9%.
+        // Bit-exact by construction: same addresses, same order, only the address computation changed.
         let srcBase = &MemoryMarshal.GetArrayDataReference srcAcc
         let dstBase = &MemoryMarshal.GetArrayDataReference dstAcc
         let hwBase = &MemoryMarshal.GetArrayDataReference halfW
@@ -668,57 +677,57 @@ let private applyFusedPass
             let mutable k = 0
 
             while k < haN do
-                let rb = hwOff + halfAdd.[haOff + k] * L1 + t
-                a0 <- Avx2.Add(a0, Vector256.LoadUnsafe(&hwBase, unativeint rb))
-                a1 <- Avx2.Add(a1, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 16)))
-                a2 <- Avx2.Add(a2, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 32)))
-                a3 <- Avx2.Add(a3, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 48)))
-                a4 <- Avx2.Add(a4, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 64)))
-                a5 <- Avx2.Add(a5, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 80)))
-                a6 <- Avx2.Add(a6, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 96)))
-                a7 <- Avx2.Add(a7, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 112)))
+                let r = &Unsafe.Add(&hwBase, nativeint (hwOff + halfAdd.[haOff + k] * L1 + t))
+                a0 <- Avx2.Add(a0, Vector256.LoadUnsafe(&r, 0un))
+                a1 <- Avx2.Add(a1, Vector256.LoadUnsafe(&r, 16un))
+                a2 <- Avx2.Add(a2, Vector256.LoadUnsafe(&r, 32un))
+                a3 <- Avx2.Add(a3, Vector256.LoadUnsafe(&r, 48un))
+                a4 <- Avx2.Add(a4, Vector256.LoadUnsafe(&r, 64un))
+                a5 <- Avx2.Add(a5, Vector256.LoadUnsafe(&r, 80un))
+                a6 <- Avx2.Add(a6, Vector256.LoadUnsafe(&r, 96un))
+                a7 <- Avx2.Add(a7, Vector256.LoadUnsafe(&r, 112un))
                 k <- k + 1
 
             k <- 0
 
             while k < hsN do
-                let rb = hwOff + halfSub.[hsOff + k] * L1 + t
-                a0 <- Avx2.Subtract(a0, Vector256.LoadUnsafe(&hwBase, unativeint rb))
-                a1 <- Avx2.Subtract(a1, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 16)))
-                a2 <- Avx2.Subtract(a2, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 32)))
-                a3 <- Avx2.Subtract(a3, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 48)))
-                a4 <- Avx2.Subtract(a4, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 64)))
-                a5 <- Avx2.Subtract(a5, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 80)))
-                a6 <- Avx2.Subtract(a6, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 96)))
-                a7 <- Avx2.Subtract(a7, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 112)))
+                let r = &Unsafe.Add(&hwBase, nativeint (hwOff + halfSub.[hsOff + k] * L1 + t))
+                a0 <- Avx2.Subtract(a0, Vector256.LoadUnsafe(&r, 0un))
+                a1 <- Avx2.Subtract(a1, Vector256.LoadUnsafe(&r, 16un))
+                a2 <- Avx2.Subtract(a2, Vector256.LoadUnsafe(&r, 32un))
+                a3 <- Avx2.Subtract(a3, Vector256.LoadUnsafe(&r, 48un))
+                a4 <- Avx2.Subtract(a4, Vector256.LoadUnsafe(&r, 64un))
+                a5 <- Avx2.Subtract(a5, Vector256.LoadUnsafe(&r, 80un))
+                a6 <- Avx2.Subtract(a6, Vector256.LoadUnsafe(&r, 96un))
+                a7 <- Avx2.Subtract(a7, Vector256.LoadUnsafe(&r, 112un))
                 k <- k + 1
 
             k <- 0
 
             while k < taN do
-                let rb = twOff + thrAdd.[taOff + k] * L1 + t
-                a0 <- Avx2.Add(a0, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint rb)))
-                a1 <- Avx2.Add(a1, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 16))))
-                a2 <- Avx2.Add(a2, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 32))))
-                a3 <- Avx2.Add(a3, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 48))))
-                a4 <- Avx2.Add(a4, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 64))))
-                a5 <- Avx2.Add(a5, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 80))))
-                a6 <- Avx2.Add(a6, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 96))))
-                a7 <- Avx2.Add(a7, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 112))))
+                let r = &Unsafe.Add(&twBase, nativeint (twOff + thrAdd.[taOff + k] * L1 + t))
+                a0 <- Avx2.Add(a0, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&r, 0un)))
+                a1 <- Avx2.Add(a1, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&r, 16un)))
+                a2 <- Avx2.Add(a2, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&r, 32un)))
+                a3 <- Avx2.Add(a3, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&r, 48un)))
+                a4 <- Avx2.Add(a4, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&r, 64un)))
+                a5 <- Avx2.Add(a5, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&r, 80un)))
+                a6 <- Avx2.Add(a6, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&r, 96un)))
+                a7 <- Avx2.Add(a7, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&r, 112un)))
                 k <- k + 1
 
             k <- 0
 
             while k < tsN do
-                let rb = twOff + thrSub.[tsOff + k] * L1 + t
-                a0 <- Avx2.Subtract(a0, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint rb)))
-                a1 <- Avx2.Subtract(a1, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 16))))
-                a2 <- Avx2.Subtract(a2, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 32))))
-                a3 <- Avx2.Subtract(a3, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 48))))
-                a4 <- Avx2.Subtract(a4, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 64))))
-                a5 <- Avx2.Subtract(a5, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 80))))
-                a6 <- Avx2.Subtract(a6, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 96))))
-                a7 <- Avx2.Subtract(a7, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 112))))
+                let r = &Unsafe.Add(&twBase, nativeint (twOff + thrSub.[tsOff + k] * L1 + t))
+                a0 <- Avx2.Subtract(a0, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&r, 0un)))
+                a1 <- Avx2.Subtract(a1, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&r, 16un)))
+                a2 <- Avx2.Subtract(a2, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&r, 32un)))
+                a3 <- Avx2.Subtract(a3, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&r, 48un)))
+                a4 <- Avx2.Subtract(a4, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&r, 64un)))
+                a5 <- Avx2.Subtract(a5, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&r, 80un)))
+                a6 <- Avx2.Subtract(a6, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&r, 96un)))
+                a7 <- Avx2.Subtract(a7, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&r, 112un)))
                 k <- k + 1
 
             Vector256.StoreUnsafe(a0, &dstBase, unativeint (dstOff + t))
