@@ -750,23 +750,50 @@ let private applyFusedPass
 
             dstAcc.[dstOff + j] <- int16 s
 
-    // PSQT: 8 int32 buckets = one pass (scalar; trivially cheap next to the L1 body).
-    for b in 0 .. PsqtBuckets - 1 do
-        let mutable s = srcPsq.[srcPsqOff + b]
+    // PSQT: PsqtBuckets (8) int32 buckets.
+    if useAvx2 then
+        // Row-outer / bucket-inner via one ymm (2026-07-27). The scalar form below is bucket-outer, so it
+        // re-walks the WHOLE row list once per bucket: ~8x the index-list reads, ~8x the bounds checks, and
+        // a stride-8 scattered load per (row, bucket). PsqtBuckets = 8 int32 = 32 B = exactly one
+        // Vector256<int>, and a row's buckets are contiguous, so one row is one vector load and the whole
+        // tail collapses to ~one load+add per row. Bit-exact: same per-lane values in the same accumulation
+        // order (add-block then sub-block, halves then threats); only the loop nesting changed.
+        let hpBase = &MemoryMarshal.GetArrayDataReference halfPsqt
+        let tpBase = &MemoryMarshal.GetArrayDataReference thrPsqt
+        let spBase = &MemoryMarshal.GetArrayDataReference srcPsq
+        let dpBase = &MemoryMarshal.GetArrayDataReference dstPsq
+        let mutable p = Vector256.LoadUnsafe(&spBase, unativeint srcPsqOff)
 
         for k in 0 .. haN - 1 do
-            s <- s + halfPsqt.[halfAdd.[haOff + k] * PsqtBuckets + b]
+            p <- Avx2.Add(p, Vector256.LoadUnsafe(&hpBase, unativeint (halfAdd.[haOff + k] * PsqtBuckets)))
 
         for k in 0 .. hsN - 1 do
-            s <- s - halfPsqt.[halfSub.[hsOff + k] * PsqtBuckets + b]
+            p <- Avx2.Subtract(p, Vector256.LoadUnsafe(&hpBase, unativeint (halfSub.[hsOff + k] * PsqtBuckets)))
 
         for k in 0 .. taN - 1 do
-            s <- s + thrPsqt.[thrAdd.[taOff + k] * PsqtBuckets + b]
+            p <- Avx2.Add(p, Vector256.LoadUnsafe(&tpBase, unativeint (thrAdd.[taOff + k] * PsqtBuckets)))
 
         for k in 0 .. tsN - 1 do
-            s <- s - thrPsqt.[thrSub.[tsOff + k] * PsqtBuckets + b]
+            p <- Avx2.Subtract(p, Vector256.LoadUnsafe(&tpBase, unativeint (thrSub.[tsOff + k] * PsqtBuckets)))
 
-        dstPsq.[dstPsqOff + b] <- s
+        Vector256.StoreUnsafe(p, &dpBase, unativeint dstPsqOff)
+    else
+        for b in 0 .. PsqtBuckets - 1 do
+            let mutable s = srcPsq.[srcPsqOff + b]
+
+            for k in 0 .. haN - 1 do
+                s <- s + halfPsqt.[halfAdd.[haOff + k] * PsqtBuckets + b]
+
+            for k in 0 .. hsN - 1 do
+                s <- s - halfPsqt.[halfSub.[hsOff + k] * PsqtBuckets + b]
+
+            for k in 0 .. taN - 1 do
+                s <- s + thrPsqt.[thrAdd.[taOff + k] * PsqtBuckets + b]
+
+            for k in 0 .. tsN - 1 do
+                s <- s - thrPsqt.[thrSub.[tsOff + k] * PsqtBuckets + b]
+
+            dstPsq.[dstPsqOff + b] <- s
 
 /// Fused frame apply (see the section comment). Row lists larger than `FusedMaxRowsPerPass` in total are
 /// split: the first pass reads src and writes dst, the remaining passes run in place on dst. Order-of-
