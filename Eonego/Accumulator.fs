@@ -641,8 +641,12 @@ let private applyFusedPass
             Vector512.StoreUnsafe(a3, &dstBase, unativeint (dstOff + t + 96))
             t <- t + 128
     elif useAvx2 then
-        // 4-ymm tile (64 int16) x 16 tiles; the tile lives in registers while every row's chunk streams
-        // through (proven-safe register budget — mirrors the fc0 GEMV 4-accumulator blocking in NNUE.fs).
+        // 8-ymm tile (128 int16) x 8 tiles; the tile lives in registers while every row's chunk streams
+        // through (mirrors the fc0 GEMV accumulator blocking in NNUE.fs and the AVX-512 path's 128-lane tile).
+        // Widened from 4 ymm / 64 lanes (2026-07-27): the row lists are re-walked once per TILE, so halving
+        // the tile count halves the index-list reloads, the row-base address math, and the loop overhead —
+        // the per-row work that does NOT scale with tile width. 8 accumulators + 1 weight temp fits the
+        // 16-ymm budget. Bit-exact: identical per-lane arithmetic, only the tiling changed.
         // Base-ref + element-offset loads/stores skip the bounds checks the JIT can't elide on runtime
         // offsets; the small index lists use ordinary bounds-checked access (n <= 128, negligible).
         let srcBase = &MemoryMarshal.GetArrayDataReference srcAcc
@@ -656,6 +660,10 @@ let private applyFusedPass
             let mutable a1 = Vector256.LoadUnsafe(&srcBase, unativeint (srcOff + t + 16))
             let mutable a2 = Vector256.LoadUnsafe(&srcBase, unativeint (srcOff + t + 32))
             let mutable a3 = Vector256.LoadUnsafe(&srcBase, unativeint (srcOff + t + 48))
+            let mutable a4 = Vector256.LoadUnsafe(&srcBase, unativeint (srcOff + t + 64))
+            let mutable a5 = Vector256.LoadUnsafe(&srcBase, unativeint (srcOff + t + 80))
+            let mutable a6 = Vector256.LoadUnsafe(&srcBase, unativeint (srcOff + t + 96))
+            let mutable a7 = Vector256.LoadUnsafe(&srcBase, unativeint (srcOff + t + 112))
 
             let mutable k = 0
 
@@ -665,6 +673,10 @@ let private applyFusedPass
                 a1 <- Avx2.Add(a1, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 16)))
                 a2 <- Avx2.Add(a2, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 32)))
                 a3 <- Avx2.Add(a3, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 48)))
+                a4 <- Avx2.Add(a4, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 64)))
+                a5 <- Avx2.Add(a5, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 80)))
+                a6 <- Avx2.Add(a6, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 96)))
+                a7 <- Avx2.Add(a7, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 112)))
                 k <- k + 1
 
             k <- 0
@@ -675,6 +687,10 @@ let private applyFusedPass
                 a1 <- Avx2.Subtract(a1, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 16)))
                 a2 <- Avx2.Subtract(a2, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 32)))
                 a3 <- Avx2.Subtract(a3, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 48)))
+                a4 <- Avx2.Subtract(a4, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 64)))
+                a5 <- Avx2.Subtract(a5, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 80)))
+                a6 <- Avx2.Subtract(a6, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 96)))
+                a7 <- Avx2.Subtract(a7, Vector256.LoadUnsafe(&hwBase, unativeint (rb + 112)))
                 k <- k + 1
 
             k <- 0
@@ -685,6 +701,10 @@ let private applyFusedPass
                 a1 <- Avx2.Add(a1, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 16))))
                 a2 <- Avx2.Add(a2, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 32))))
                 a3 <- Avx2.Add(a3, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 48))))
+                a4 <- Avx2.Add(a4, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 64))))
+                a5 <- Avx2.Add(a5, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 80))))
+                a6 <- Avx2.Add(a6, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 96))))
+                a7 <- Avx2.Add(a7, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 112))))
                 k <- k + 1
 
             k <- 0
@@ -695,13 +715,21 @@ let private applyFusedPass
                 a1 <- Avx2.Subtract(a1, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 16))))
                 a2 <- Avx2.Subtract(a2, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 32))))
                 a3 <- Avx2.Subtract(a3, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 48))))
+                a4 <- Avx2.Subtract(a4, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 64))))
+                a5 <- Avx2.Subtract(a5, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 80))))
+                a6 <- Avx2.Subtract(a6, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 96))))
+                a7 <- Avx2.Subtract(a7, Avx2.ConvertToVector256Int16(Vector128.LoadUnsafe(&twBase, unativeint (rb + 112))))
                 k <- k + 1
 
             Vector256.StoreUnsafe(a0, &dstBase, unativeint (dstOff + t))
             Vector256.StoreUnsafe(a1, &dstBase, unativeint (dstOff + t + 16))
             Vector256.StoreUnsafe(a2, &dstBase, unativeint (dstOff + t + 32))
             Vector256.StoreUnsafe(a3, &dstBase, unativeint (dstOff + t + 48))
-            t <- t + 64
+            Vector256.StoreUnsafe(a4, &dstBase, unativeint (dstOff + t + 64))
+            Vector256.StoreUnsafe(a5, &dstBase, unativeint (dstOff + t + 80))
+            Vector256.StoreUnsafe(a6, &dstBase, unativeint (dstOff + t + 96))
+            Vector256.StoreUnsafe(a7, &dstBase, unativeint (dstOff + t + 112))
+            t <- t + 128
     else
         // Scalar reference: int32 accumulate then truncate to int16 — bit-identical to sequential int16
         // wrapping adds (truncation mod 2^16 is a homomorphism over addition; |sum| << 2^31).
