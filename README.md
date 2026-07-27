@@ -120,7 +120,8 @@ Command-line tools for training data, benchmarks, and regression checks:
 - **Policy parity** — `dumppolicy` / `dumppolicyown` compare engine inference against trainer oracles
 - **Tablebase labels** — `tbgen` builds Syzygy-labeled endgame training sets
 - **Retrograde** — `retro` solves and verifies low-material retrograde tables
-- **Scripts** — `nodesweep.ps1`, `bench.ps1`, and `b4fixture.ps1` for node-count and timing regression
+- **Scripts** — `nodesweep.ps1`, `bench.ps1`, `mtbench.ps1`, and `b4fixture.ps1` for node-count and
+  single/multi-threaded timing regression
 - **Trainer** — Python pipelines for match testing (SPRT), SPSA tuning, NNUE training, and policy-net campaigns
 
 Changes are validated with fixed-depth node-count sweeps (tree mechanics) and SPRT self-play
@@ -128,7 +129,7 @@ matches (playing strength).
 
 ## Testing
 
-408 automated tests cover move generation, make/unmake, SEE, move ordering, history and
+416 automated tests cover move generation, make/unmake, SEE, move ordering, history and
 correction tables, transposition-table behavior, NNUE correctness, draw detection,
 multi-threading, tablebase integration, policy/WDL inference, time management, and search
 equivalence against an unpruned baseline.
@@ -140,9 +141,15 @@ MIT — see [LICENSE](LICENSE).
 ## Status
 
 Actively developed; strength is tracked through SPRT self-play against earlier versions. Current
-release is **0.1.2**, which is throughput-only over 0.1.1 (NNUE accumulator kernel tuning; node
-counts are byte-identical). Since 0.1.0, the previously experimental search features — DFPN, the policy
-head, the dynamic time-management components, and the extended history/correction terms — are
-enabled by default, each still individually disableable through its `EONEGO_*` environment
-variable. These defaults are pre-SPRT and under validation; the time manager also reserves a small
-proportional safety margin on the clock to avoid flag-fall under load.
+release is **0.1.3** (documentation only over 0.1.2).
+
+0.1.2 was throughput-only over 0.1.1: three successive tunings of the fused NNUE accumulator
+kernel — a wider AVX2 register tile, a vectorized PSQT tail, and hoisting the per-row base address
+out of the tile loop — for roughly +11% nps in total. These change how fast the tree is walked, not
+which nodes are visited, so node counts stay byte-identical and the gain is worth only a few Elo.
+
+Since 0.1.0, the previously experimental search features — DFPN, the policy head, the dynamic
+time-management components, and the extended history/correction terms — are enabled by default,
+each still individually disableable through its `EONEGO_*` environment variable. These defaults are
+pre-SPRT and under validation; the time manager also reserves a small proportional safety margin on
+the clock to avoid flag-fall under load.

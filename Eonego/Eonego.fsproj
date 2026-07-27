@@ -6,7 +6,7 @@
 
     <!-- Engine identity (keep in sync with Engine.fs — the runtime reads the F# literals, this
          block only stamps the Windows file/product metadata of the published exe). -->
-    <Version>0.1.2</Version>
+    <Version>0.1.3</Version>
     <Product>Eonego</Product>
     <Authors>Houijasu</Authors>
     <Copyright>Copyright (C) 2026 Houijasu — MIT</Copyright>
