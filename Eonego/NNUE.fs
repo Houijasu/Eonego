@@ -599,21 +599,21 @@ let private fc0GemvSparse
                 let c0 = (w <<< 6) + System.Numerics.BitOperations.TrailingZeroCount bits
                 bits <- bits &&& (bits - 1UL)
                 let u0 = Vector256.Create(ftInts.[c0]).AsByte()
-                let rb0 = c0 * (Fc0Out * 4)
-                a0 <- AvxVnni.MultiplyWideningAndAdd(a0, u0, (Vector256.LoadUnsafe(&wBase, unativeint rb0): Vector256<sbyte>))
-                a1 <- AvxVnni.MultiplyWideningAndAdd(a1, u0, (Vector256.LoadUnsafe(&wBase, unativeint (rb0 + 32)): Vector256<sbyte>))
-                a2 <- AvxVnni.MultiplyWideningAndAdd(a2, u0, (Vector256.LoadUnsafe(&wBase, unativeint (rb0 + 64)): Vector256<sbyte>))
-                a3 <- AvxVnni.MultiplyWideningAndAdd(a3, u0, (Vector256.LoadUnsafe(&wBase, unativeint (rb0 + 96)): Vector256<sbyte>))
+                let r0 = &Unsafe.Add(&wBase, nativeint (c0 * (Fc0Out * 4)))
+                a0 <- AvxVnni.MultiplyWideningAndAdd(a0, u0, (Vector256.LoadUnsafe(&r0, 0un): Vector256<sbyte>))
+                a1 <- AvxVnni.MultiplyWideningAndAdd(a1, u0, (Vector256.LoadUnsafe(&r0, 32un): Vector256<sbyte>))
+                a2 <- AvxVnni.MultiplyWideningAndAdd(a2, u0, (Vector256.LoadUnsafe(&r0, 64un): Vector256<sbyte>))
+                a3 <- AvxVnni.MultiplyWideningAndAdd(a3, u0, (Vector256.LoadUnsafe(&r0, 96un): Vector256<sbyte>))
 
                 if bits <> 0UL then
                     let c1 = (w <<< 6) + System.Numerics.BitOperations.TrailingZeroCount bits
                     bits <- bits &&& (bits - 1UL)
                     let u1 = Vector256.Create(ftInts.[c1]).AsByte()
-                    let rb1 = c1 * (Fc0Out * 4)
-                    b0 <- AvxVnni.MultiplyWideningAndAdd(b0, u1, (Vector256.LoadUnsafe(&wBase, unativeint rb1): Vector256<sbyte>))
-                    b1 <- AvxVnni.MultiplyWideningAndAdd(b1, u1, (Vector256.LoadUnsafe(&wBase, unativeint (rb1 + 32)): Vector256<sbyte>))
-                    b2 <- AvxVnni.MultiplyWideningAndAdd(b2, u1, (Vector256.LoadUnsafe(&wBase, unativeint (rb1 + 64)): Vector256<sbyte>))
-                    b3 <- AvxVnni.MultiplyWideningAndAdd(b3, u1, (Vector256.LoadUnsafe(&wBase, unativeint (rb1 + 96)): Vector256<sbyte>))
+                    let r1 = &Unsafe.Add(&wBase, nativeint (c1 * (Fc0Out * 4)))
+                    b0 <- AvxVnni.MultiplyWideningAndAdd(b0, u1, (Vector256.LoadUnsafe(&r1, 0un): Vector256<sbyte>))
+                    b1 <- AvxVnni.MultiplyWideningAndAdd(b1, u1, (Vector256.LoadUnsafe(&r1, 32un): Vector256<sbyte>))
+                    b2 <- AvxVnni.MultiplyWideningAndAdd(b2, u1, (Vector256.LoadUnsafe(&r1, 64un): Vector256<sbyte>))
+                    b3 <- AvxVnni.MultiplyWideningAndAdd(b3, u1, (Vector256.LoadUnsafe(&r1, 96un): Vector256<sbyte>))
     else
         for w in 0 .. 3 do
             let mutable bits = nnzWords.[w]
@@ -622,21 +622,21 @@ let private fc0GemvSparse
                 let c0 = (w <<< 6) + System.Numerics.BitOperations.TrailingZeroCount bits
                 bits <- bits &&& (bits - 1UL)
                 let u0 = Vector256.Create(ftInts.[c0]).AsByte()
-                let rb0 = c0 * (Fc0Out * 4)
-                a0 <- Avx2.Add(a0, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u0, (Vector256.LoadUnsafe(&wBase, unativeint rb0): Vector256<sbyte>)), VOnes16))
-                a1 <- Avx2.Add(a1, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u0, (Vector256.LoadUnsafe(&wBase, unativeint (rb0 + 32)): Vector256<sbyte>)), VOnes16))
-                a2 <- Avx2.Add(a2, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u0, (Vector256.LoadUnsafe(&wBase, unativeint (rb0 + 64)): Vector256<sbyte>)), VOnes16))
-                a3 <- Avx2.Add(a3, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u0, (Vector256.LoadUnsafe(&wBase, unativeint (rb0 + 96)): Vector256<sbyte>)), VOnes16))
+                let r0 = &Unsafe.Add(&wBase, nativeint (c0 * (Fc0Out * 4)))
+                a0 <- Avx2.Add(a0, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u0, (Vector256.LoadUnsafe(&r0, 0un): Vector256<sbyte>)), VOnes16))
+                a1 <- Avx2.Add(a1, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u0, (Vector256.LoadUnsafe(&r0, 32un): Vector256<sbyte>)), VOnes16))
+                a2 <- Avx2.Add(a2, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u0, (Vector256.LoadUnsafe(&r0, 64un): Vector256<sbyte>)), VOnes16))
+                a3 <- Avx2.Add(a3, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u0, (Vector256.LoadUnsafe(&r0, 96un): Vector256<sbyte>)), VOnes16))
 
                 if bits <> 0UL then
                     let c1 = (w <<< 6) + System.Numerics.BitOperations.TrailingZeroCount bits
                     bits <- bits &&& (bits - 1UL)
                     let u1 = Vector256.Create(ftInts.[c1]).AsByte()
-                    let rb1 = c1 * (Fc0Out * 4)
-                    b0 <- Avx2.Add(b0, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u1, (Vector256.LoadUnsafe(&wBase, unativeint rb1): Vector256<sbyte>)), VOnes16))
-                    b1 <- Avx2.Add(b1, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u1, (Vector256.LoadUnsafe(&wBase, unativeint (rb1 + 32)): Vector256<sbyte>)), VOnes16))
-                    b2 <- Avx2.Add(b2, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u1, (Vector256.LoadUnsafe(&wBase, unativeint (rb1 + 64)): Vector256<sbyte>)), VOnes16))
-                    b3 <- Avx2.Add(b3, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u1, (Vector256.LoadUnsafe(&wBase, unativeint (rb1 + 96)): Vector256<sbyte>)), VOnes16))
+                    let r1 = &Unsafe.Add(&wBase, nativeint (c1 * (Fc0Out * 4)))
+                    b0 <- Avx2.Add(b0, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u1, (Vector256.LoadUnsafe(&r1, 0un): Vector256<sbyte>)), VOnes16))
+                    b1 <- Avx2.Add(b1, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u1, (Vector256.LoadUnsafe(&r1, 32un): Vector256<sbyte>)), VOnes16))
+                    b2 <- Avx2.Add(b2, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u1, (Vector256.LoadUnsafe(&r1, 64un): Vector256<sbyte>)), VOnes16))
+                    b3 <- Avx2.Add(b3, Avx2.MultiplyAddAdjacent(Avx2.MultiplyAddAdjacent(u1, (Vector256.LoadUnsafe(&r1, 96un): Vector256<sbyte>)), VOnes16))
 
     let bBase = &MemoryMarshal.GetArrayDataReference fc0b
     let oBase = &MemoryMarshal.GetReference fc0
